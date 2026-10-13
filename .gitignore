@@ -26,3 +26,5 @@ safari/**/build/
 
 # Claude local
 .claude/settings.local.json
+safari/**/dd/
+safari/**/*.xcworkspace/xcuserdata/

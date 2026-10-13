@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cross-Tab-Sync</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Cross-Tab-Sync</h1>
+      <span id="badge" class="badge" hidden></span>
+    </header>
+
+    <form id="pair-view" hidden>
+      <label>Server URL
+        <input id="server-url" type="url" required placeholder="https://sync.example.com" autocomplete="url" />
+      </label>
+      <label>Device name
+        <input id="device-name" type="text" required maxlength="64" />
+      </label>
+      <label>Pairing code
+        <input id="pair-code" type="text" required maxlength="16" autocomplete="one-time-code"
+          spellcheck="false" autocapitalize="characters" placeholder="8 characters" />
+      </label>
+      <p class="hint">Create a code with <code>cross-tab-sync pair-code</code> or from an already paired browser.</p>
+      <button id="pair" type="submit" class="primary">Pair</button>
+    </form>
+
+    <section id="main-view" hidden>
+      <dl class="facts">
+        <dt>Owner</dt><dd id="owner"></dd>
+        <dt>Last sync</dt><dd id="last-sync"></dd>
+        <dt>Pending changes</dt><dd id="pending"></dd>
+      </dl>
+      <p id="status-text" class="status"></p>
+      <div class="actions">
+        <button id="hand-over" type="button">Hand over</button>
+        <button id="continue-here" type="button">Continue here</button>
+      </div>
+      <div class="pairing">
+        <button id="create-code" type="button" class="link">Create pairing code</button>
+        <p id="pairing-code" class="code" hidden></p>
+      </div>
+      <footer>
+        <span id="identity"></span>
+        <button id="disconnect" type="button" class="link danger">Disconnect</button>
+      </footer>
+    </section>
+
+    <p id="error" class="error" role="alert" hidden></p>
+    <script src="popup.js"></script>
+  </body>
+</html>
