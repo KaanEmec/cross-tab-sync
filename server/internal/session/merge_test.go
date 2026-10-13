@@ -166,3 +166,42 @@ func TestForkedEntryID(t *testing.T) {
 		t.Fatalf("tombstoned fork reopened: %+v", r)
 	}
 }
+
+// A journal replayed with an expired base (the recovery path after 410) must
+// not treat entries its own batch opened, navigated or forked as moved.
+func TestMergeExpiredBaseKeepsOwnBatchChanges(t *testing.T) {
+	t.Parallel()
+	s := NewState(nil)
+	for i, op := range []Op{
+		{OpID: op1, Type: TypeOpen, EntryID: e1, URL: "https://a.example/"},
+		{OpID: op2, Type: TypeNavigate, EntryID: e1, URL: "https://b.example/"},
+		{OpID: op3, Type: TypeClose, EntryID: e1},
+	} {
+		if r, _, _ := s.Merge(op, 0, true, "dev", int64(i+1)); r.Status != StatusApplied || r.EntryID != e1 {
+			t.Fatalf("op %d: %+v", i, r)
+		}
+	}
+	if got := openURLs(s); len(got) != 0 {
+		t.Fatalf("left open: %v", got)
+	}
+
+	// Fork, then close on the fork (addressed through the original id), in one batch.
+	s = NewState([]Entry{
+		{ID: e2, URL: "https://x.example/", URLRevision: 3, URLDevice: "other"},
+		{ID: e3, URL: "https://z.example/", Position: 1, URLRevision: 3, URLDevice: "other"},
+	})
+	forked := ForkedEntryID(op1)
+	if r, _, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e2, URL: "https://y.example/"}, 0, true, "dev", 10); r.Status != StatusForked {
+		t.Fatalf("fork: %+v", r)
+	}
+	if r, _, _ := s.Merge(Op{OpID: op2, Type: TypeClose, EntryID: e2}, 0, true, "dev", 11); r.Status != StatusApplied || r.EntryID != forked {
+		t.Fatalf("close on fork: %+v", r)
+	}
+	if got := openURLs(s); !slices.Equal(got, []string{"https://x.example/", "https://z.example/"}) {
+		t.Fatalf("open urls %v", got)
+	}
+	// Entries the batch did not touch stay protected by the expired rule.
+	if r, _, _ := s.Merge(Op{OpID: op3, Type: TypeClose, EntryID: e3}, 0, true, "dev", 12); r.Status != StatusIgnored {
+		t.Fatalf("close on untouched entry: %+v", r)
+	}
+}

@@ -74,7 +74,8 @@ func TestMergeForkedNavigateKeepsBothURLs(t *testing.T) {
 		t.Fatalf("merge changed ownership: %+v -> %+v", owner, s.Owner)
 	}
 
-	// Followers see the fork as an open of the new entry.
+	// Followers see the fork as an applied open of the new entry; "forked"
+	// exists only in the merge response and its replay.
 	var ch struct {
 		Operations []loggedOp `json:"operations"`
 	}
@@ -84,7 +85,7 @@ func TestMergeForkedNavigateKeepsBothURLs(t *testing.T) {
 	}
 	lo := ch.Operations[0]
 	if lo.Seq != 3 || lo.DeviceID != b.ID || lo.Op["type"] != "open" || lo.Op["entryId"] != forked ||
-		lo.Op["url"] != "https://b.example/" || lo.Result.Status != "forked" || lo.Result.EntryID != forked {
+		lo.Op["url"] != "https://b.example/" || lo.Result.Status != "applied" || lo.Result.EntryID != forked {
 		t.Fatalf("logged fork: %+v", lo)
 	}
 	// The owner keeps publishing with its generation.
@@ -227,8 +228,8 @@ func TestHistoryRetentionThresholds(t *testing.T) {
 	a, b := e.pair("A"), e.pair("B")
 	gen := e.acquire(a, false)
 	e1, e2, e3 := uid(), uid(), uid()
-	open1 := openOp(e1, "https://a.example/")
-	e.ops(a, gen, 0, open1, openOp(e2, "https://b.example/"), closeOp(e2)) // 1..3
+	open1, open2 := openOp(e1, "https://a.example/"), openOp(e2, "https://b.example/")
+	e.ops(a, gen, 0, open1, open2, closeOp(e2)) // 1..3
 	if s := e.session(a); s.Revision != 3 || minRevision(t, e, a) != 1 {
 		t.Fatalf("before pruning: %+v", s)
 	}
@@ -287,6 +288,15 @@ func TestHistoryRetentionThresholds(t *testing.T) {
 	}
 	if r := e.merge(b, at(3, closeOp(e1))); r.Results[0].Status != "applied" {
 		t.Fatalf("retained close: %+v", r)
+	}
+
+	// Documented limit: once e2's tombstone and its opening were pruned, the
+	// same open resubmitted is a new operation and recreates the entry.
+	if r := e.ops(a, gen, 0, open2); r.Results[0].Status != "applied" || r.Results[0].Replayed || r.Results[0].EntryID != e2 {
+		t.Fatalf("pruned open resent: %+v", r)
+	}
+	if got := e.urls(a); !slices.Equal(got, []string{"https://b.example/", "https://c.example/"}) {
+		t.Fatalf("urls %v", got)
 	}
 }
 

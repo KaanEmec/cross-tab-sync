@@ -422,7 +422,7 @@ func applyBatch(ctx context.Context, tx *sql.Tx, b batch) ([]session.Result, int
 			if err := json.Unmarshal([]byte(raw), &res); err != nil {
 				return nil, 0, fmt.Errorf("decoding stored result: %w", err)
 			}
-			stored[op.OpID] = res
+			stored[op.OpID] = replayResult(op, res)
 		}
 		ids = append(ids, op.EntryID)
 		if b.merge != nil && op.Type == session.TypeNavigate {
@@ -478,7 +478,7 @@ func applyBatch(ctx context.Context, tx *sql.Tx, b batch) ([]session.Result, int
 		if err != nil {
 			return nil, 0, fmt.Errorf("encoding operation: %w", err)
 		}
-		result, err := json.Marshal(res)
+		result, err := json.Marshal(logResult(res))
 		if err != nil {
 			return nil, 0, fmt.Errorf("encoding result: %w", err)
 		}
@@ -494,6 +494,25 @@ func applyBatch(ctx context.Context, tx *sql.Tx, b batch) ([]session.Result, int
 		return nil, 0, fmt.Errorf("updating revision: %w", err)
 	}
 	return results, rev, nil
+}
+
+// logResult is the result as stored in the log, which changes and catchUp
+// expose: a fork is the applied open it was converted to. replayResult
+// restores the merge response's "forked" from the submitted navigate, whose
+// result entry is then its own fork id (nothing else can produce that id).
+func logResult(res session.Result) session.Result {
+	if res.Status == session.StatusForked {
+		res.Status = session.StatusApplied
+	}
+	return res
+}
+
+func replayResult(submitted session.Op, res session.Result) session.Result {
+	if submitted.Type == session.TypeNavigate && res.Status == session.StatusApplied &&
+		res.EntryID == session.ForkedEntryID(submitted.OpID) {
+		res.Status = session.StatusForked
+	}
+	return res
 }
 
 func upsertEntry(ctx context.Context, tx *sql.Tx, e *session.Entry) error {

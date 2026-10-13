@@ -27,7 +27,7 @@ CTS_ALLOW_INSECURE=1 ./bin/cross-tab-sync serve     # local development over pla
 | `CTS_SNAPSHOT_RETENTION` | `20` | Recovery snapshots kept |
 | `CTS_HISTORY_RETENTION` | `720h` | Operation log and tombstones kept (Go duration) |
 
-Logs are JSON on stdout with method, route pattern, status, device id and latency only. History older than `CTS_HISTORY_RETENTION` is pruned at startup and hourly (open entries are always kept); clients behind `minRevision` get `410 history_expired` or `fullResync: true` and reload the session.
+Logs are JSON on stdout with method, route pattern, status, device id and latency only. History older than `CTS_HISTORY_RETENTION` is pruned at startup and hourly (open entries are always kept); clients behind `minRevision` get `410 history_expired` or `fullResync: true` and reload the session. Operations older than the retention window are treated as new if resubmitted, so a resent opening of a pruned closed entry recreates it.
 
 ## curl examples
 

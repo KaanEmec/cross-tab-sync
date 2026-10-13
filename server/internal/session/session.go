@@ -149,12 +149,14 @@ type State struct {
 	byID      map[string]*Entry
 	openByURL map[string]string
 	forks     map[string]string // merge: entry id -> entry forked from it in this batch
+	ownURLs   map[string]bool   // entries whose URL this batch set (open or navigate)
 	nextPos   int64
 }
 
 // NewState builds a state from entries; it copies them.
 func NewState(entries []Entry) *State {
-	s := &State{byID: make(map[string]*Entry, len(entries)), openByURL: make(map[string]string), forks: make(map[string]string)}
+	s := &State{byID: make(map[string]*Entry, len(entries)), openByURL: make(map[string]string),
+		forks: make(map[string]string), ownURLs: make(map[string]bool)}
 	for i := range entries {
 		e := entries[i]
 		s.byID[e.ID] = &e
@@ -198,6 +200,7 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 		}
 		s.byID[ne.ID] = ne
 		s.openByURL[ne.URL] = ne.ID
+		s.ownURLs[ne.ID] = true
 		s.nextPos = min(max(s.nextPos, ne.Position+1), MaxPosition)
 		res.Status, res.EntryID = StatusApplied, ne.ID
 		return res, copyEntry(ne)
@@ -216,6 +219,7 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 		e.UpdatedRevision = rev
 		e.URLRevision, e.URLDevice = rev, deviceID
 		s.openByURL[e.URL] = e.ID
+		s.ownURLs[e.ID] = true
 		res.Status, res.EntryID = StatusApplied, e.ID
 		return res, copyEntry(e)
 
@@ -247,7 +251,9 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 
 // ForkedEntryID is the entry id a forked navigate opens: the UUIDv5 (SHA-1)
 // of the name "forked" in the namespace of the operation id. It is stable, so
-// a navigate resubmitted after its opId was pruned cannot fork twice.
+// a navigate resubmitted after its opId was pruned coalesces with (or, as a
+// tombstone, is ignored by) its earlier fork, as long as that entry is
+// retained; once a closed fork is pruned, a resubmission opens it again.
 func ForkedEntryID(opID string) string {
 	return uuid.NewSHA1(uuid.MustParse(opID), []byte("forked")).String()
 }
@@ -255,7 +261,8 @@ func ForkedEntryID(opID string) string {
 // Merge applies an offline operation recorded at baseRevision, following the
 // merge rules. An existing open entry counts as moved when its URL changed
 // after baseRevision through another device, or always when expired is set
-// (baseRevision outside the retained history). A navigate on a moved entry
+// (baseRevision outside the retained history), except entries whose URL this
+// batch itself set: the journal's own opens, navigates and forks. A navigate on a moved entry
 // opens a fresh entry (StatusForked, coalescing on URL); close and update on a
 // moved entry are ignored; open behaves as in Apply. Later operations of the
 // same batch on a forked entry are redirected to its fork.
@@ -273,7 +280,7 @@ func (s *State) Merge(op Op, baseRevision int64, expired bool, deviceID string, 
 		op.EntryID = id
 	}
 	e := s.byID[op.EntryID]
-	moved := e != nil && e.Open() &&
+	moved := e != nil && e.Open() && !s.ownURLs[e.ID] &&
 		(expired || (e.URLRevision > baseRevision && e.URLDevice != deviceID))
 	if !moved {
 		res, changed := s.Apply(op, deviceID, rev)

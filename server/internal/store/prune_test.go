@@ -248,3 +248,41 @@ func TestMigration0002Backfill(t *testing.T) {
 		t.Fatalf("session after migration: %+v %v", sess, err)
 	}
 }
+
+// A failure partway through a merge batch rolls back every earlier change.
+func TestMergeFailureRollsBack(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newHistoryFixture(t)
+	now := time.Now()
+	e1 := f.id()
+	f.apply(now, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: e1, URL: "https://a.example/"}) // 1
+
+	// Valid at the API level, rejected by the database on the third op.
+	if _, err := f.st.db.ExecContext(ctx, `CREATE TRIGGER fail_merge BEFORE INSERT ON entries
+		WHEN NEW.url = 'https://fail.example/' BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	base := func(v int64) *int64 { return &v }
+	ops := []session.MergeOp{
+		{Op: session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URL: "https://b.example/"}, BaseRevision: base(1)},
+		{Op: session.Op{OpID: f.id(), Type: session.TypeNavigate, EntryID: e1, URL: "https://a2.example/"}, BaseRevision: base(1)},
+		{Op: session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URL: "https://fail.example/"}, BaseRevision: base(1)},
+	}
+	if _, err := f.st.Merge(ctx, f.dev, ops, now, 5); err == nil {
+		t.Fatal("merge succeeded despite the injected failure")
+	}
+	sess, err := f.st.GetSession(ctx)
+	if err != nil || sess.Revision != 1 || len(sess.Entries) != 1 || sess.Entries[0].URL != "https://a.example/" {
+		t.Fatalf("session after failed merge: %+v %v", sess, err)
+	}
+	for query, want := range map[string]int{
+		`SELECT COUNT(*) FROM operations`: 1,
+		`SELECT COUNT(*) FROM entries`:    1,
+		`SELECT COUNT(*) FROM snapshots`:  0,
+	} {
+		if n := f.count(query); n != want {
+			t.Fatalf("%s = %d, want %d", query, n, want)
+		}
+	}
+}
