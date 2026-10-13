@@ -107,6 +107,41 @@ Local persisted state: credentials, server URL, device name, `lastRevision`, `ge
 - Pairing requests the backend origin with `permissions.request` from the popup (user gesture) before calling `/v1/pair`; the form is persisted first because the prompt may close the popup.
 - Eligible tabs: `http`/`https` URLs in normal (non-private) windows. Browser pages, private windows and discarded placeholder entries without a URL are excluded.
 
+## Client behavior (v0.2 automatic sync)
+
+Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch is the owner heartbeat, `acquire {force:true}` is takeover, `changes?since=` is the follower pull.
+
+### Roles and cadence
+
+- A 5-minute `alarms` cycle runs on every device, plus an immediate run after takeover, manual actions, and local changes (debounced by about 2 s).
+- **Owner run**: flush the journal with `POST operations` (empty batch if nothing pending), apply `catchUp`, advance `lastRevision`. `409 stale_owner` drops owner state, keeps the journal, and the device continues as a follower.
+- **Follower run**: `GET changes?since=lastRevision`, apply, advance. `410 history_expired` triggers a full resync from `GET session` (reconcile mappings by URL, create missing tabs, never close).
+- A persisted run lock makes runs exclusive; a run that finds the lock held exits.
+
+### Recording local changes (both roles, always journaled)
+
+- **Addition**: `tabs.onCreated` or a first eligible URL on `tabs.onUpdated` for a tab the extension did not create. If the URL is already mapped to an entry, the tab becomes another local copy (count +1, no operation). Otherwise `open` with a new `entryId`.
+- **Closure**: `tabs.onRemoved` with `isWindowClosing: false` on a mapped tab. Count −1; if it was the last local copy, `close`. Window closure, shutdown, crash, and absence from a capture only unmap. Removals during the first 10 s after startup are treated as unmap only.
+- **Navigation**: `tabs.onUpdated` with a new committed URL (status `complete`) on a mapped tab, not caused by remote application. Single local copy: `navigate {entryId, url}`. One of several copies: the tab detaches from its entry (count −1) and is recorded as a fresh `open` for the new URL. Navigating to a URL that is already mapped locally coalesces (the tab joins that entry; the old entry gets `close` if this was its last copy).
+- **Echo suppression**: the extension records what it is about to create, navigate, or remove (`expected` set keyed by tab id and URL, with a timeout) and ignores the matching events.
+- The journal is sent immediately when owner; followers hold it until they become owner.
+
+### Applying remote operations
+
+- `open`: reuse an eligible local tab with the same URL, else create in the background in the receiving window.
+- `navigate`: update every mapped local copy; if the destination is already open locally, the copies are closed (background copies only) and the entry maps to the existing tab.
+- `close`: close the mapped background copies. If the active tab is among them, it stays open, is unmapped, and is put in a `detached` set so it is not republished as a new opening until it navigates or closes.
+- `update`: apply pinned state; position is a hint only.
+- The active tab and focused window never change as a result of application.
+
+### Automatic ownership
+
+- **Activity signals**: `tabs.onActivated`, `windows.onFocusChanged` to a real window, user-created tabs, and user navigation. Signals in the first 10 s after startup and signals caused by remote application are not activity. Heartbeats are never activity.
+- **Fresh interaction**: a signal after at least 60 s without signals, or the first signal after this device lost ownership. A browser that merely stays focused produces none.
+- **Takeover**: on a fresh interaction while not owner, run Continue here (`acquire {force:true}`, reconcile, flush the journal). At most one attempt per 30 s.
+- **Manual Hand over** suppresses automatic takeover until the next fresh interaction.
+- The superseded owner learns of the change from `409 stale_owner` on its next run, keeps its journal, and follows. Its pending work is published when it next takes over. The cadence bounds the window in which the prior owner's unpublished changes are invisible to the new owner.
+
 ## Privacy
 
 The server sees URLs, pinned state, order, device names and timestamps; it must, in order to coalesce duplicates. Logs record request method, path, status, device id and latency only. End-to-end encryption is out of scope for v1 (see [ARCHITECTURE.md](ARCHITECTURE.md#key-decisions)).
