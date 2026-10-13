@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { TabInfo } from "../src/adapter/types.js";
 import {
+  rematchByUrl,
   countUrls,
   emptyMappings,
   entryForTab,
@@ -49,5 +50,26 @@ describe("mapping", () => {
     const r = reconcileMappings(m, [tab(1, "https://a/"), tab(2, "https://elsewhere/"), tab(4, "https://c/")]);
     expect(Object.keys(r.tabs)).toEqual(["1", "2"]);
     expect(reconcileMappings(m, [tab(3, "")]).tabs["3"]?.entryId).toBe("e3");
+  });
+
+  it("re-matches previous-session mappings by last-known URL, one tab each, dropping the rest", () => {
+    let stored = setMapping(emptyMappings(), 1, "A", "https://a/");
+    stored = setMapping(stored, 2, "A", "https://a/");
+    stored = setMapping(stored, 3, "B", "https://b/moved");
+    stored = setMapping(stored, 4, "C", "https://gone/");
+    const base = setMapping(emptyMappings(), 50, "Z", "https://z/");
+    const tabs = [
+      { id: 50, url: "https://a/" },
+      { id: 51, url: "https://a/" },
+      { id: 52, url: "https://b/moved" },
+      { id: 53, url: "https://a/" },
+    ];
+    const m = rematchByUrl(stored, tabs, base);
+    expect(m.tabs).toEqual({
+      "50": { entryId: "Z", url: "https://z/" },
+      "51": { entryId: "A", url: "https://a/" },
+      "52": { entryId: "B", url: "https://b/moved" },
+      "53": { entryId: "A", url: "https://a/" },
+    });
   });
 });

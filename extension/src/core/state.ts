@@ -16,6 +16,11 @@ export interface State {
   /** Last owner reported by the server (may be another device). */
   owner: Owner | null;
   mappings: Mappings;
+  /**
+   * Mappings from the previous browser session (tab ids changed at startup). Re-matched to current
+   * tabs by last-known URL at the next action, when restored tabs have loaded.
+   */
+  staleMappings: Mappings | null;
   pending: Journal;
   /** ISO timestamp of the last successful exchange with the server. */
   lastSync: string | null;
@@ -54,6 +59,7 @@ export function defaultState(): State {
     generation: null,
     owner: null,
     mappings: emptyMappings(),
+    staleMappings: null,
     pending: [],
     lastSync: null,
     lastError: null,
@@ -98,6 +104,7 @@ export function clearedCredentials(): Partial<State> {
     generation: null,
     owner: null,
     mappings: emptyMappings(),
+    staleMappings: null,
     pending: [],
   };
 }

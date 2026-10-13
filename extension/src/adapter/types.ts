@@ -48,7 +48,8 @@ export interface BrowserAdapter {
   onAlarm(cb: (name: string) => void): Unsubscribe;
   onTabCreated(cb: (tab: TabInfo) => void): Unsubscribe;
   onTabRemoved(cb: (tabId: number, windowClosing: boolean) => void): Unsubscribe;
-  onTabUpdated(cb: (tab: TabInfo) => void): Unsubscribe;
+  /** `change` carries the changed `url` and/or load `status` ("loading" | "complete"). */
+  onTabUpdated(cb: (tab: TabInfo, change: { url?: string; status?: string }) => void): Unsubscribe;
   onTabActivated(cb: (tabId: number, windowId: number) => void): Unsubscribe;
   onWindowFocusChanged(cb: (windowId: number | null) => void): Unsubscribe;
 }

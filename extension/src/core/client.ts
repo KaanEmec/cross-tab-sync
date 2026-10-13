@@ -122,7 +122,8 @@ export function normalizeServerUrl(input: string): string {
   } catch {
     throw new Error("Server URL is not a valid URL");
   }
-  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  // Only loopback hosts listed in optional_host_permissions may use plain http.
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1";
   if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
     throw new Error("Server URL must use https:// (http:// only for localhost)");
   }

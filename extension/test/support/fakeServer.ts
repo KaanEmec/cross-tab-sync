@@ -10,6 +10,29 @@ import {
 } from "../../src/core/client.js";
 import type { Api } from "../../src/core/handover.js";
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const encoder = new TextEncoder();
+
+/** Mirrors the Go server: url.Parse-style escapes, http(s), non-empty host, 2048 bytes. */
+export function serverAcceptsUrl(url: string): boolean {
+  if (encoder.encode(url).length > 2048 || /%(?![0-9A-Fa-f]{2})/.test(url)) return false;
+  const m = /^(https?):\/\/([^/?#]*)/.exec(url);
+  return Boolean(m && m[2] && m[2].replace(/^.*@/, "").replace(/:\d*$/, ""));
+}
+
+function validateBatch(body: { baseRevision: number; operations: Operation[] }): void {
+  const bad = (msg: string) => new ApiError(400, "invalid_request", msg, { error: "invalid_request" });
+  if (encoder.encode(JSON.stringify(body)).length > 64 * 1024) {
+    throw new ApiError(413, "payload_too_large", "body too large", { error: "payload_too_large" });
+  }
+  if (!Number.isInteger(body.baseRevision) || body.baseRevision < 0) throw bad("baseRevision required");
+  if (body.operations.length > 500) throw bad("too many operations");
+  for (const op of body.operations) {
+    if (!UUID.test(op.opId) || !UUID.test(op.entryId)) throw bad("ids must be lowercase UUIDs");
+    if ((op.type === "open" || op.type === "navigate") && !serverAcceptsUrl(op.url)) throw bad("invalid url");
+  }
+}
+
 interface Device {
   id: string;
   name: string;
@@ -30,6 +53,8 @@ export class FakeServer {
   /** Apply the next operations batch but fail as if the response was lost. */
   dropNextOperationsResponse = false;
   requests: { path: string; body?: unknown; device?: string }[] = [];
+  /** Test hook to delay a heartbeat between authentication and the ownership check. */
+  beforeHeartbeat?: () => Promise<void>;
 
   addDevice(name: string): Device {
     const n = this.devices.length + 1;
@@ -181,12 +206,14 @@ export class FakeServer {
     },
     heartbeat: async (generation) => {
       const d = this.auth(cfg.token);
+      await this.beforeHeartbeat?.();
       this.checkOwner(d, generation);
     },
     operations: async ({ generation, baseRevision, operations }) => {
       const d = this.auth(cfg.token);
       this.requests.push({ path: "operations", body: { generation, baseRevision, operations }, device: d.id });
       this.checkOwner(d, generation);
+      validateBatch({ baseRevision, operations });
       const catchUp = this.log.filter((l) => l.seq > baseRevision && l.deviceId !== d.id);
       const results = operations.map((op) => this.apply(d.id, op));
       if (this.dropNextOperationsResponse) {

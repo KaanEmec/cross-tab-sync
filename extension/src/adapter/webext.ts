@@ -101,9 +101,9 @@ export function createWebExtAdapter(): BrowserAdapter {
     onTabRemoved: (cb) =>
       listen(chrome.tabs.onRemoved, (tabId: number, info: chrome.tabs.OnRemovedInfo) => cb(tabId, info.isWindowClosing)),
     onTabUpdated: (cb) =>
-      listen(chrome.tabs.onUpdated, (_id: number, _change: chrome.tabs.OnUpdatedInfo, t: chrome.tabs.Tab) => {
+      listen(chrome.tabs.onUpdated, (_id: number, change: chrome.tabs.OnUpdatedInfo, t: chrome.tabs.Tab) => {
         const tab = toTab(t);
-        if (tab) cb(tab);
+        if (tab) cb(tab, { url: change.url, status: change.status });
       }),
     onTabActivated: (cb) =>
       listen(chrome.tabs.onActivated, (info: chrome.tabs.OnActivatedInfo) => cb(info.tabId, info.windowId)),

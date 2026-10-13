@@ -5,12 +5,17 @@ export const MAX_URL_BYTES = 2048;
 
 const encoder = new TextEncoder();
 
+/** A '%' not followed by two hex digits: Go's url.Parse (the server) rejects these. */
+const BAD_ESCAPE = /%(?![0-9A-Fa-f]{2})/;
+
 export function isShareableUrl(url: string | undefined): url is string {
   if (!url) return false;
   if (!url.startsWith("http://") && !url.startsWith("https://")) return false;
+  if (BAD_ESCAPE.test(url)) return false;
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    if (!parsed.hostname) return false;
   } catch {
     return false;
   }

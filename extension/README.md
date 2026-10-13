@@ -59,7 +59,8 @@ Build and run the app in Xcode, then in Safari: **Settings > Advanced > Show fea
 
 ## Behavior notes and limits (v0.1)
 
-- Tab ids are only valid within one browser session, so tab mappings are cleared on browser startup; the next action re-matches tabs by URL.
+- Tab ids are only valid within one browser session. On browser startup the mappings are set aside and the next action re-matches them to the restored tabs by each tab's last-known URL (kept current from `tabs.onUpdated`); unmatched ones are dropped.
 - Navigating a shared tab is not propagated yet (v0.2 `navigate`); the tab stays mapped to its entry.
+- URLs the server cannot parse (bad `%` escapes, no host, over 2048 bytes) are never shared. If the server still rejects a batch as invalid, that batch is dropped from the journal, its tabs are unmapped and the popup shows how many changes were dropped.
 - Tab order is a hint only; `tabs.move` is unsupported in Safari and not used. New tabs are appended in session order. Pinned state is applied when tabs are created.
 - Operations are journaled in `storage.local` before they are sent and removed only on a server result, so retries resend the same `opId`s.

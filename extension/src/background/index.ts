@@ -12,6 +12,7 @@ import {
   pairFromPending,
   refreshOwner,
   resetForBrowserStartup,
+  updateMappedUrl,
   type Deps,
 } from "../core/handover.js";
 import { BusyError, withRunLock } from "../core/lock.js";
@@ -47,9 +48,10 @@ async function exclusive<T>(action: string, fn: () => Promise<T>): Promise<T> {
 async function pairExclusive(): Promise<void> {
   if (current) await current.catch(() => undefined);
   const result = await exclusive("pair", () => pairFromPending(deps));
-  if (!result && !isPaired(await loadState(adapter.storage))) {
-    throw new Error("Pairing form expired or was already used; enter the code again");
-  }
+  if (result) return;
+  const s = await loadState(adapter.storage);
+  // The other trigger may already have failed (e.g. invalid_code): report its error.
+  if (!isPaired(s)) throw new Error(s.lastError ?? "Pairing form expired or was already used; enter the code again");
 }
 
 async function setup(): Promise<void> {
@@ -79,8 +81,20 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 adapter.onAlarm((name) => {
-  if (name !== HEARTBEAT_ALARM || current) return;
-  void loadState(adapter.storage).then((s) => (isLocked(s, Date.now()) ? undefined : heartbeat(deps)));
+  if (name !== HEARTBEAT_ALARM) return;
+  // Under the run lock; skipped while an action runs (that action refreshes liveness itself).
+  void exclusive("heartbeat", () => heartbeat(deps)).catch(() => undefined);
+});
+
+// Keep the last-known URL of mapped tabs current, serialized after any running action so the
+// read-modify-write never races an action's own mapping writes.
+let urlUpdates: Promise<unknown> = Promise.resolve();
+adapter.onTabUpdated((tab, change) => {
+  if (change.url === undefined && change.status !== "complete") return;
+  urlUpdates = urlUpdates
+    .then(() => current?.catch(() => undefined))
+    .then(() => updateMappedUrl(deps, tab.id, tab.url))
+    .catch(() => undefined);
 });
 
 // Remember the last focused normal window: it receives tabs created by Continue here.

@@ -19,6 +19,11 @@ describe("isShareableUrl", () => {
     ["", false],
     [undefined, false],
     ["https://", false],
+    ["https://example.com/%zz", false],
+    ["https://example.com/a%2", false],
+    ["https://example.com/?q=100%", false],
+    ["https://example.com/%E2%82%AC?x=%2F", true],
+    ["https://:443/", false],
   ])("%s -> %s", (url, expected) => {
     expect(isShareableUrl(url)).toBe(expected);
   });

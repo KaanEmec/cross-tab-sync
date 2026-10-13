@@ -81,9 +81,9 @@
         if (tab) cb(tab);
       }),
       onTabRemoved: (cb) => listen(chrome.tabs.onRemoved, (tabId, info) => cb(tabId, info.isWindowClosing)),
-      onTabUpdated: (cb) => listen(chrome.tabs.onUpdated, (_id, _change, t) => {
+      onTabUpdated: (cb) => listen(chrome.tabs.onUpdated, (_id, change, t) => {
         const tab = toTab(t);
-        if (tab) cb(tab);
+        if (tab) cb(tab, { url: change.url, status: change.status });
       }),
       onTabActivated: (cb) => listen(chrome.tabs.onActivated, (info) => cb(info.tabId, info.windowId)),
       onWindowFocusChanged: (cb) => listen(
@@ -118,7 +118,7 @@
     } catch {
       throw new Error("Server URL is not a valid URL");
     }
-    const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+    const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1";
     if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
       throw new Error("Server URL must use https:// (http:// only for localhost)");
     }
@@ -212,12 +212,15 @@
   // src/core/eligibility.ts
   var MAX_URL_BYTES = 2048;
   var encoder = new TextEncoder();
+  var BAD_ESCAPE = /%(?![0-9A-Fa-f]{2})/;
   function isShareableUrl(url) {
     if (!url) return false;
     if (!url.startsWith("http://") && !url.startsWith("https://")) return false;
+    if (BAD_ESCAPE.test(url)) return false;
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+      if (!parsed.hostname) return false;
     } catch {
       return false;
     }
@@ -296,6 +299,17 @@
     }
     return { ...m, tabs };
   }
+  function rematchByUrl(stored, tabs, base = emptyMappings()) {
+    const claimed = new Set(Object.keys(base.tabs).map(Number));
+    let m = base;
+    for (const old of Object.values(stored.tabs)) {
+      const tab = tabs.find((t) => t.url === old.url && !claimed.has(t.id));
+      if (!tab) continue;
+      claimed.add(tab.id);
+      m = setMapping(m, tab.id, old.entryId, old.url);
+    }
+    return m;
+  }
   function reconcileMappings(m, allTabs) {
     const present = new Set(allTabs.map((t) => String(t.id)));
     const tabs = {};
@@ -363,6 +377,7 @@
       generation: null,
       owner: null,
       mappings: emptyMappings(),
+      staleMappings: null,
       pending: [],
       lastSync: null,
       lastError: null,
@@ -401,6 +416,7 @@
       generation: null,
       owner: null,
       mappings: emptyMappings(),
+      staleMappings: null,
       pending: []
     };
   }
@@ -436,8 +452,10 @@
   function ownerLabel(o) {
     return o ? `${o.name} (generation ${o.generation})` : "another device";
   }
-  async function fail(store, e) {
+  async function fail(store, e, sentGeneration) {
     if (e instanceof ApiError && e.code === "stale_owner") {
+      const persisted = (await loadState(store.deps.adapter.storage)).generation;
+      if (sentGeneration !== void 0 && persisted !== sentGeneration) throw e;
       const owner = e.owner;
       await store.set({
         generation: null,
@@ -460,6 +478,12 @@
     const [all, windows] = await Promise.all([adapter2.queryTabs(), adapter2.getWindows()]);
     return { all, eligible: eligibleTabs(all, windows) };
   }
+  async function currentMappings(store, all, eligible) {
+    let mappings = reconcileMappings(store.s.mappings, all);
+    if (store.s.staleMappings) mappings = rematchByUrl(store.s.staleMappings, eligible, mappings);
+    await store.set({ mappings, staleMappings: null });
+    return mappings;
+  }
   async function resolveReceivingWindow(adapter2, persisted) {
     const windows = (await adapter2.getWindows()).filter((w) => w.type === "normal" && !w.incognito);
     const ids = new Set(windows.map((w) => w.id));
@@ -472,7 +496,6 @@
     if (items.length === 0) return { created: 0, failed: 0 };
     const { adapter: adapter2 } = store.deps;
     let windowId = await resolveReceivingWindow(adapter2, store.s.receivingWindowId);
-    let mappings = store.s.mappings;
     let created = 0;
     let failed = 0;
     for (const item of items) {
@@ -486,13 +509,12 @@
         } else {
           tab = await adapter2.createTab({ windowId, url: item.url, pinned: item.pinned });
         }
-        mappings = setMapping(mappings, tab.id, item.entryId, item.url);
+        await store.set({ mappings: setMapping(store.s.mappings, tab.id, item.entryId, item.url), receivingWindowId: windowId });
         created++;
       } catch {
         failed++;
       }
     }
-    await store.set({ mappings, receivingWindowId: windowId });
     return { created, failed };
   }
   function applyResults(mappings, ops, results) {
@@ -510,7 +532,7 @@
     if (foreign.length === 0) return;
     const { adapter: adapter2 } = store.deps;
     const { all, eligible } = await captureTabs(adapter2);
-    let mappings = reconcileMappings(store.s.mappings, all);
+    let mappings = await currentMappings(store, all, eligible);
     const toCreate = [];
     for (const { op, result } of foreign) {
       const target = result.entryId ?? op.entryId;
@@ -566,10 +588,24 @@
       } catch (e) {
         if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
       }
-      return;
+      return { rejected: 0 };
     }
+    let rejected = 0;
     for (const batch of pending) {
-      const res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
+      let res;
+      try {
+        res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
+      } catch (e) {
+        if (!(e instanceof ApiError && (e.code === "invalid_request" || e.code === "payload_too_large"))) throw e;
+        const entryIds = new Set(batch.map((op) => op.entryId));
+        const tabIds = Object.entries(store.s.mappings.tabs).filter(([, m]) => entryIds.has(m.entryId)).map(([k]) => Number(k));
+        await store.set({
+          pending: acknowledge(store.s.pending, batch.map((op) => op.opId)),
+          mappings: removeMappings(store.s.mappings, tabIds)
+        });
+        rejected += batch.length;
+        continue;
+      }
       await store.set({
         pending: acknowledge(store.s.pending, res.results.map((r) => r.opId)),
         mappings: applyResults(store.s.mappings, batch, res.results)
@@ -577,6 +613,10 @@
       await applyCatchUp(store, res.catchUp?.operations ?? []);
       await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), lastSync: nowIso(deps2) });
     }
+    return { rejected };
+  }
+  function rejectedMessage(rejected) {
+    return rejected > 0 ? `${rejected} change(s) were rejected by the server and dropped` : null;
   }
   async function handOver(deps2) {
     const store = await Store.open(deps2);
@@ -588,23 +628,23 @@
       const p = plan({
         entries: null,
         tabs: eligible,
-        mappings: reconcileMappings(store.s.mappings, all),
+        mappings: await currentMappings(store, all, eligible),
         pendingEntries: pendingEntryIds(store.s.pending),
         newId: idGen(deps2)
       });
       await store.set({ mappings: p.mappings, pending: append(store.s.pending, p.open) });
-      await flush(store);
+      const { rejected } = await flush(store);
       await apiFor(deps2, store.s).release(generation);
       await store.set({
         generation: null,
         owner: null,
         lastSync: nowIso(deps2),
-        lastError: null,
+        lastError: rejectedMessage(rejected),
         statusText: `Handed over at revision ${store.s.lastRevision}`
       });
       return store.s;
     } catch (e) {
-      return fail(store, e);
+      return fail(store, e, store.s.generation);
     }
   }
   async function continueHere(deps2) {
@@ -627,21 +667,22 @@
       const p = plan({
         entries: session.entries,
         tabs: eligible,
-        mappings: reconcileMappings(store.s.mappings, all),
+        mappings: await currentMappings(store, all, eligible),
         pendingEntries: pendingEntryIds(store.s.pending),
         newId: idGen(deps2)
       });
       await store.set({ mappings: p.mappings, pending: append(store.s.pending, p.open) });
       const { failed } = await createTabs(store, p.create);
-      await flush(store);
+      const { rejected } = await flush(store);
+      const errors = [failed > 0 ? `${failed} tab(s) could not be created` : null, rejectedMessage(rejected)];
       await store.set({
         lastSync: nowIso(deps2),
-        lastError: failed > 0 ? `${failed} tab(s) could not be created` : null,
+        lastError: errors.filter(Boolean).join("; ") || null,
         statusText: `Owner, generation ${generation}, revision ${store.s.lastRevision}`
       });
       return store.s;
     } catch (e) {
-      return fail(store, e);
+      return fail(store, e, store.s.generation);
     }
   }
   async function pair(deps2, input) {
@@ -727,11 +768,29 @@
       await apiFor(deps2, store.s).heartbeat(generation);
       await store.set({ lastSync: nowIso(deps2) });
     } catch (e) {
-      await fail(store, e).catch(() => void 0);
+      await fail(store, e, generation).catch(() => void 0);
     }
   }
   async function resetForBrowserStartup(deps2) {
-    await saveState(deps2.adapter.storage, { mappings: emptyMappings(), receivingWindowId: null, runLock: null });
+    const s = await loadState(deps2.adapter.storage);
+    const previous = [...Object.values(s.staleMappings?.tabs ?? {}), ...Object.values(s.mappings.tabs)];
+    const staleMappings = {
+      tabs: Object.fromEntries(previous.map((m, i) => [`stale-${i}`, m])),
+      urlCounts: s.mappings.urlCounts
+    };
+    await saveState(deps2.adapter.storage, {
+      mappings: emptyMappings(),
+      staleMappings: previous.length > 0 ? staleMappings : null,
+      receivingWindowId: null,
+      runLock: null
+    });
+  }
+  async function updateMappedUrl(deps2, tabId, url) {
+    if (!isShareableUrl(url)) return;
+    const s = await loadState(deps2.adapter.storage);
+    const m = s.mappings.tabs[String(tabId)];
+    if (!m || m.url === url) return;
+    await saveState(deps2.adapter.storage, { mappings: setMapping(s.mappings, tabId, m.entryId, url) });
   }
 
   // src/core/lock.ts
@@ -794,9 +853,9 @@
   async function pairExclusive() {
     if (current) await current.catch(() => void 0);
     const result = await exclusive("pair", () => pairFromPending(deps));
-    if (!result && !isPaired(await loadState(adapter.storage))) {
-      throw new Error("Pairing form expired or was already used; enter the code again");
-    }
+    if (result) return;
+    const s = await loadState(adapter.storage);
+    if (!isPaired(s)) throw new Error(s.lastError ?? "Pairing form expired or was already used; enter the code again");
   }
   async function setup() {
     const state = await loadState(adapter.storage);
@@ -817,8 +876,13 @@
     void resetForBrowserStartup(deps).then(setup);
   });
   adapter.onAlarm((name) => {
-    if (name !== HEARTBEAT_ALARM || current) return;
-    void loadState(adapter.storage).then((s) => isLocked(s, Date.now()) ? void 0 : heartbeat(deps));
+    if (name !== HEARTBEAT_ALARM) return;
+    void exclusive("heartbeat", () => heartbeat(deps)).catch(() => void 0);
+  });
+  var urlUpdates = Promise.resolve();
+  adapter.onTabUpdated((tab, change) => {
+    if (change.url === void 0 && change.status !== "complete") return;
+    urlUpdates = urlUpdates.then(() => current?.catch(() => void 0)).then(() => updateMappedUrl(deps, tab.id, tab.url)).catch(() => void 0);
   });
   adapter.onWindowFocusChanged((windowId) => {
     if (windowId === null) return;

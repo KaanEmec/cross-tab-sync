@@ -95,7 +95,7 @@ describe("normalizeServerUrl", () => {
     ["http://127.0.0.1:8080/", "http://127.0.0.1:8080"],
   ])("%s -> %s", (input, out) => expect(normalizeServerUrl(input)).toBe(out));
 
-  it.each(["http://sync.example", "ftp://x", "not a url", "https://x/?a=1"])("rejects %s", (input) => {
+  it.each(["http://sync.example", "http://[::1]:8080", "ftp://x", "not a url", "https://x/?a=1"])("rejects %s", (input) => {
     expect(() => normalizeServerUrl(input)).toThrow();
   });
 });

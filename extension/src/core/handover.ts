@@ -10,13 +10,15 @@ import {
   type LoggedOperation,
   type OpResult,
   type Operation,
+  type OperationsResponse,
   type Owner,
 } from "./client.js";
-import { eligibleTabs, type EligibleTab } from "./eligibility.js";
+import { eligibleTabs, isShareableUrl, type EligibleTab } from "./eligibility.js";
 import { acknowledge, append, batches, list, newOpId, pendingEntryIds } from "./journal.js";
 import {
   emptyMappings,
   reconcileMappings,
+  rematchByUrl,
   remapEntry,
   removeMappings,
   setMapping,
@@ -72,11 +74,14 @@ function ownerLabel(o: Owner | null): string {
 }
 
 /**
- * Record an error in state. `stale_owner` drops owner state; `device_revoked` clears credentials.
- * Always rethrows so the caller can report it.
+ * Record an error in state. `stale_owner` drops owner state, but only if the persisted generation
+ * is still the one the failed request sent (a late reply must not wipe a newer acquisition);
+ * `device_revoked` clears credentials. Always rethrows so the caller can report it.
  */
-async function fail(store: Store, e: unknown): Promise<never> {
+async function fail(store: Store, e: unknown, sentGeneration?: number | null): Promise<never> {
   if (e instanceof ApiError && e.code === "stale_owner") {
+    const persisted = (await loadState(store.deps.adapter.storage)).generation;
+    if (sentGeneration !== undefined && persisted !== sentGeneration) throw e;
     const owner = e.owner;
     await store.set({
       generation: null,
@@ -102,6 +107,17 @@ async function captureTabs(adapter: BrowserAdapter): Promise<{ all: TabInfo[]; e
 }
 
 /**
+ * Current mappings: drop tabs that are gone, then (first run after a browser restart) re-match the
+ * previous session's mappings to current tabs by last-known URL. Persists the result.
+ */
+async function currentMappings(store: Store, all: TabInfo[], eligible: EligibleTab[]): Promise<Mappings> {
+  let mappings = reconcileMappings(store.s.mappings, all);
+  if (store.s.staleMappings) mappings = rematchByUrl(store.s.staleMappings, eligible, mappings);
+  await store.set({ mappings, staleMappings: null });
+  return mappings;
+}
+
+/**
  * Window that receives created tabs: the last focused normal window, else the persisted
  * `receivingWindowId`, else any normal window. Null means a window must be created.
  */
@@ -122,7 +138,6 @@ async function createTabs(
   if (items.length === 0) return { created: 0, failed: 0 };
   const { adapter } = store.deps;
   let windowId = await resolveReceivingWindow(adapter, store.s.receivingWindowId);
-  let mappings = store.s.mappings;
   let created = 0;
   let failed = 0;
   for (const item of items) {
@@ -136,13 +151,13 @@ async function createTabs(
       } else {
         tab = await adapter.createTab({ windowId, url: item.url, pinned: item.pinned });
       }
-      mappings = setMapping(mappings, tab.id, item.entryId, item.url);
+      // Persist per tab: a worker killed mid-loop must not leave created tabs unmapped.
+      await store.set({ mappings: setMapping(store.s.mappings, tab.id, item.entryId, item.url), receivingWindowId: windowId });
       created++;
     } catch {
       failed++;
     }
   }
-  await store.set({ mappings, receivingWindowId: windowId });
   return { created, failed };
 }
 
@@ -169,7 +184,7 @@ async function applyCatchUp(store: Store, ops: LoggedOperation[]): Promise<void>
   if (foreign.length === 0) return;
   const { adapter } = store.deps;
   const { all, eligible } = await captureTabs(adapter);
-  let mappings = reconcileMappings(store.s.mappings, all);
+  let mappings = await currentMappings(store, all, eligible);
   const toCreate: TabToCreate[] = [];
 
   for (const { op, result } of foreign) {
@@ -217,7 +232,7 @@ async function applyCatchUp(store: Store, ops: LoggedOperation[]): Promise<void>
  * Send every journaled operation (in server-sized batches) and apply results and catchUp.
  * With nothing to send, catch up through `changes?since=` instead of posting an empty batch.
  */
-async function flush(store: Store): Promise<void> {
+async function flush(store: Store): Promise<{ rejected: number }> {
   const deps = store.deps;
   const generation = store.s.generation;
   if (generation === null) throw new Error("This device is not the owner");
@@ -232,10 +247,28 @@ async function flush(store: Store): Promise<void> {
       // History older than the server keeps: the next Continue here resyncs from the full session.
       if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
     }
-    return;
+    return { rejected: 0 };
   }
+  let rejected = 0;
   for (const batch of pending) {
-    const res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
+    let res: OperationsResponse;
+    try {
+      res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
+    } catch (e) {
+      // A batch the server refuses as malformed would be refused forever: drop it from the journal
+      // and unmap its tabs so the rest proceeds. Nothing in the batch was applied.
+      if (!(e instanceof ApiError && (e.code === "invalid_request" || e.code === "payload_too_large"))) throw e;
+      const entryIds = new Set(batch.map((op) => op.entryId));
+      const tabIds = Object.entries(store.s.mappings.tabs)
+        .filter(([, m]) => entryIds.has(m.entryId))
+        .map(([k]) => Number(k));
+      await store.set({
+        pending: acknowledge(store.s.pending, batch.map((op) => op.opId)),
+        mappings: removeMappings(store.s.mappings, tabIds),
+      });
+      rejected += batch.length;
+      continue;
+    }
     await store.set({
       pending: acknowledge(store.s.pending, res.results.map((r) => r.opId)),
       mappings: applyResults(store.s.mappings, batch, res.results),
@@ -243,6 +276,11 @@ async function flush(store: Store): Promise<void> {
     await applyCatchUp(store, res.catchUp?.operations ?? []);
     await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), lastSync: nowIso(deps) });
   }
+  return { rejected };
+}
+
+function rejectedMessage(rejected: number): string | null {
+  return rejected > 0 ? `${rejected} change(s) were rejected by the server and dropped` : null;
 }
 
 /** Hand over: publish unmapped eligible tabs, apply catchUp, release ownership. */
@@ -257,25 +295,25 @@ export async function handOver(deps: Deps): Promise<State> {
     const p = plan({
       entries: null,
       tabs: eligible,
-      mappings: reconcileMappings(store.s.mappings, all),
+      mappings: await currentMappings(store, all, eligible),
       pendingEntries: pendingEntryIds(store.s.pending),
       newId: idGen(deps),
     });
     // Journal before sending: a crash or network error leaves ops to be replayed with the same ids.
     await store.set({ mappings: p.mappings, pending: append(store.s.pending, p.open) });
-    await flush(store);
+    const { rejected } = await flush(store);
 
     await apiFor(deps, store.s).release(generation);
     await store.set({
       generation: null,
       owner: null,
       lastSync: nowIso(deps),
-      lastError: null,
+      lastError: rejectedMessage(rejected),
       statusText: `Handed over at revision ${store.s.lastRevision}`,
     });
     return store.s;
   } catch (e) {
-    return fail(store, e);
+    return fail(store, e, store.s.generation);
   }
 }
 
@@ -302,22 +340,23 @@ export async function continueHere(deps: Deps): Promise<State> {
     const p = plan({
       entries: session.entries,
       tabs: eligible,
-      mappings: reconcileMappings(store.s.mappings, all),
+      mappings: await currentMappings(store, all, eligible),
       pendingEntries: pendingEntryIds(store.s.pending),
       newId: idGen(deps),
     });
     await store.set({ mappings: p.mappings, pending: append(store.s.pending, p.open) });
     const { failed } = await createTabs(store, p.create);
-    await flush(store);
+    const { rejected } = await flush(store);
 
+    const errors = [failed > 0 ? `${failed} tab(s) could not be created` : null, rejectedMessage(rejected)];
     await store.set({
       lastSync: nowIso(deps),
-      lastError: failed > 0 ? `${failed} tab(s) could not be created` : null,
+      lastError: errors.filter(Boolean).join("; ") || null,
       statusText: `Owner, generation ${generation}, revision ${store.s.lastRevision}`,
     });
     return store.s;
   } catch (e) {
-    return fail(store, e);
+    return fail(store, e, store.s.generation);
   }
 }
 
@@ -425,11 +464,35 @@ export async function heartbeat(deps: Deps): Promise<void> {
     await apiFor(deps, store.s).heartbeat(generation);
     await store.set({ lastSync: nowIso(deps) });
   } catch (e) {
-    await fail(store, e).catch(() => undefined);
+    await fail(store, e, generation).catch(() => undefined);
   }
 }
 
-/** Clear tab mappings at browser startup: tab ids are only valid within one browser session. */
+/**
+ * Browser startup: tab ids from the previous session are meaningless, so set the mappings aside
+ * as `staleMappings`; the next action re-matches them by last-known URL (restored tabs may still
+ * be loading now).
+ */
 export async function resetForBrowserStartup(deps: Deps): Promise<void> {
-  await saveState(deps.adapter.storage, { mappings: emptyMappings(), receivingWindowId: null, runLock: null });
+  const s = await loadState(deps.adapter.storage);
+  const previous = [...Object.values(s.staleMappings?.tabs ?? {}), ...Object.values(s.mappings.tabs)];
+  const staleMappings: Mappings = {
+    tabs: Object.fromEntries(previous.map((m, i) => [`stale-${i}`, m])),
+    urlCounts: s.mappings.urlCounts,
+  };
+  await saveState(deps.adapter.storage, {
+    mappings: emptyMappings(),
+    staleMappings: previous.length > 0 ? staleMappings : null,
+    receivingWindowId: null,
+    runLock: null,
+  });
+}
+
+/** Keep a mapped tab's last-known URL current (tabs.onUpdated). Unmapped tabs are ignored. */
+export async function updateMappedUrl(deps: Deps, tabId: number, url: string | undefined): Promise<void> {
+  if (!isShareableUrl(url)) return;
+  const s = await loadState(deps.adapter.storage);
+  const m = s.mappings.tabs[String(tabId)];
+  if (!m || m.url === url) return;
+  await saveState(deps.adapter.storage, { mappings: setMapping(s.mappings, tabId, m.entryId, url) });
 }

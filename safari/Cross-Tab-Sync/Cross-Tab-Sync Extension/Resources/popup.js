@@ -24,6 +24,7 @@
       generation: null,
       owner: null,
       mappings: emptyMappings(),
+      staleMappings: null,
       pending: [],
       lastSync: null,
       lastError: null,
@@ -138,7 +139,7 @@
     try {
       return await chrome.permissions.request({ origins: [pattern] });
     } catch {
-      return true;
+      return false;
     }
   }
   pairView.addEventListener("submit", (ev) => {
@@ -151,7 +152,7 @@
     void Promise.all([saved, granted]).then(async ([, ok]) => {
       if (!ok) {
         await saveState(storageLocal, { pendingPair: null });
-        showError("Permission to reach the server was denied. Pairing needs access to the server address.");
+        showError("Permission to reach the server was denied or is not available for this address. Pairing needs access to the server.");
         return;
       }
       const res = await run({ type: "pair" });
@@ -172,8 +173,22 @@
       el.hidden = false;
     }
   });
+  var disconnectArmed = null;
   $("disconnect").addEventListener("click", () => {
-    if (confirm("Disconnect this browser from the sync server? Your tabs stay open.")) void run({ type: "disconnect" });
+    const btn = $("disconnect");
+    if (disconnectArmed === null) {
+      btn.textContent = "Click again to disconnect";
+      btn.title = "Your tabs stay open";
+      disconnectArmed = setTimeout(() => {
+        disconnectArmed = null;
+        btn.textContent = "Disconnect";
+      }, 4e3);
+      return;
+    }
+    clearTimeout(disconnectArmed);
+    disconnectArmed = null;
+    btn.textContent = "Disconnect";
+    void run({ type: "disconnect" });
   });
   chrome.storage.onChanged.addListener((_changes, area) => {
     if (area !== "local" || busy) return;

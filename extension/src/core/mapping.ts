@@ -54,9 +54,25 @@ export function remapEntry(m: Mappings, from: string, to: string, url?: string):
 }
 
 /**
- * Drop mappings for tabs that no longer exist. A tab whose URL changed keeps its mapping:
- * navigation is propagated in v0.2, not by re-opening. Mappings are cleared on browser
- * startup because tab ids are only stable within one browser session.
+ * Rebuild mappings after a browser restart, when tab ids changed: each stored mapping claims one
+ * current eligible tab whose URL equals the mapping's last-known URL (exact match). Mappings
+ * without a match are dropped.
+ */
+export function rematchByUrl(stored: Mappings, tabs: { id: number; url: string }[], base: Mappings = emptyMappings()): Mappings {
+  const claimed = new Set(Object.keys(base.tabs).map(Number));
+  let m = base;
+  for (const old of Object.values(stored.tabs)) {
+    const tab = tabs.find((t) => t.url === old.url && !claimed.has(t.id));
+    if (!tab) continue;
+    claimed.add(tab.id);
+    m = setMapping(m, tab.id, old.entryId, old.url);
+  }
+  return m;
+}
+
+/**
+ * Drop mappings for tabs that no longer exist. A tab whose URL changed keeps its mapping (its
+ * last-known URL is kept current from tabs.onUpdated); navigation is propagated in v0.2.
  */
 export function reconcileMappings(m: Mappings, allTabs: TabInfo[]): Mappings {
   const present = new Set(allTabs.map((t) => String(t.id)));

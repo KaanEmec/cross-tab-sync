@@ -11,6 +11,7 @@ import {
   pairFromPending,
   refreshOwner,
   resetForBrowserStartup,
+  updateMappedUrl,
   type Deps,
 } from "../src/core/handover.js";
 import { list } from "../src/core/journal.js";
@@ -366,12 +367,149 @@ describe("lifecycle", () => {
     expect(urls(mac.b)).toEqual(["https://a/"]);
   });
 
-  it("browser startup clears tab mappings (tab ids are per browser session)", async () => {
+  it("browser startup sets mappings aside for re-matching (tab ids are per browser session)", async () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
     await continueHere(mac.deps);
     await resetForBrowserStartup(mac.deps);
     const s = await mac.state();
     expect(s.mappings.tabs).toEqual({});
+    expect(Object.values(s.staleMappings?.tabs ?? {}).map((m) => m.url)).toEqual(["https://a/"]);
     expect(s.token).not.toBeNull();
   });
 });
+
+describe("review fixes", () => {
+  it("drops a batch the server rejects as invalid, unmaps its tabs, and the next run succeeds", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
+    await continueHere(mac.deps);
+    // A journaled op from an older build with a URL the server cannot parse.
+    const bad = mac.b.addTab(mac.b.windows[0]!.id, { url: "https://example.com/%zz" });
+    const entryId = crypto.randomUUID();
+    await saveState(mac.b.storage, {
+      pending: [{ op: { opId: crypto.randomUUID(), type: "open", entryId, url: "https://example.com/%zz" }, queuedAt: "" }],
+      mappings: { tabs: { [String(bad.id)]: { entryId, url: "https://example.com/%zz" } }, urlCounts: {} },
+    });
+
+    const s = await handOver(mac.deps);
+    expect(s.pending).toEqual([]);
+    expect(s.mappings.tabs[String(bad.id)]).toBeUndefined();
+    expect(s.lastError).toBe("1 change(s) were rejected by the server and dropped");
+    expect(s.generation).toBeNull(); // released despite the rejected batch
+    expect(server.openUrls()).toEqual([]);
+
+    mac.b.addTab(mac.b.windows[0]!.id, { url: "https://ok/" });
+    const s2 = await continueHere(mac.deps);
+    expect(s2.lastError).toBeNull();
+    expect(s2.pending).toEqual([]);
+    expect(server.openUrls()).toEqual(["https://ok/"]); // the bad tab is not eligible any more
+  });
+
+  it("flushes several batches with baseRevision advancing", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
+    await continueHere(mac.deps);
+    const win = mac.b.windows[0]!.id;
+    for (let i = 0; i < 620; i++) mac.b.addTab(win, { url: `https://site.example/page/${i}` });
+
+    const s = await handOver(mac.deps);
+    const sent = server.requests
+      .filter((r) => r.path === "operations")
+      .map((r) => r.body as { baseRevision: number; operations: unknown[] });
+    expect(sent.length).toBeGreaterThan(1);
+    expect(sent.reduce((n, b) => n + b.operations.length, 0)).toBe(620);
+    for (const b of sent) {
+      expect(b.operations.length).toBeLessThanOrEqual(500);
+      expect(new TextEncoder().encode(JSON.stringify(b)).length).toBeLessThan(64 * 1024);
+    }
+    // Each batch's baseRevision is the revision returned for the previous one.
+    let expected = 0;
+    for (const b of sent) {
+      expect(b.baseRevision).toBe(expected);
+      expected += b.operations.length;
+    }
+    expect(s.lastRevision).toBe(620);
+    expect(s.pending).toEqual([]);
+    expect(server.openUrls()).toHaveLength(620);
+  });
+
+  it("a late heartbeat 409 does not drop an ownership acquired since", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
+    await continueHere(mac.deps); // generation 1
+    const brave = await device("Brave", (b) => b.addWindow({ focused: true }));
+    await continueHere(brave.deps); // generation 2
+    // mac still believes it holds generation 1 (it has not noticed the takeover yet).
+    await saveState(mac.b.storage, { generation: 1 });
+
+    let release!: () => void;
+    server.beforeHeartbeat = () => new Promise<void>((r) => (release = r));
+    const beat = heartbeat(mac.deps); // sends generation 1, held by the server
+    await new Promise((r) => setTimeout(r, 0));
+    server.beforeHeartbeat = undefined;
+    const s = await continueHere(mac.deps); // generation 3
+    expect(s.generation).toBe(3);
+    release();
+    await beat;
+
+    const after = await mac.state();
+    expect(after.generation).toBe(3);
+    expect(after.owner?.deviceId).toBe(after.deviceId);
+  });
+
+  it("re-matches tabs by last-known URL after a browser restart", async () => {
+    const mac = await device("Mac Safari", (b) =>
+      b.addWindow({ focused: true, tabs: [{ url: "https://a/" }, { url: "https://b/" }, { url: "https://a/" }] }),
+    );
+    await continueHere(mac.deps);
+    const revision = server.revision;
+    // The user navigated the b tab; onUpdated keeps its last-known URL current.
+    const bTab = mac.b.tabs[1]!;
+    bTab.url = "https://b/next";
+    await updateMappedUrl(mac.deps, bTab.id, bTab.url);
+    const entriesBefore = (await mac.state()).mappings.tabs;
+
+    // Restart: same pages restored under new tab ids.
+    await resetForBrowserStartup(mac.deps);
+    mac.b.tabs = [];
+    mac.b.windows = [];
+    mac.b.addWindow({ focused: true, tabs: [{ url: "https://a/" }, { url: "https://b/next" }, { url: "https://a/" }] });
+
+    const s = await continueHere(mac.deps);
+    expect(createCalls(mac.b)).toEqual([]); // nothing recreated (https://b/ is satisfied by the moved tab)
+    expect(server.revision).toBe(revision); // nothing republished
+    expect(s.staleMappings).toBeNull();
+    expect(Object.values(s.mappings.tabs).map((m) => m.entryId).sort()).toEqual(
+      Object.values(entriesBefore).map((m) => m.entryId).sort(),
+    );
+    expect(urls(mac.b)).toEqual(["https://a/", "https://b/next", "https://a/"]);
+  });
+
+  it("persists each created tab's mapping, even when a later create fails", async () => {
+    const other = await device("Brave", (b) =>
+      b.addWindow({ focused: true, tabs: [{ url: "https://1/" }, { url: "https://2/" }, { url: "https://3/" }] }),
+    );
+    await continueHere(other.deps);
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
+    mac.b.failCreateFor.add("https://2/");
+    const seenAtCreate: number[] = [];
+    const create = mac.b.createTab.bind(mac.b);
+    mac.b.createTab = async (opts) => {
+      seenAtCreate.push(Object.keys((await mac.state()).mappings.tabs).length);
+      return create(opts);
+    };
+
+    const s = await continueHere(mac.deps);
+    expect(seenAtCreate).toEqual([0, 1, 1]); // the first tab was persisted before the next create
+    expect(urls(mac.b)).toEqual(["https://1/", "https://3/"]);
+    expect(Object.values(s.mappings.tabs).map((m) => m.url).sort()).toEqual(["https://1/", "https://3/"]);
+    expect(s.lastError).toBe("1 tab(s) could not be created");
+  });
+
+  it("updateMappedUrl ignores unmapped tabs and unshareable URLs", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
+    await continueHere(mac.deps);
+    const id = mac.b.tabs[0]!.id;
+    await updateMappedUrl(mac.deps, id, "");
+    await updateMappedUrl(mac.deps, 999, "https://x/");
+    expect((await mac.state()).mappings.tabs).toEqual({ [String(id)]: expect.objectContaining({ url: "https://a/" }) });
+  });
+});
+

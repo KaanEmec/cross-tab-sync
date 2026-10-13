@@ -54,7 +54,7 @@ export class FakeBrowser implements BrowserAdapter {
     alarm: new Emitter<[string]>(),
     tabCreated: new Emitter<[TabInfo]>(),
     tabRemoved: new Emitter<[number, boolean]>(),
-    tabUpdated: new Emitter<[TabInfo]>(),
+    tabUpdated: new Emitter<[TabInfo, { url?: string; status?: string }]>(),
     tabActivated: new Emitter<[number, number]>(),
     windowFocus: new Emitter<[number | null]>(),
   };
@@ -138,7 +138,7 @@ export class FakeBrowser implements BrowserAdapter {
   onAlarm = (cb: (name: string) => void) => this.events.alarm.on(cb);
   onTabCreated = (cb: (tab: TabInfo) => void) => this.events.tabCreated.on(cb);
   onTabRemoved = (cb: (tabId: number, windowClosing: boolean) => void) => this.events.tabRemoved.on(cb);
-  onTabUpdated = (cb: (tab: TabInfo) => void) => this.events.tabUpdated.on(cb);
+  onTabUpdated = (cb: (tab: TabInfo, change: { url?: string; status?: string }) => void) => this.events.tabUpdated.on(cb);
   onTabActivated = (cb: (tabId: number, windowId: number) => void) => this.events.tabActivated.on(cb);
   onWindowFocusChanged = (cb: (windowId: number | null) => void) => this.events.windowFocus.on(cb);
 }
