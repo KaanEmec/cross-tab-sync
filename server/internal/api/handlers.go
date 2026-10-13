@@ -22,13 +22,14 @@ type entryJSON struct {
 }
 
 type sessionJSON struct {
-	Revision int64        `json:"revision"`
-	Owner    *store.Owner `json:"owner"`
-	Entries  []entryJSON  `json:"entries"`
+	Revision    int64        `json:"revision"`
+	MinRevision int64        `json:"minRevision"`
+	Owner       *store.Owner `json:"owner"`
+	Entries     []entryJSON  `json:"entries"`
 }
 
 func toSessionJSON(s store.Session) sessionJSON {
-	out := sessionJSON{Revision: s.Revision, Owner: s.Owner, Entries: make([]entryJSON, len(s.Entries))}
+	out := sessionJSON{Revision: s.Revision, MinRevision: s.MinRevision, Owner: s.Owner, Entries: make([]entryJSON, len(s.Entries))}
 	for i, e := range s.Entries {
 		out.Entries[i] = entryJSON{ID: e.ID, URL: e.URL, Pinned: e.Pinned, Position: e.Position, UpdatedRevision: e.UpdatedRevision}
 	}
@@ -152,12 +153,14 @@ func (s *Server) changes(w http.ResponseWriter, r *http.Request) {
 		invalid(w, "since must be an integer revision")
 		return
 	}
-	rev, owner, ops, err := s.store.Changes(r.Context(), since)
+	cs, err := s.store.Changes(r.Context(), since)
 	if err != nil {
 		s.storeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"revision": rev, "owner": owner, "operations": ops})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"revision": cs.Revision, "minRevision": cs.MinRevision, "owner": cs.Owner, "operations": cs.Operations,
+	})
 }
 
 func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
@@ -231,9 +234,7 @@ func (s *Server) operations(w http.ResponseWriter, r *http.Request) {
 	case req.BaseRevision == nil || *req.BaseRevision < 0:
 		invalid(w, "baseRevision must be a non-negative integer")
 		return
-	case len(req.Operations) > session.MaxBatchOps:
-		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-			fmt.Sprintf("at most %d operations per batch", session.MaxBatchOps), nil)
+	case !batchSizeOK(w, len(req.Operations)):
 		return
 	}
 	// Validate everything before touching state: a bad op rejects the batch.
@@ -249,11 +250,48 @@ func (s *Server) operations(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"revision": res.Revision,
-		"results":  results(res.Results),
-		"catchUp":  map[string]any{"operations": res.CatchUp},
-	})
+	body := map[string]any{"revision": res.Revision, "results": results(res.Results)}
+	if res.FullResync {
+		body["fullResync"] = true
+	} else {
+		body["catchUp"] = map[string]any{"operations": res.CatchUp}
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// batchSizeOK writes 413 and returns false when a batch has too many operations.
+func batchSizeOK(w http.ResponseWriter, n int) bool {
+	if n <= session.MaxBatchOps {
+		return true
+	}
+	writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+		fmt.Sprintf("at most %d operations per batch", session.MaxBatchOps), nil)
+	return false
+}
+
+func (s *Server) merge(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Operations []session.MergeOp `json:"operations"`
+	}
+	if !decode(w, r, &req, false) || !batchSizeOK(w, len(req.Operations)) {
+		return
+	}
+	for i, op := range req.Operations {
+		if op.BaseRevision == nil || *op.BaseRevision < 0 {
+			invalid(w, fmt.Sprintf("operations[%d]: baseRevision must be a non-negative integer", i))
+			return
+		}
+		if err := session.Validate(op.Op); err != nil {
+			invalid(w, fmt.Sprintf("operations[%d]: %v", i, err))
+			return
+		}
+	}
+	res, err := s.store.Merge(r.Context(), device(r).ID, req.Operations, s.now(), s.cfg.SnapshotRetention)
+	if err != nil {
+		s.storeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revision": res.Revision, "results": results(res.Results)})
 }
 
 func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {

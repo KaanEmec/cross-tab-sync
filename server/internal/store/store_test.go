@@ -129,6 +129,7 @@ func TestRevokedDeviceCannotWrite(t *testing.T) {
 	checks["heartbeat"] = st.Heartbeat(ctx, a, gen, now)
 	_, checks["operations"] = st.ApplyOperations(ctx, a, gen, 0, nil, now, 5)
 	_, checks["restore"] = st.RestoreSnapshot(ctx, a, gen, 1, now, 5)
+	_, checks["merge"] = st.Merge(ctx, a, nil, now, 5)
 	checks["revoke"] = st.RevokeDevice(ctx, a, b, now)
 	for name, err := range checks {
 		if !errors.Is(err, ErrRevoked) {

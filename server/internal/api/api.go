@@ -43,6 +43,7 @@ func New(st *store.Store, cfg config.Config, log *slog.Logger, now func() time.T
 	mux.Handle("POST /v1/session/release", s.auth(s.release))
 	mux.Handle("POST /v1/session/heartbeat", s.auth(s.heartbeat))
 	mux.Handle("POST /v1/session/operations", s.auth(s.operations))
+	mux.Handle("POST /v1/session/merge", s.auth(s.merge))
 	mux.Handle("GET /v1/snapshots", s.auth(s.listSnapshots))
 	mux.Handle("POST /v1/snapshots/{id}/restore", s.auth(s.restore))
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {

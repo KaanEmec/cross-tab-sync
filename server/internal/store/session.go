@@ -29,9 +29,18 @@ type Owner struct {
 
 // Session is the current shared session with its open entries.
 type Session struct {
-	Revision int64
-	Owner    *Owner
-	Entries  []session.Entry
+	Revision    int64
+	MinRevision int64 // oldest retained operation sequence number
+	Owner       *Owner
+	Entries     []session.Entry
+}
+
+// ChangeSet is the answer to a changes request.
+type ChangeSet struct {
+	Revision    int64
+	MinRevision int64
+	Owner       *Owner
+	Operations  []LoggedOp
 }
 
 // LoggedOp is one applied operation from the log.
@@ -42,11 +51,12 @@ type LoggedOp struct {
 	Result   json.RawMessage `json:"result"`
 }
 
-// BatchResult is the outcome of an operations batch or a restore.
+// BatchResult is the outcome of an operations batch, a merge or a restore.
 type BatchResult struct {
-	Revision int64
-	Results  []session.Result
-	CatchUp  []LoggedOp
+	Revision   int64
+	Results    []session.Result
+	CatchUp    []LoggedOp
+	FullResync bool // baseRevision is outside the retained history; CatchUp is empty
 }
 
 // Snapshot describes a stored recovery snapshot.
@@ -67,10 +77,15 @@ type snapshotEntry struct {
 }
 
 type sessionRow struct {
-	revision   int64
-	generation int64
-	owner      *Owner
+	revision    int64
+	minRevision int64
+	generation  int64
+	owner       *Owner
 }
+
+// expired reports whether a client that has applied revision base cannot
+// catch up from the retained history.
+func (r sessionRow) expired(base int64) bool { return base < r.minRevision-1 }
 
 func loadSession(ctx context.Context, tx *sql.Tx) (sessionRow, error) {
 	var (
@@ -79,9 +94,9 @@ func loadSession(ctx context.Context, tx *sql.Tx) (sessionRow, error) {
 		lastSeen sql.NullInt64
 		name     sql.NullString
 	)
-	err := tx.QueryRowContext(ctx, `SELECT s.revision, s.generation, s.owner_device_id, s.owner_last_seen_at, d.name
+	err := tx.QueryRowContext(ctx, `SELECT s.revision, s.min_revision, s.generation, s.owner_device_id, s.owner_last_seen_at, d.name
 		FROM session s LEFT JOIN devices d ON d.id = s.owner_device_id WHERE s.id = 1`).
-		Scan(&r.revision, &r.generation, &ownerID, &lastSeen, &name)
+		Scan(&r.revision, &r.minRevision, &r.generation, &ownerID, &lastSeen, &name)
 	if err != nil {
 		return r, fmt.Errorf("loading session: %w", err)
 	}
@@ -122,7 +137,8 @@ func touchOwner(ctx context.Context, tx *sql.Tx, now time.Time) error {
 	return nil
 }
 
-const entryColumns = `id, url, pinned, position, opened_by, created_revision, updated_revision, closed_revision`
+const entryColumns = `id, url, pinned, position, opened_by, created_revision, updated_revision, closed_revision,
+	url_revision, url_device`
 
 func queryEntries(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]session.Entry, error) {
 	rows, err := tx.QueryContext(ctx, query, args...)
@@ -136,7 +152,8 @@ func queryEntries(ctx context.Context, tx *sql.Tx, query string, args ...any) ([
 			e      session.Entry
 			closed sql.NullInt64
 		)
-		if err := rows.Scan(&e.ID, &e.URL, &e.Pinned, &e.Position, &e.OpenedBy, &e.CreatedRevision, &e.UpdatedRevision, &closed); err != nil {
+		if err := rows.Scan(&e.ID, &e.URL, &e.Pinned, &e.Position, &e.OpenedBy, &e.CreatedRevision, &e.UpdatedRevision, &closed,
+			&e.URLRevision, &e.URLDevice); err != nil {
 			return nil, fmt.Errorf("scanning entry: %w", err)
 		}
 		if closed.Valid {
@@ -167,7 +184,7 @@ func (s *Store) GetSession(ctx context.Context) (Session, error) {
 		if err != nil {
 			return err
 		}
-		out = Session{Revision: r.revision, Owner: r.owner, Entries: es}
+		out = Session{Revision: r.revision, MinRevision: r.minRevision, Owner: r.owner, Entries: es}
 		return nil
 	})
 	return out, err
@@ -212,7 +229,7 @@ func (s *Store) Acquire(ctx context.Context, deviceID string, force bool, now ti
 			return err
 		}
 		gen = r.generation
-		out = Session{Revision: r.revision, Owner: r.owner, Entries: es}
+		out = Session{Revision: r.revision, MinRevision: r.minRevision, Owner: r.owner, Entries: es}
 		return nil
 	})
 	return gen, out, err
@@ -255,26 +272,23 @@ func (s *Store) Heartbeat(ctx context.Context, deviceID string, gen int64, now t
 	})
 }
 
-// Changes returns the operations applied after revision since.
-func (s *Store) Changes(ctx context.Context, since int64) (int64, *Owner, []LoggedOp, error) {
-	var (
-		rev   int64
-		owner *Owner
-		ops   []LoggedOp
-	)
+// Changes returns the operations applied after revision since. It fails with
+// ErrHistoryExpired when since is outside the retained history.
+func (s *Store) Changes(ctx context.Context, since int64) (ChangeSet, error) {
+	var out ChangeSet
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		r, err := loadSession(ctx, tx)
 		if err != nil {
 			return err
 		}
-		if since < 0 || since > r.revision {
+		if since < 0 || since > r.revision || r.expired(since) {
 			return ErrHistoryExpired
 		}
-		rev, owner = r.revision, r.owner
-		ops, err = loggedOps(ctx, tx, `SELECT seq, device_id, payload, result FROM operations WHERE seq > ? ORDER BY seq`, since)
+		out = ChangeSet{Revision: r.revision, MinRevision: r.minRevision, Owner: r.owner}
+		out.Operations, err = loggedOps(ctx, tx, `SELECT seq, device_id, payload, result FROM operations WHERE seq > ? ORDER BY seq`, since)
 		return err
 	})
-	return rev, owner, ops, err
+	return out, err
 }
 
 func loggedOps(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]LoggedOp, error) {
@@ -302,7 +316,8 @@ func loggedOps(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]Lo
 }
 
 // ApplyOperations applies a validated batch atomically for the owner at
-// generation gen. catchUp holds other devices' operations after baseRevision.
+// generation gen. catchUp holds other devices' operations after baseRevision,
+// unless baseRevision is outside the retained history (FullResync).
 func (s *Store) ApplyOperations(ctx context.Context, deviceID string, gen, baseRevision int64, ops []session.Op, now time.Time, retention int) (BatchResult, error) {
 	var out BatchResult
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -319,11 +334,13 @@ func (s *Store) ApplyOperations(ctx context.Context, deviceID string, gen, baseR
 		if err := touchOwner(ctx, tx, now); err != nil {
 			return err
 		}
-		out.CatchUp, err = loggedOps(ctx, tx,
-			`SELECT seq, device_id, payload, result FROM operations WHERE seq > ? AND device_id != ? ORDER BY seq`,
-			baseRevision, deviceID)
-		if err != nil {
-			return err
+		if out.FullResync = r.expired(baseRevision); !out.FullResync {
+			out.CatchUp, err = loggedOps(ctx, tx,
+				`SELECT seq, device_id, payload, result FROM operations WHERE seq > ? AND device_id != ? ORDER BY seq`,
+				baseRevision, deviceID)
+			if err != nil {
+				return err
+			}
 		}
 		out.Results, out.Revision, err = applyBatch(ctx, tx, batch{
 			deviceID: deviceID, generation: gen, revision: r.revision, ops: ops,
@@ -334,11 +351,49 @@ func (s *Store) ApplyOperations(ctx context.Context, deviceID string, gen, baseR
 	return out, err
 }
 
+// Merge applies a validated offline journal atomically for any active
+// device, owner or not, with per-operation causal checks against each
+// operation's baseRevision (see session.State.Merge). Ownership is neither
+// required nor changed. Merged operations are logged with generation 0.
+func (s *Store) Merge(ctx context.Context, deviceID string, ops []session.MergeOp, now time.Time, retention int) (BatchResult, error) {
+	var out BatchResult
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, deviceID); err != nil {
+			return err
+		}
+		r, err := loadSession(ctx, tx)
+		if err != nil {
+			return err
+		}
+		plain := make([]session.Op, len(ops))
+		expired := make([]bool, len(ops))
+		bases := make([]int64, len(ops))
+		for i, op := range ops {
+			plain[i], bases[i] = op.Op, *op.BaseRevision
+			// A base ahead of the session (e.g. after a server restore) is
+			// as untrustworthy as one outside the retained history.
+			expired[i] = r.expired(bases[i]) || bases[i] > r.revision
+		}
+		out.Results, out.Revision, err = applyBatch(ctx, tx, batch{
+			deviceID: deviceID, revision: r.revision, ops: plain, now: now, retention: retention,
+			reason: ReasonOperations, merge: &mergeInfo{bases: bases, expired: expired},
+		})
+		return err
+	})
+	return out, err
+}
+
+type mergeInfo struct {
+	bases   []int64 // per-op baseRevision
+	expired []bool  // per-op: base outside the retained history or ahead of the session
+}
+
 type batch struct {
 	deviceID   string
 	generation int64
 	revision   int64
 	ops        []session.Op
+	merge      *mergeInfo // non-nil: apply with merge rules
 	now        time.Time
 	retention  int
 	reason     string // snapshot reason
@@ -370,6 +425,9 @@ func applyBatch(ctx context.Context, tx *sql.Tx, b batch) ([]session.Result, int
 			stored[op.OpID] = res
 		}
 		ids = append(ids, op.EntryID)
+		if b.merge != nil && op.Type == session.TypeNavigate {
+			ids = append(ids, session.ForkedEntryID(op.OpID)) // a fork may already exist as a tombstone
+		}
 	}
 
 	idsJSON, err := json.Marshal(ids)
@@ -391,13 +449,21 @@ func applyBatch(ctx context.Context, tx *sql.Tx, b batch) ([]session.Result, int
 
 	rev := b.revision
 	results := make([]session.Result, 0, len(b.ops))
-	for _, op := range b.ops {
+	for i, op := range b.ops {
 		if res, ok := stored[op.OpID]; ok {
 			res.Replayed = true
 			results = append(results, res)
 			continue
 		}
-		res, changed := st.Apply(op, b.deviceID, rev+1)
+		var (
+			res     session.Result
+			changed *session.Entry
+		)
+		if b.merge != nil {
+			res, changed, op = st.Merge(op, b.merge.bases[i], b.merge.expired[i], b.deviceID, rev+1)
+		} else {
+			res, changed = st.Apply(op, b.deviceID, rev+1)
+		}
 		var seq any
 		if res.Status != session.StatusIgnored {
 			rev++
@@ -435,10 +501,11 @@ func upsertEntry(ctx context.Context, tx *sql.Tx, e *session.Entry) error {
 	if e.ClosedRevision != nil {
 		closed = *e.ClosedRevision
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO entries (`+entryColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := tx.ExecContext(ctx, `INSERT INTO entries (`+entryColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET url = excluded.url, pinned = excluded.pinned, position = excluded.position,
-			updated_revision = excluded.updated_revision, closed_revision = excluded.closed_revision`,
-		e.ID, e.URL, e.Pinned, e.Position, e.OpenedBy, e.CreatedRevision, e.UpdatedRevision, closed)
+			updated_revision = excluded.updated_revision, closed_revision = excluded.closed_revision,
+			url_revision = excluded.url_revision, url_device = excluded.url_device`,
+		e.ID, e.URL, e.Pinned, e.Position, e.OpenedBy, e.CreatedRevision, e.UpdatedRevision, closed, e.URLRevision, e.URLDevice)
 	if err != nil {
 		return fmt.Errorf("writing entry: %w", err)
 	}

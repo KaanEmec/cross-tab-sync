@@ -22,6 +22,7 @@ func TestRoutesRequireToken(t *testing.T) {
 		{"POST", "/v1/session/release"},
 		{"POST", "/v1/session/heartbeat"},
 		{"POST", "/v1/session/operations"},
+		{"POST", "/v1/session/merge"},
 		{"GET", "/v1/snapshots"},
 		{"POST", "/v1/snapshots/1/restore"},
 	}

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+
+	"github.com/google/uuid"
 )
 
 // Operation types.
@@ -23,6 +25,7 @@ const (
 	StatusApplied   = "applied"
 	StatusCoalesced = "coalesced"
 	StatusIgnored   = "ignored"
+	StatusForked    = "forked" // merge only: a stale navigate became an open
 )
 
 // Limits from PROTOCOL.md.
@@ -44,6 +47,13 @@ type Op struct {
 	Position *int64 `json:"position,omitempty"`
 }
 
+// MergeOp is an offline operation submitted through merge, carrying the
+// revision the device had applied when it recorded the change.
+type MergeOp struct {
+	Op
+	BaseRevision *int64 `json:"baseRevision"`
+}
+
 // Result is the stored outcome of an operation.
 type Result struct {
 	OpID     string `json:"opId"`
@@ -62,6 +72,8 @@ type Entry struct {
 	CreatedRevision int64
 	UpdatedRevision int64
 	ClosedRevision  *int64
+	URLRevision     int64  // revision of the last URL change (open or navigate)
+	URLDevice       string // device that made that change; "" when unknown
 }
 
 // Open reports whether the entry is not a tombstone.
@@ -136,12 +148,13 @@ func IsUUID(s string) bool {
 type State struct {
 	byID      map[string]*Entry
 	openByURL map[string]string
+	forks     map[string]string // merge: entry id -> entry forked from it in this batch
 	nextPos   int64
 }
 
 // NewState builds a state from entries; it copies them.
 func NewState(entries []Entry) *State {
-	s := &State{byID: make(map[string]*Entry, len(entries)), openByURL: make(map[string]string)}
+	s := &State{byID: make(map[string]*Entry, len(entries)), openByURL: make(map[string]string), forks: make(map[string]string)}
 	for i := range entries {
 		e := entries[i]
 		s.byID[e.ID] = &e
@@ -175,6 +188,7 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 		ne := &Entry{
 			ID: op.EntryID, URL: op.URL, OpenedBy: deviceID,
 			CreatedRevision: rev, UpdatedRevision: rev, Position: s.nextPos,
+			URLRevision: rev, URLDevice: deviceID,
 		}
 		if op.Pinned != nil {
 			ne.Pinned = *op.Pinned
@@ -200,6 +214,7 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 		delete(s.openByURL, e.URL)
 		e.URL = op.URL
 		e.UpdatedRevision = rev
+		e.URLRevision, e.URLDevice = rev, deviceID
 		s.openByURL[e.URL] = e.ID
 		res.Status, res.EntryID = StatusApplied, e.ID
 		return res, copyEntry(e)
@@ -228,6 +243,53 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 		return res, copyEntry(e)
 	}
 	return res, nil
+}
+
+// ForkedEntryID is the entry id a forked navigate opens: the UUIDv5 (SHA-1)
+// of the name "forked" in the namespace of the operation id. It is stable, so
+// a navigate resubmitted after its opId was pruned cannot fork twice.
+func ForkedEntryID(opID string) string {
+	return uuid.NewSHA1(uuid.MustParse(opID), []byte("forked")).String()
+}
+
+// Merge applies an offline operation recorded at baseRevision, following the
+// merge rules. An existing open entry counts as moved when its URL changed
+// after baseRevision through another device, or always when expired is set
+// (baseRevision outside the retained history). A navigate on a moved entry
+// opens a fresh entry (StatusForked, coalescing on URL); close and update on a
+// moved entry are ignored; open behaves as in Apply. Later operations of the
+// same batch on a forked entry are redirected to its fork.
+//
+// The returned Op is the operation as effectively applied (a forked navigate
+// becomes its open, redirected operations carry the fork's id); the log
+// stores it so followers replay the merge correctly.
+func (s *State) Merge(op Op, baseRevision int64, expired bool, deviceID string, rev int64) (Result, *Entry, Op) {
+	if op.Type == TypeOpen {
+		res, changed := s.Apply(op, deviceID, rev)
+		return res, changed, op
+	}
+	from := op.EntryID
+	if id, ok := s.forks[from]; ok {
+		op.EntryID = id
+	}
+	e := s.byID[op.EntryID]
+	moved := e != nil && e.Open() &&
+		(expired || (e.URLRevision > baseRevision && e.URLDevice != deviceID))
+	if !moved {
+		res, changed := s.Apply(op, deviceID, rev)
+		return res, changed, op
+	}
+	if op.Type != TypeNavigate {
+		return Result{OpID: op.OpID, Status: StatusIgnored}, nil, op
+	}
+	pinned := e.Pinned
+	fork := Op{OpID: op.OpID, Type: TypeOpen, EntryID: ForkedEntryID(op.OpID), URL: op.URL, Pinned: &pinned}
+	res, changed := s.Apply(fork, deviceID, rev)
+	if res.Status == StatusApplied {
+		res.Status = StatusForked
+		s.forks[from] = fork.EntryID
+	}
+	return res, changed, fork
 }
 
 func (s *State) closeEntry(e *Entry, rev int64) {

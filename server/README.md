@@ -25,8 +25,9 @@ CTS_ALLOW_INSECURE=1 ./bin/cross-tab-sync serve     # local development over pla
 | `CTS_ALLOW_INSECURE` | `false` | Accept plain HTTP. Otherwise requests need TLS or `X-Forwarded-Proto: https` (set by Caddy; never expose the service port directly) |
 | `CTS_OWNER_LIVENESS` | `10m` | Owner is stale after this long without heartbeat or operations |
 | `CTS_SNAPSHOT_RETENTION` | `20` | Recovery snapshots kept |
+| `CTS_HISTORY_RETENTION` | `720h` | Operation log and tombstones kept (Go duration) |
 
-Logs are JSON on stdout with method, route pattern, status, device id and latency only. The operation log is never pruned yet, so `changes` and `catchUp` history is unbounded until pruning and catch-up paging arrive in v1.0.0.
+Logs are JSON on stdout with method, route pattern, status, device id and latency only. History older than `CTS_HISTORY_RETENTION` is pruned at startup and hourly (open entries are always kept); clients behind `minRevision` get `410 history_expired` or `fullResync: true` and reload the session.
 
 ## curl examples
 
@@ -40,6 +41,10 @@ curl -s -X POST $S/v1/session/operations -H "Authorization: Bearer $T" -d '{
   "operations": [{"opId":"3f0e8f9c-1b7a-4c2e-9a51-0c8d2b6f4a10","type":"open",
                   "entryId":"8a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d","url":"https://example.com/"}]}'
 curl -s "$S/v1/session/changes?since=0" -H "Authorization: Bearer $T"
+# Offline journal from any device (no ownership); each op carries its own baseRevision.
+curl -s -X POST $S/v1/session/merge -H "Authorization: Bearer $T" -d '{
+  "operations": [{"opId":"7c9e6679-7425-40de-944b-e07fc1f90ae7","type":"navigate","baseRevision":1,
+                  "entryId":"8a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d","url":"https://example.org/"}]}'
 curl -s -X POST $S/v1/session/release -H "Authorization: Bearer $T" -d '{"generation":1}'
 ```
 

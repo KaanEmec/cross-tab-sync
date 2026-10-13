@@ -30,6 +30,7 @@ Configuration (environment):
   CTS_ALLOW_INSECURE      accept plain HTTP without X-Forwarded-Proto: https (default false)
   CTS_OWNER_LIVENESS      owner liveness window (default 10m)
   CTS_SNAPSHOT_RETENTION  recovery snapshots kept (default 20)
+  CTS_HISTORY_RETENTION   operation and tombstone history kept (default 720h)
 `
 
 func main() {
@@ -78,6 +79,21 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		return err
 	}
 	defer st.Close()
+
+	// History pruning: once now, then hourly until shutdown. Deferred after
+	// st.Close so the pruner has stopped before the database closes.
+	pruneCtx, stopPruner := context.WithCancel(ctx)
+	pruned := make(chan struct{})
+	go func() {
+		defer close(pruned)
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		st.RunPruner(pruneCtx, ticker.C, cfg.HistoryRetention, time.Now, logger)
+	}()
+	defer func() {
+		stopPruner()
+		<-pruned
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

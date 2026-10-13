@@ -14,6 +14,7 @@ type Config struct {
 	AllowInsecure     bool          // CTS_ALLOW_INSECURE
 	OwnerLiveness     time.Duration // CTS_OWNER_LIVENESS
 	SnapshotRetention int           // CTS_SNAPSHOT_RETENTION
+	HistoryRetention  time.Duration // CTS_HISTORY_RETENTION
 }
 
 // Default returns the configuration used when no variables are set.
@@ -23,6 +24,7 @@ func Default() Config {
 		DBPath:            "./data/cts.db",
 		OwnerLiveness:     10 * time.Minute,
 		SnapshotRetention: 20,
+		HistoryRetention:  30 * 24 * time.Hour,
 	}
 }
 
@@ -61,6 +63,16 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("CTS_SNAPSHOT_RETENTION: must be at least 1, got %d", n)
 		}
 		c.SnapshotRetention = n
+	}
+	if v := getenv("CTS_HISTORY_RETENTION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("CTS_HISTORY_RETENTION: %w", err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("CTS_HISTORY_RETENTION: must be positive, got %s", d)
+		}
+		c.HistoryRetention = d
 	}
 	return c, nil
 }
