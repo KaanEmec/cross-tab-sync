@@ -169,7 +169,11 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 - A fresh interaction inside the 30 s rate limit, or a failed takeover, stays pending and fires on the next signal after the limit.
 - Navigation counts as activity only in the active tab; every user-created tab counts.
 - A freshly paired device (revision 0) rebuilds from the full session instead of replaying history.
-- Changes to a tab in the 30 s after the extension created or navigated it, until its load completes, are treated as the extension's own (redirects); user navigation in that window is not published.
+- A load the extension started stays its own until 10 s after its first committed event (redirects, post-load URL rewrites); user navigation inside that window is not published.
+- A new browser session is detected by a marker in `storage.session` before any event is handled; the startup reset then runs even if the restored tabs' events arrive before `runtime.onStartup`.
+- Continue here first applies `changes?since=lastRevision` (410 → full session), then materializes. Materializing navigates mapped tabs whose entry URL moved when nothing local is pending for that entry.
+- Divergence: when a remote navigate or close meets a local pending navigate for the same entry, local copies are forked to a fresh entry (`open` of the local URL) and the remote URL gets its own background tab; nothing is overwritten.
+- `close` operations are held for 2 s and dropped (unmap only) if the window disappeared, `windows.onRemoved` fired, three or more removals came from that window, or a new browser session started.
 - Tabs mapped to entries that are no longer in the session are detached, not republished. Continue here never recreates entries this device has a pending `close` for.
 - Previous-session mappings and the detached set survive a restart for 60 s so late-restored tabs still match.
 - Local pin changes are not published in v0.2.
