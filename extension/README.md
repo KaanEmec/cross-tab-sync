@@ -64,3 +64,7 @@ Build and run the app in Xcode, then in Safari: **Settings > Advanced > Show fea
 - URLs the server cannot parse (bad `%` escapes, no host, over 2048 bytes) are never shared. If the server still rejects a batch as invalid, that batch is dropped from the journal, its tabs are unmapped and the popup shows how many changes were dropped.
 - Tab order is a hint only; `tabs.move` is unsupported in Safari and not used. New tabs are appended in session order. Pinned state is applied when tabs are created.
 - Operations are journaled in `storage.local` before they are sent and removed only on a server result, so retries resend the same `opId`s.
+
+## Integration test (real server)
+
+`pnpm test:integration` builds the Go server (`go build` in `../server`, needs `go` on PATH, otherwise the suite is skipped), starts it on a free loopback port with `CTS_ALLOW_INSECURE=1` and a temporary database, pairs two simulated devices through the real `/v1/pair` and drives `continueHere` / `handOver` with the real `ApiClient` and `fetch` against it. Tests live in `test/integration/*.integration.ts` and are not part of `pnpm test`.
