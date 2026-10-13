@@ -101,13 +101,18 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 | `close` | applied | ignored: the entry now represents a different page |
 | `update` | applied | ignored |
 
-"Navigated since" means the entry's URL changed at a revision greater than the operation's `baseRevision`. Metadata-only changes do not block a close.
+"Navigated since" means another device changed the entry's URL at a revision greater than the operation's `baseRevision`; a device's own earlier changes never make its later operations stale. Metadata-only changes do not block a close. A base ahead of the current revision counts as expired.
+
+- The forked entry id is UUIDv5 with the `opId` as namespace and the name `forked`; it copies the source entry's pinned state and is appended after the highest position. If the forked URL is already open, the result is `coalesced` to that entry.
+- Later operations in the same batch that target the forked entry's source are redirected to the fork. Across requests this is not remembered: after a `forked` result the client must rewrite its remaining pending operations for that entry to the new id.
+- The log records operations as applied (a forked navigate is logged as an `open` of the fork), so `changes` and `catchUp` consumers never see `forked`.
+- Operations on closed or unknown entries are `ignored`. Merged operations carry generation 0 and do not refresh the owner's liveness.
 
 ### History retention (v1.0)
 
 - The server keeps operations and tombstones for `CTS_HISTORY_RETENTION` (default 30 days) and never prunes below the current open entries. `minRevision` is the oldest retained sequence number; `GET session` and `changes` responses include it.
 - `changes?since=R` with `R < minRevision - 1` returns `410 history_expired`. The client reloads `GET session`, reconciles mappings by URL (entries no longer present are detached, never republished), keeps its pending journal, and submits it through `merge`.
-- Pruning runs at startup and once per hour.
+- Pruning runs at startup and once per hour. It cuts the log at one sequence number (the first retained operation), so retained history is contiguous.
 
 ## Errors
 
