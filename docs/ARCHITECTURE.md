@@ -53,7 +53,7 @@ Exactly one device is the **owner** (publisher) at a time. The owner pushes oper
 
 ### Safari wrapper (`safari/`)
 
-A minimal Swift macOS app whose only job is to host the extension. Produced from `extension/dist/safari` by Apple's converter; no native messaging and no native logic. Local testing uses Safari's *Allow unsigned extensions*; distribution is Developer ID + notarization (documented in the release epic).
+A minimal Swift macOS app whose only job is to host the extension. Produced from `extension/dist/safari` by `xcrun safari-web-extension-packager`; no native messaging and no native logic. Local testing uses Safari's *Allow unsigned extensions* (Settings > Developer, resets when Safari quits); distribution is Developer ID + notarization (documented in the release epic).
 
 ## Key decisions
 
@@ -69,13 +69,16 @@ A minimal Swift macOS app whose only job is to host the extension. Produced from
 | Encryption | TLS in transit; plaintext URLs at rest on the user's own VPS | The server must read URLs to coalesce duplicates. End-to-end encryption is deferred; it would need client-side dedup via an HMAC of the URL. Logs never contain URLs or tokens. |
 | Extension build | esbuild + TypeScript, no framework | Two small bundles (worker, popup). No React/Vue; the popup is a status page. |
 | Browser API | `chrome.*` promise API directly, no polyfill | Both Safari and Brave support it under MV3. A thin adapter interface keeps the core testable. |
-| Sync cadence | `alarms` every 5 minutes, immediate on takeover and manual actions | Service workers are suspended; alarms are the only reliable scheduler. |
+| Sync cadence | `alarms` every 5 minutes, immediate on takeover and manual actions | Service workers are suspended; alarms are the only reliable scheduler. Safari does not persist alarms, so the worker re-creates them on every start. |
+| Backend access | `optional_host_permissions`; the exact backend origin is requested with `permissions.request` during pairing | Both browsers need a host grant before `fetch` to the backend. Asking for one origin avoids a broad install-time permission. |
+| Supported browsers | Safari 18.4+ on macOS, Brave on Chromium 120+ on Windows | Safari 18.4 is the first version that loads Developer ID extensions and has the required `permissions` semantics; Chromium 120 gives 30 s alarm floors. See [COMPATIBILITY.md](COMPATIBILITY.md). |
+| Tab order | Best-effort `position` hint, never `tabs.move` on Safari | Safari does not implement `tabs.move`. Order is applied only where cheap. |
 
 ## Roadmap status
 
 | Milestone | Epic | Status |
 | --- | --- | --- |
-| v0.1.0 | 01 Session contract | in progress |
+| v0.1.0 | 01 Session contract | done (protocol + compatibility research; real-browser checks pending) |
 | v0.1.0 | 02 Backend | in progress |
 | v0.1.0 | 03 Extensions | in progress |
 | v0.2.0 | Automatic ownership, tab changes, reconciliation | planned |
