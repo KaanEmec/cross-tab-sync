@@ -70,6 +70,7 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 | `POST /v1/session/release` | device | `{generation}` | `204` · `409 stale_owner {owner}` |
 | `POST /v1/session/heartbeat` | device | `{generation}` | `204` · `409 stale_owner {owner}` |
 | `POST /v1/session/operations` | device | `{generation, baseRevision, operations:[…]}` | `200 {revision, results:[{opId,status,entryId?,replayed?}], catchUp:{operations:[…]}}` · `409 stale_owner {owner}` |
+| `POST /v1/session/merge` | device | `{operations:[{…, baseRevision}]}` | `200 {revision, results}` — no ownership needed; causal rules below |
 | `GET /v1/snapshots` | device | | `200 {snapshots:[{id,revision,deviceId,reason,createdAt,entryCount}]}`. `revision` is the revision just before the change that triggered the snapshot; `reason` is `operations` or `restore`. |
 | `POST /v1/snapshots/{id}/restore` | device | `{generation}` | `200 {revision, results}` — restoration is issued as ordinary `open` operations, never a rewind |
 
@@ -86,7 +87,27 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 - `baseRevision` is the last revision the client applied. The response's `catchUp` contains operations from other devices after `baseRevision` and before this batch, so the client needs no second request. It does not reject on mismatch; operations are entry-addressed, not positional.
 - Limits: 500 operations per batch (`413 payload_too_large`), 2048-byte http/https URLs and well-formed operations (`400 invalid_request` for the whole batch), 64 KiB bodies. Clients split batches by encoded size.
 - `baseRevision` is required. An empty `operations` array acts as a heartbeat plus catch-up.
+- If `baseRevision` is older than the retained history, the response carries `fullResync: true` and no `catchUp`; the client must reload `GET session`.
 - `catchUp.operations` and `changes.operations` items are `{seq, deviceId, op, result}` where `op` is the operation as sent and `result` is `{status, entryId?}`.
+
+### Merge rules (offline changes, v1.0)
+
+`POST /v1/session/merge` accepts a journal from any paired device, owner or not, and applies it atomically with per-operation causal checks against each operation's own `baseRevision` (the revision the device had applied when it recorded the change). It never requires ownership and never changes ownership. Results and `revision` behave as for `operations`.
+
+| Operation | Entry unchanged since `baseRevision` | Entry navigated since (or `baseRevision` older than retained history) |
+| --- | --- | --- |
+| `open` (fresh `entryId`) | applied, coalescing on URL | applied, coalescing on URL. Reopening a tombstoned `entryId` stays ignored. |
+| `navigate` | applied | converted to `open` of a fresh entry with the new URL, so both divergent destinations survive (`status: "forked"`, result `entryId` = new entry) |
+| `close` | applied | ignored: the entry now represents a different page |
+| `update` | applied | ignored |
+
+"Navigated since" means the entry's URL changed at a revision greater than the operation's `baseRevision`. Metadata-only changes do not block a close.
+
+### History retention (v1.0)
+
+- The server keeps operations and tombstones for `CTS_HISTORY_RETENTION` (default 30 days) and never prunes below the current open entries. `minRevision` is the oldest retained sequence number; `GET session` and `changes` responses include it.
+- `changes?since=R` with `R < minRevision - 1` returns `410 history_expired`. The client reloads `GET session`, reconciles mappings by URL (entries no longer present are detached, never republished), keeps its pending journal, and submits it through `merge`.
+- Pruning runs at startup and once per hour.
 
 ## Errors
 
@@ -115,7 +136,7 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 
 - A 5-minute `alarms` cycle runs on every device, plus an immediate run after takeover and manual actions. The owner also runs about 2 s after a local change; followers only journal.
 - **Owner run**: flush the journal with `POST operations` (empty batch if nothing pending), apply `catchUp`, advance `lastRevision`. `409 stale_owner` drops owner state, keeps the journal, and the device continues as a follower.
-- **Follower run**: `GET changes?since=lastRevision`, apply, advance. `410 history_expired` triggers a full resync from `GET session` (reconcile mappings by URL, create missing tabs, never close).
+- **Follower run**: submit the pending journal through `merge` (v1.0; in v0.2 followers hold it), then `GET changes?since=lastRevision`, apply, advance. `410 history_expired` triggers a full resync from `GET session` (reconcile mappings by URL, create missing tabs, never close).
 - A persisted run lock makes runs exclusive; a run that finds the lock held exits.
 
 ### Recording local changes (both roles, always journaled)
