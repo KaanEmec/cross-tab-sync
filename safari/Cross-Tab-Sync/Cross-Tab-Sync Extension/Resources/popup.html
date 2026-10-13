@@ -29,6 +29,7 @@
 
     <section id="main-view" hidden>
       <dl class="facts">
+        <dt>Role</dt><dd id="role"></dd>
         <dt>Owner</dt><dd id="owner"></dd>
         <dt>Last sync</dt><dd id="last-sync"></dd>
         <dt>Pending changes</dt><dd id="pending"></dd>
@@ -37,6 +38,7 @@
       <div class="actions">
         <button id="hand-over" type="button">Hand over</button>
         <button id="continue-here" type="button">Continue here</button>
+        <button id="sync-now" type="button" class="wide" title="Owner: publish pending changes. Follower: fetch the latest changes.">Sync now</button>
       </div>
       <div class="pairing">
         <button id="create-code" type="button" class="link">Create pairing code</button>

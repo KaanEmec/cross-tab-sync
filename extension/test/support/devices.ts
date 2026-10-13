@@ -1,0 +1,111 @@
+// Test devices: a fake browser, a SyncEngine attached to its events, a manual debounce timer and a
+// shared clock, all against one FakeServer.
+import { FakeBrowser, type FakeTabInit } from "../../src/adapter/fake.js";
+import type { Operation } from "../../src/core/client.js";
+import { eligibleTabs } from "../../src/core/eligibility.js";
+import { SyncEngine, type Scheduler } from "../../src/core/engine.js";
+import { pair, type Deps } from "../../src/core/handover.js";
+import { loadState, saveState, type State } from "../../src/core/state.js";
+import type { FakeServer } from "./fakeServer.js";
+
+export class Clock {
+  t = Date.parse("2026-10-13T10:00:00.000Z");
+  now = () => new Date(this.t);
+  advance(ms: number): void {
+    this.t += ms;
+  }
+}
+
+export class ManualTimers {
+  private readonly tasks = new Set<() => void>();
+  schedule: Scheduler = (fn) => {
+    const task = () => fn();
+    this.tasks.add(task);
+    return () => this.tasks.delete(task);
+  };
+  get size(): number {
+    return this.tasks.size;
+  }
+  fire(): void {
+    const due = [...this.tasks];
+    this.tasks.clear();
+    for (const t of due) t();
+  }
+}
+
+export interface Dev {
+  b: FakeBrowser;
+  deps: Deps;
+  engine: SyncEngine;
+  timers: ManualTimers;
+  /** The normal window created for the device (unless `noWindow`). */
+  win: number;
+  id: string;
+  state(): Promise<State>;
+  /** Drain the queue, firing debounce timers, until nothing is left. */
+  settle(): Promise<void>;
+  /** Sorted URLs of eligible local tabs. */
+  urls(): Promise<string[]>;
+  /** Mark recent activity so the next signal is not a fresh interaction. */
+  quiet(): Promise<void>;
+  acquires(): number;
+  /** Operations this device sent, in order. */
+  sent(): Operation[];
+  tab(url: string): number;
+}
+
+let codeSeq = 0;
+
+export async function device(
+  server: FakeServer,
+  clock: Clock,
+  name: string,
+  opts: { tabs?: FakeTabInit[]; noWindow?: boolean; setup?: (b: FakeBrowser) => void } = {},
+): Promise<Dev> {
+  const b = new FakeBrowser();
+  const win = opts.noWindow ? -1 : b.addWindow({ focused: true, tabs: opts.tabs ?? [] });
+  opts.setup?.(b);
+  const deps: Deps = { adapter: b, api: server.api, browser: name.includes("Safari") ? "safari" : "brave", now: clock.now };
+  const code = `DEV${++codeSeq}`.padEnd(8, "0");
+  server.codes.add(code);
+  const s = await pair(deps, { serverUrl: "https://sync.example", deviceName: name, code });
+  const id = s.deviceId!;
+  const timers = new ManualTimers();
+  const engine = new SyncEngine(deps, timers.schedule);
+  engine.attach();
+  return {
+    b,
+    deps,
+    engine,
+    timers,
+    win,
+    id,
+    state: () => loadState(b.storage),
+    async settle() {
+      for (let i = 0; i < 100; i++) {
+        await engine.idle();
+        if (timers.size === 0) return;
+        timers.fire();
+      }
+      throw new Error("engine did not settle");
+    },
+    async urls() {
+      return eligibleTabs(b.tabs, b.windows)
+        .map((t) => t.url)
+        .sort();
+    },
+    async quiet() {
+      await saveState(b.storage, { lastActivityAt: clock.t });
+    },
+    acquires: () => server.requests.filter((r) => r.path === "acquire" && r.device === id).length,
+    sent: () =>
+      server.requests
+        .filter((r) => r.path === "operations" && r.device === id)
+        .flatMap((r) => (r.body as { operations: Operation[] }).operations),
+    tab(url: string) {
+      const t = b.tabs.find((x) => x.url === url);
+      if (!t) throw new Error(`no tab ${url}`);
+      return t.id;
+    },
+  };
+}

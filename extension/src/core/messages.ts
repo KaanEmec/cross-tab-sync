@@ -8,6 +8,8 @@ export type Request =
   | { type: "pair" }
   | { type: "handOver" }
   | { type: "continueHere" }
+  /** Run the owner or follower sync now. */
+  | { type: "syncNow" }
   | { type: "createPairingCode" }
   | { type: "disconnect" };
 

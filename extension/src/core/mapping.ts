@@ -59,20 +59,33 @@ export function remapEntry(m: Mappings, from: string, to: string, url?: string):
  * without a match are dropped.
  */
 export function rematchByUrl(stored: Mappings, tabs: { id: number; url: string }[], base: Mappings = emptyMappings()): Mappings {
+  return claimByUrl(stored, tabs, base).mappings;
+}
+
+/** Like rematchByUrl, also returning the stored mappings that found no tab (null when none). */
+export function claimByUrl(
+  stored: Mappings,
+  tabs: { id: number; url: string }[],
+  base: Mappings = emptyMappings(),
+): { mappings: Mappings; rest: Mappings | null } {
   const claimed = new Set(Object.keys(base.tabs).map(Number));
   let m = base;
-  for (const old of Object.values(stored.tabs)) {
+  const rest: Record<string, MappedTab> = {};
+  for (const [key, old] of Object.entries(stored.tabs)) {
     const tab = tabs.find((t) => t.url === old.url && !claimed.has(t.id));
-    if (!tab) continue;
+    if (!tab) {
+      rest[key] = old;
+      continue;
+    }
     claimed.add(tab.id);
     m = setMapping(m, tab.id, old.entryId, old.url);
   }
-  return m;
+  return { mappings: m, rest: Object.keys(rest).length > 0 ? { ...stored, tabs: rest } : null };
 }
 
 /**
  * Drop mappings for tabs that no longer exist. A tab whose URL changed keeps its mapping (its
- * last-known URL is kept current from tabs.onUpdated); navigation is propagated in v0.2.
+ * last-known URL is kept current by change recording).
  */
 export function reconcileMappings(m: Mappings, allTabs: TabInfo[]): Mappings {
   const present = new Set(allTabs.map((t) => String(t.id)));

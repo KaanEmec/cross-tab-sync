@@ -13,6 +13,7 @@ function toTab(t: chrome.tabs.Tab): TabInfo | null {
     incognito: Boolean(t.incognito),
     index: t.index,
     active: Boolean(t.active),
+    status: t.status,
   };
 }
 
@@ -111,5 +112,6 @@ export function createWebExtAdapter(): BrowserAdapter {
       listen(chrome.windows.onFocusChanged, (windowId: number) =>
         cb(windowId === chrome.windows.WINDOW_ID_NONE ? null : windowId),
       ),
+    onStartup: (cb) => listen(chrome.runtime.onStartup, () => cb()),
   };
 }

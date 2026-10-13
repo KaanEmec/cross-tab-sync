@@ -31,7 +31,14 @@
       statusText: null,
       receivingWindowId: null,
       pendingPair: null,
-      runLock: null
+      runLock: null,
+      expected: [],
+      detached: {},
+      startupAt: null,
+      lastActivityAt: null,
+      lastTakeoverAt: null,
+      suppressAutoTakeover: false,
+      freshPending: false
     };
   }
   var PREFIX = "cts.";
@@ -89,6 +96,7 @@
     if (s.reachable !== void 0) reachable = s.reachable;
     badge.textContent = reachable === false ? "Offline" : s.isOwner ? "Owner" : "Follower";
     badge.classList.toggle("owner", s.isOwner && reachable !== false);
+    $("role").textContent = s.isOwner ? "Owner (publishes changes)" : "Follower (applies changes)";
     const o = s.owner;
     $("owner").textContent = !o ? "No owner" : o.deviceId === s.deviceId ? `This device (gen. ${o.generation})` : `${o.name} (gen. ${o.generation})`;
     $("last-sync").textContent = relative(s.lastSync);
@@ -103,6 +111,7 @@
     handOver.disabled = busy || s.running || !s.isOwner;
     handOver.title = s.isOwner ? "Publish this browser's tabs and release control" : "Only the owner can hand over";
     continueHere.disabled = busy || s.running;
+    $("sync-now").disabled = busy || s.running;
     showError(s.lastError);
   }
   function hostOf(url) {
@@ -161,6 +170,7 @@
   });
   $("hand-over").addEventListener("click", () => void run({ type: "handOver" }));
   $("continue-here").addEventListener("click", () => void run({ type: "continueHere" }));
+  $("sync-now").addEventListener("click", () => void run({ type: "syncNow" }));
   $("create-code").addEventListener("click", async () => {
     const res = await run({ type: "createPairingCode" });
     const el = $("pairing-code");

@@ -85,6 +85,7 @@ button.link.danger { color: var(--danger); }
 .status { margin: 0 0 12px; min-height: 1.4em; color: var(--muted); }
 
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+.actions .wide { grid-column: 1 / -1; }
 
 .pairing { margin-bottom: 12px; }
 .code {

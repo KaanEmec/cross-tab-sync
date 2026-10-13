@@ -1,289 +1,21 @@
-// Manual handover (PROTOCOL.md "Client behavior (v0.1 manual handover)").
-// Written against BrowserAdapter and a client factory so it runs unchanged against fakes.
+// Manual handover (PROTOCOL.md "Client behavior (v0.1 manual handover)") plus pairing and
+// lifecycle actions. Written against BrowserAdapter and a client factory so it runs unchanged
+// against fakes. Hand over and Continue here reuse the v0.2 sync run (sync.ts).
 
-import type { BrowserAdapter, TabInfo } from "../adapter/types.js";
-import {
-  ApiError,
-  normalizeServerUrl,
-  type ApiClient,
-  type BrowserKind,
-  type LoggedOperation,
-  type OpResult,
-  type Operation,
-  type OperationsResponse,
-  type Owner,
-} from "./client.js";
-import { eligibleTabs, isShareableUrl, type EligibleTab } from "./eligibility.js";
-import { acknowledge, append, batches, list, newOpId, pendingEntryIds } from "./journal.js";
-import {
-  emptyMappings,
-  reconcileMappings,
-  rematchByUrl,
-  remapEntry,
-  removeMappings,
-  setMapping,
-  tabsForEntry,
-  type Mappings,
-} from "./mapping.js";
-import { plan, type TabToCreate } from "./plan.js";
+import { materialize } from "./apply.js";
+import { ApiError, normalizeServerUrl, type Owner } from "./client.js";
+import { emptyMappings, type Mappings } from "./mapping.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
+import { apiFor, fail, nowIso, nowMs, ownerLabel, requirePaired, Store, type Deps } from "./store.js";
+import { flush, rejectedMessage } from "./sync.js";
 
-export type Api = Pick<
-  ApiClient,
-  "pair" | "createPairingCode" | "deleteDevice" | "session" | "changes" | "acquire" | "release" | "heartbeat" | "operations"
->;
-
-export interface Deps {
-  adapter: BrowserAdapter;
-  api: (cfg: { baseUrl: string; token: string | null }) => Api;
-  browser: BrowserKind;
-  now?: () => Date;
-  newId?: () => string;
-}
-
-/** Thin mutable view over persisted state: every `set` is written through immediately. */
-class Store {
-  constructor(
-    readonly deps: Deps,
-    public s: State,
-  ) {}
-
-  static async open(deps: Deps): Promise<Store> {
-    return new Store(deps, await loadState(deps.adapter.storage));
-  }
-
-  async set(patch: Partial<State>): Promise<void> {
-    this.s = { ...this.s, ...patch };
-    await saveState(this.deps.adapter.storage, patch);
-  }
-}
-
-const nowIso = (deps: Deps) => (deps.now ? deps.now() : new Date()).toISOString();
-const idGen = (deps: Deps) => deps.newId ?? newOpId;
-
-function apiFor(deps: Deps, s: State): Api {
-  return deps.api({ baseUrl: s.serverUrl, token: s.token });
-}
-
-function requirePaired(s: State): void {
-  if (!isPaired(s)) throw new Error("This device is not paired");
-}
-
-function ownerLabel(o: Owner | null): string {
-  return o ? `${o.name} (generation ${o.generation})` : "another device";
-}
+export type { Api, Deps } from "./store.js";
+export { applyResults, resolveReceivingWindow } from "./apply.js";
 
 /**
- * Record an error in state. `stale_owner` drops owner state, but only if the persisted generation
- * is still the one the failed request sent (a late reply must not wipe a newer acquisition);
- * `device_revoked` clears credentials. Always rethrows so the caller can report it.
+ * Hand over: publish unmapped eligible tabs, flush, apply catchUp, release ownership. Automatic
+ * takeover is suppressed until the next fresh interaction (the hand over counts as the latest one).
  */
-async function fail(store: Store, e: unknown, sentGeneration?: number | null): Promise<never> {
-  if (e instanceof ApiError && e.code === "stale_owner") {
-    const persisted = (await loadState(store.deps.adapter.storage)).generation;
-    if (sentGeneration !== undefined && persisted !== sentGeneration) throw e;
-    const owner = e.owner;
-    await store.set({
-      generation: null,
-      owner,
-      statusText: `Not the owner: ${ownerLabel(owner)} took over. Use Continue here to take control.`,
-      lastError: "Ownership was taken by another device; nothing was applied.",
-    });
-  } else if (e instanceof ApiError && e.code === "device_revoked") {
-    await store.set({
-      ...clearedCredentials(),
-      statusText: "Disconnected",
-      lastError: "This device was revoked on the server. Pair it again.",
-    });
-  } else {
-    await store.set({ lastError: e instanceof Error ? e.message : String(e) });
-  }
-  throw e;
-}
-
-async function captureTabs(adapter: BrowserAdapter): Promise<{ all: TabInfo[]; eligible: EligibleTab[] }> {
-  const [all, windows] = await Promise.all([adapter.queryTabs(), adapter.getWindows()]);
-  return { all, eligible: eligibleTabs(all, windows) };
-}
-
-/**
- * Current mappings: drop tabs that are gone, then (first run after a browser restart) re-match the
- * previous session's mappings to current tabs by last-known URL. Persists the result.
- */
-async function currentMappings(store: Store, all: TabInfo[], eligible: EligibleTab[]): Promise<Mappings> {
-  let mappings = reconcileMappings(store.s.mappings, all);
-  if (store.s.staleMappings) mappings = rematchByUrl(store.s.staleMappings, eligible, mappings);
-  await store.set({ mappings, staleMappings: null });
-  return mappings;
-}
-
-/**
- * Window that receives created tabs: the last focused normal window, else the persisted
- * `receivingWindowId`, else any normal window. Null means a window must be created.
- */
-export async function resolveReceivingWindow(adapter: BrowserAdapter, persisted: number | null): Promise<number | null> {
-  const windows = (await adapter.getWindows()).filter((w) => w.type === "normal" && !w.incognito);
-  const ids = new Set(windows.map((w) => w.id));
-  const last = await adapter.getLastFocusedWindow().catch(() => null);
-  if (last && ids.has(last.id)) return last.id;
-  if (persisted !== null && ids.has(persisted)) return persisted;
-  return windows[0]?.id ?? null;
-}
-
-/** Create tabs in the background. Never activates a tab or focuses a window. */
-async function createTabs(
-  store: Store,
-  items: TabToCreate[],
-): Promise<{ created: number; failed: number }> {
-  if (items.length === 0) return { created: 0, failed: 0 };
-  const { adapter } = store.deps;
-  let windowId = await resolveReceivingWindow(adapter, store.s.receivingWindowId);
-  let created = 0;
-  let failed = 0;
-  for (const item of items) {
-    try {
-      let tab: TabInfo;
-      if (windowId === null) {
-        const w = await adapter.createWindow(item.url);
-        windowId = w.windowId;
-        tab = w.tab;
-        if (item.pinned) await adapter.updateTab(tab.id, { pinned: true });
-      } else {
-        tab = await adapter.createTab({ windowId, url: item.url, pinned: item.pinned });
-      }
-      // Persist per tab: a worker killed mid-loop must not leave created tabs unmapped.
-      await store.set({ mappings: setMapping(store.s.mappings, tab.id, item.entryId, item.url), receivingWindowId: windowId });
-      created++;
-    } catch {
-      failed++;
-    }
-  }
-  return { created, failed };
-}
-
-/** Acknowledge results, and follow coalesced opens/navigates to the surviving entry. */
-export function applyResults(mappings: Mappings, ops: Operation[], results: OpResult[]): Mappings {
-  const byId = new Map(ops.map((op) => [op.opId, op]));
-  let m = mappings;
-  for (const r of results) {
-    const op = byId.get(r.opId);
-    if (!op || r.status !== "coalesced" || !r.entryId || r.entryId === op.entryId) continue;
-    m = remapEntry(m, op.entryId, r.entryId);
-  }
-  return m;
-}
-
-/**
- * Apply operations made by other devices. v0.1 never closes local tabs: a `close` only unmaps.
- * New entries reuse a local tab with the exact URL before a background tab is created.
- */
-async function applyCatchUp(store: Store, ops: LoggedOperation[]): Promise<void> {
-  const foreign = ops
-    .filter((l) => l.deviceId !== store.s.deviceId && l.result.status !== "ignored")
-    .sort((a, b) => a.seq - b.seq);
-  if (foreign.length === 0) return;
-  const { adapter } = store.deps;
-  const { all, eligible } = await captureTabs(adapter);
-  let mappings = await currentMappings(store, all, eligible);
-  const toCreate: TabToCreate[] = [];
-
-  for (const { op, result } of foreign) {
-    const target = result.entryId ?? op.entryId;
-    switch (op.type) {
-      case "open": {
-        if (target !== op.entryId) mappings = remapEntry(mappings, op.entryId, target);
-        if (tabsForEntry(mappings, target).length > 0 || toCreate.some((c) => c.entryId === target)) break;
-        const reuse = eligible.filter((t) => t.url === op.url && mappings.tabs[String(t.id)] === undefined);
-        if (reuse.length > 0) {
-          for (const t of reuse) mappings = setMapping(mappings, t.id, target, op.url);
-        } else {
-          toCreate.push({ entryId: target, url: op.url, pinned: op.pinned ?? false });
-        }
-        break;
-      }
-      case "navigate": {
-        const tabIds = tabsForEntry(mappings, op.entryId);
-        mappings = remapEntry(mappings, op.entryId, target, op.url);
-        const pendingCreate = toCreate.find((c) => c.entryId === op.entryId);
-        if (pendingCreate) Object.assign(pendingCreate, { entryId: target, url: op.url });
-        for (const id of tabIds) await adapter.updateTab(id, { url: op.url }).catch(() => undefined);
-        break;
-      }
-      case "close": {
-        mappings = removeMappings(mappings, tabsForEntry(mappings, op.entryId));
-        const i = toCreate.findIndex((c) => c.entryId === op.entryId);
-        if (i >= 0) toCreate.splice(i, 1);
-        break;
-      }
-      case "update": {
-        if (op.pinned === undefined) break;
-        for (const id of tabsForEntry(mappings, op.entryId)) {
-          await adapter.updateTab(id, { pinned: op.pinned }).catch(() => undefined);
-        }
-        break;
-      }
-    }
-  }
-  await store.set({ mappings });
-  await createTabs(store, toCreate);
-}
-
-/**
- * Send every journaled operation (in server-sized batches) and apply results and catchUp.
- * With nothing to send, catch up through `changes?since=` instead of posting an empty batch.
- */
-async function flush(store: Store): Promise<{ rejected: number }> {
-  const deps = store.deps;
-  const generation = store.s.generation;
-  if (generation === null) throw new Error("This device is not the owner");
-  const api = apiFor(deps, store.s);
-  const pending = batches(list(store.s.pending));
-  if (pending.length === 0) {
-    try {
-      const res = await api.changes(store.s.lastRevision);
-      await applyCatchUp(store, res.operations);
-      await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), lastSync: nowIso(deps) });
-    } catch (e) {
-      // History older than the server keeps: the next Continue here resyncs from the full session.
-      if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
-    }
-    return { rejected: 0 };
-  }
-  let rejected = 0;
-  for (const batch of pending) {
-    let res: OperationsResponse;
-    try {
-      res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
-    } catch (e) {
-      // A batch the server refuses as malformed would be refused forever: drop it from the journal
-      // and unmap its tabs so the rest proceeds. Nothing in the batch was applied.
-      if (!(e instanceof ApiError && (e.code === "invalid_request" || e.code === "payload_too_large"))) throw e;
-      const entryIds = new Set(batch.map((op) => op.entryId));
-      const tabIds = Object.entries(store.s.mappings.tabs)
-        .filter(([, m]) => entryIds.has(m.entryId))
-        .map(([k]) => Number(k));
-      await store.set({
-        pending: acknowledge(store.s.pending, batch.map((op) => op.opId)),
-        mappings: removeMappings(store.s.mappings, tabIds),
-      });
-      rejected += batch.length;
-      continue;
-    }
-    await store.set({
-      pending: acknowledge(store.s.pending, res.results.map((r) => r.opId)),
-      mappings: applyResults(store.s.mappings, batch, res.results),
-    });
-    await applyCatchUp(store, res.catchUp?.operations ?? []);
-    await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), lastSync: nowIso(deps) });
-  }
-  return { rejected };
-}
-
-function rejectedMessage(rejected: number): string | null {
-  return rejected > 0 ? `${rejected} change(s) were rejected by the server and dropped` : null;
-}
-
-/** Hand over: publish unmapped eligible tabs, apply catchUp, release ownership. */
 export async function handOver(deps: Deps): Promise<State> {
   const store = await Store.open(deps);
   try {
@@ -291,16 +23,8 @@ export async function handOver(deps: Deps): Promise<State> {
     const generation = store.s.generation;
     if (generation === null) throw new Error("This device is not the owner. Use Continue here to take control first.");
 
-    const { all, eligible } = await captureTabs(deps.adapter);
-    const p = plan({
-      entries: null,
-      tabs: eligible,
-      mappings: await currentMappings(store, all, eligible),
-      pendingEntries: pendingEntryIds(store.s.pending),
-      newId: idGen(deps),
-    });
     // Journal before sending: a crash or network error leaves ops to be replayed with the same ids.
-    await store.set({ mappings: p.mappings, pending: append(store.s.pending, p.open) });
+    await materialize(store, null, true);
     const { rejected } = await flush(store);
 
     await apiFor(deps, store.s).release(generation);
@@ -310,6 +34,9 @@ export async function handOver(deps: Deps): Promise<State> {
       lastSync: nowIso(deps),
       lastError: rejectedMessage(rejected),
       statusText: `Handed over at revision ${store.s.lastRevision}`,
+      suppressAutoTakeover: true,
+      lastActivityAt: nowMs(deps),
+      freshPending: false,
     });
     return store.s;
   } catch (e) {
@@ -317,11 +44,15 @@ export async function handOver(deps: Deps): Promise<State> {
   }
 }
 
-/** Continue here: force-acquire, materialize the session locally, publish local extras. */
+/**
+ * Continue here (manual, and automatic takeover): force-acquire, materialize the session locally,
+ * publish local extras, flush the journal kept while following.
+ */
 export async function continueHere(deps: Deps): Promise<State> {
   const store = await Store.open(deps);
   try {
     requirePaired(store.s);
+    await store.set({ lastTakeoverAt: nowMs(deps), suppressAutoTakeover: false, freshPending: false });
     const { generation, session } = await apiFor(deps, store.s).acquire(true);
     // Nothing local has changed before this point, so an unreachable server leaves tabs untouched.
     await store.set({
@@ -336,16 +67,7 @@ export async function continueHere(deps: Deps): Promise<State> {
       lastSync: nowIso(deps),
     });
 
-    const { all, eligible } = await captureTabs(deps.adapter);
-    const p = plan({
-      entries: session.entries,
-      tabs: eligible,
-      mappings: await currentMappings(store, all, eligible),
-      pendingEntries: pendingEntryIds(store.s.pending),
-      newId: idGen(deps),
-    });
-    await store.set({ mappings: p.mappings, pending: append(store.s.pending, p.open) });
-    const { failed } = await createTabs(store, p.create);
+    const { failed } = await materialize(store, session.entries, true);
     const { rejected } = await flush(store);
 
     const errors = [failed > 0 ? `${failed} tab(s) could not be created` : null, rejectedMessage(rejected)];
@@ -382,7 +104,7 @@ export async function pair(
       mappings: emptyMappings(),
       lastSync: nowIso(deps),
       lastError: null,
-      statusText: "Paired. Use Continue here to take control on this device.",
+      statusText: "Paired. This browser follows the shared tabs and takes over when you use it.",
     });
     return store.s;
   } catch (e) {
@@ -425,10 +147,7 @@ export async function disconnect(deps: Deps): Promise<State> {
   return store.s;
 }
 
-/**
- * Refresh the known owner without applying changes (follower application arrives in v0.2).
- * Returns whether the server was reachable.
- */
+/** Refresh the known owner without applying changes (popup). Returns whether the server was reachable. */
 export async function refreshOwner(deps: Deps): Promise<boolean> {
   const store = await Store.open(deps);
   if (!isPaired(store.s)) return false;
@@ -449,29 +168,16 @@ export async function refreshOwner(deps: Deps): Promise<boolean> {
     store.s.generation !== null && (!owner || owner.deviceId !== store.s.deviceId || owner.generation !== store.s.generation);
   await store.set(
     lostOwnership
-      ? { owner, generation: null, statusText: `Not the owner: ${ownerLabel(owner)} took over.` }
+      ? { owner, generation: null, freshPending: true, statusText: `Not the owner: ${ownerLabel(owner)} took over.` }
       : { owner },
   );
   return true;
 }
 
-/** Keep ownership alive while this device is the owner. Liveness only, never user activity. */
-export async function heartbeat(deps: Deps): Promise<void> {
-  const store = await Store.open(deps);
-  const generation = store.s.generation;
-  if (!isPaired(store.s) || generation === null) return;
-  try {
-    await apiFor(deps, store.s).heartbeat(generation);
-    await store.set({ lastSync: nowIso(deps) });
-  } catch (e) {
-    await fail(store, e, generation).catch(() => undefined);
-  }
-}
-
 /**
- * Browser startup: tab ids from the previous session are meaningless, so set the mappings aside
- * as `staleMappings`; the next action re-matches them by last-known URL (restored tabs may still
- * be loading now).
+ * Browser startup: tab ids from the previous session are meaningless, so set the mappings and
+ * detached tabs aside (`stale`); they are re-matched by last-known URL as restored tabs load.
+ * Starts the startup grace for removals and activity.
  */
 export async function resetForBrowserStartup(deps: Deps): Promise<void> {
   const s = await loadState(deps.adapter.storage);
@@ -480,19 +186,14 @@ export async function resetForBrowserStartup(deps: Deps): Promise<void> {
     tabs: Object.fromEntries(previous.map((m, i) => [`stale-${i}`, m])),
     urlCounts: s.mappings.urlCounts,
   };
+  const detached = Object.fromEntries(Object.values(s.detached).map((url, i) => [`stale-${i}`, url]));
   await saveState(deps.adapter.storage, {
     mappings: emptyMappings(),
     staleMappings: previous.length > 0 ? staleMappings : null,
+    detached,
+    expected: [],
     receivingWindowId: null,
     runLock: null,
+    startupAt: nowMs(deps),
   });
-}
-
-/** Keep a mapped tab's last-known URL current (tabs.onUpdated). Unmapped tabs are ignored. */
-export async function updateMappedUrl(deps: Deps, tabId: number, url: string | undefined): Promise<void> {
-  if (!isShareableUrl(url)) return;
-  const s = await loadState(deps.adapter.storage);
-  const m = s.mappings.tabs[String(tabId)];
-  if (!m || m.url === url) return;
-  await saveState(deps.adapter.storage, { mappings: setMapping(s.mappings, tabId, m.entryId, url) });
 }

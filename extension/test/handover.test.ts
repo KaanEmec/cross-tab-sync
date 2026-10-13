@@ -6,15 +6,15 @@ import {
   createPairingCode,
   disconnect,
   handOver,
-  heartbeat,
   pair,
   pairFromPending,
   refreshOwner,
   resetForBrowserStartup,
-  updateMappedUrl,
   type Deps,
 } from "../src/core/handover.js";
 import { list } from "../src/core/journal.js";
+import { setMapping } from "../src/core/mapping.js";
+import { syncRun } from "../src/core/sync.js";
 import { loadState, saveState } from "../src/core/state.js";
 import { FakeServer } from "./support/fakeServer.js";
 
@@ -227,13 +227,16 @@ describe("stale owner", () => {
     expect(urls(mac.b)).toContain("https://brave/");
   });
 
-  it("heartbeat detects a lost ownership", async () => {
+  it("the owner run (empty batch heartbeat) detects a lost ownership and follows", async () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
     await continueHere(mac.deps);
-    const brave = await device("Brave", (b) => b.addWindow({ focused: true }));
+    const brave = await device("Brave", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://brave/" }] }));
     await continueHere(brave.deps);
-    await heartbeat(mac.deps);
-    expect((await mac.state()).generation).toBeNull();
+    const s = await syncRun(mac.deps);
+    expect(s.generation).toBeNull();
+    expect(s.freshPending).toBe(true);
+    expect(s.lastError).toBeNull();
+    expect(urls(mac.b)).toEqual(["https://brave/"]);
   });
 
   it("status refresh notices another owner", async () => {
@@ -341,13 +344,15 @@ describe("catchUp", () => {
     expect(createCalls(mac.b)).toEqual([]);
   });
 
-  it("catches up through changes when there is nothing to publish", async () => {
+  it("with nothing to publish sends an empty batch (heartbeat plus catch-up)", async () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
     await continueHere(mac.deps);
     const sentBefore = server.requests.filter((r) => r.path === "operations").length;
     server.inject("dev-other", [{ opId: "c1", type: "open", entryId: "E1", url: "https://remote/" }]);
     const s = await handOver(mac.deps);
-    expect(server.requests.filter((r) => r.path === "operations").length).toBe(sentBefore);
+    const sent = server.requests.filter((r) => r.path === "operations");
+    expect(sent.length).toBe(sentBefore + 1);
+    expect((sent.at(-1)!.body as { operations: unknown[] }).operations).toEqual([]);
     expect(urls(mac.b)).toEqual(["https://a/", "https://remote/"]);
     expect(mac.b.tabs[1]!.active).toBe(false);
     expect(s.lastRevision).toBe(server.revision);
@@ -431,7 +436,7 @@ describe("review fixes", () => {
     expect(server.openUrls()).toHaveLength(620);
   });
 
-  it("a late heartbeat 409 does not drop an ownership acquired since", async () => {
+  it("a late stale_owner reply does not drop an ownership acquired since", async () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
     await continueHere(mac.deps); // generation 1
     const brave = await device("Brave", (b) => b.addWindow({ focused: true }));
@@ -440,14 +445,14 @@ describe("review fixes", () => {
     await saveState(mac.b.storage, { generation: 1 });
 
     let release!: () => void;
-    server.beforeHeartbeat = () => new Promise<void>((r) => (release = r));
-    const beat = heartbeat(mac.deps); // sends generation 1, held by the server
+    server.beforeOperations = () => new Promise<void>((r) => (release = r));
+    const run = syncRun(mac.deps).catch((e: unknown) => e); // sends generation 1, held by the server
     await new Promise((r) => setTimeout(r, 0));
-    server.beforeHeartbeat = undefined;
+    server.beforeOperations = undefined;
     const s = await continueHere(mac.deps); // generation 3
     expect(s.generation).toBe(3);
     release();
-    await beat;
+    expect(await run).toMatchObject({ code: "stale_owner" });
 
     const after = await mac.state();
     expect(after.generation).toBe(3);
@@ -460,10 +465,13 @@ describe("review fixes", () => {
     );
     await continueHere(mac.deps);
     const revision = server.revision;
-    // The user navigated the b tab; onUpdated keeps its last-known URL current.
+    // The b tab's last-known URL moved (as change recording keeps it current).
     const bTab = mac.b.tabs[1]!;
     bTab.url = "https://b/next";
-    await updateMappedUrl(mac.deps, bTab.id, bTab.url);
+    const before = await mac.state();
+    await saveState(mac.b.storage, {
+      mappings: setMapping(before.mappings, bTab.id, before.mappings.tabs[String(bTab.id)]!.entryId, bTab.url),
+    });
     const entriesBefore = (await mac.state()).mappings.tabs;
 
     // Restart: same pages restored under new tab ids.
@@ -501,15 +509,6 @@ describe("review fixes", () => {
     expect(urls(mac.b)).toEqual(["https://1/", "https://3/"]);
     expect(Object.values(s.mappings.tabs).map((m) => m.url).sort()).toEqual(["https://1/", "https://3/"]);
     expect(s.lastError).toBe("1 tab(s) could not be created");
-  });
-
-  it("updateMappedUrl ignores unmapped tabs and unshareable URLs", async () => {
-    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
-    await continueHere(mac.deps);
-    const id = mac.b.tabs[0]!.id;
-    await updateMappedUrl(mac.deps, id, "");
-    await updateMappedUrl(mac.deps, 999, "https://x/");
-    expect((await mac.state()).mappings.tabs).toEqual({ [String(id)]: expect.objectContaining({ url: "https://a/" }) });
   });
 });
 

@@ -1,5 +1,6 @@
 // In-memory BrowserAdapter for tests. Mirrors the behavior the real adapter guarantees:
 // created tabs are never active, windows are created unfocused, storage values are cloned.
+// API calls emit the events a browser would (synchronously); `user*` helpers simulate the user.
 
 import type { BrowserAdapter, KeyValueStorage, TabInfo, Unsubscribe, WindowInfo } from "./types.js";
 
@@ -57,7 +58,10 @@ export class FakeBrowser implements BrowserAdapter {
     tabUpdated: new Emitter<[TabInfo, { url?: string; status?: string }]>(),
     tabActivated: new Emitter<[number, number]>(),
     windowFocus: new Emitter<[number | null]>(),
+    startup: new Emitter<[]>(),
   };
+  /** Server-side redirects applied when a tab loads a URL (from = requested, to = final). */
+  redirects = new Map<string, string>();
 
   private nextId = 1;
 
@@ -80,6 +84,7 @@ export class FakeBrowser implements BrowserAdapter {
       incognito: win.incognito,
       index: this.tabs.filter((t) => t.windowId === windowId).length,
       active: Boolean(init.active),
+      status: "complete",
     };
     this.tabs.push(tab);
     return tab;
@@ -107,14 +112,20 @@ export class FakeBrowser implements BrowserAdapter {
   async createTab(opts: { windowId: number; url: string; pinned?: boolean }): Promise<TabInfo> {
     this.calls.push({ method: "createTab", args: [opts] });
     if (this.failCreateFor.has(opts.url)) throw new Error("create failed");
-    return { ...this.addTab(opts.windowId, { url: opts.url, pinned: opts.pinned, active: false }) };
+    const tab = this.addTab(opts.windowId, { pinned: opts.pinned, active: false });
+    this.events.tabCreated.emit({ ...tab });
+    this.load(tab, opts.url);
+    return { ...tab };
   }
 
   async createWindow(url: string): Promise<{ windowId: number; tab: TabInfo }> {
     this.calls.push({ method: "createWindow", args: [url] });
     const windowId = this.addWindow();
     // A brand-new window necessarily shows its only tab; the window itself is not focused.
-    const tab = this.addTab(windowId, { url, active: true });
+    const tab = this.addTab(windowId, { active: true });
+    this.events.tabCreated.emit({ ...tab });
+    this.events.tabActivated.emit(tab.id, windowId);
+    this.load(tab, url);
     return { windowId, tab: { ...tab } };
   }
 
@@ -122,13 +133,77 @@ export class FakeBrowser implements BrowserAdapter {
     this.calls.push({ method: "updateTab", args: [tabId, props] });
     const tab = this.tabs.find((t) => t.id === tabId);
     if (!tab) throw new Error(`no tab ${tabId}`);
-    if (props.url !== undefined) tab.url = props.url;
     if (props.pinned !== undefined) tab.pinned = props.pinned;
+    if (props.url !== undefined) this.load(tab, props.url);
   }
 
   async removeTab(tabId: number): Promise<void> {
     this.calls.push({ method: "removeTab", args: [tabId] });
+    if (!this.tabs.some((t) => t.id === tabId)) return;
     this.tabs = this.tabs.filter((t) => t.id !== tabId);
+    this.events.tabRemoved.emit(tabId, false);
+  }
+
+  /** Load `url` in `tab`, following `redirects`, and report the committed URL. */
+  private load(tab: TabInfo, url: string): void {
+    tab.url = this.redirects.get(url) ?? url;
+    tab.status = "complete";
+    this.events.tabUpdated.emit({ ...tab }, { url: tab.url, status: "complete" });
+  }
+
+  // --- user actions -------------------------------------------------------------------------
+
+  /** New tab (Chrome-like: created without URL, then the page commits). */
+  userOpenTab(windowId: number, url: string, opts: { active?: boolean } = {}): TabInfo {
+    const tab = this.addTab(windowId, {});
+    tab.status = "loading";
+    this.events.tabCreated.emit({ ...tab });
+    if (opts.active) this.userActivate(tab.id);
+    this.load(tab, url);
+    return { ...tab };
+  }
+
+  userNavigate(tabId: number, url: string): void {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (!tab) throw new Error(`no tab ${tabId}`);
+    this.load(tab, url);
+  }
+
+  userActivate(tabId: number): void {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (!tab) throw new Error(`no tab ${tabId}`);
+    for (const t of this.tabs) if (t.windowId === tab.windowId) t.active = t.id === tabId;
+    this.events.tabActivated.emit(tabId, tab.windowId);
+  }
+
+  userCloseTab(tabId: number): void {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (!tab) throw new Error(`no tab ${tabId}`);
+    this.tabs = this.tabs.filter((t) => t.id !== tabId);
+    this.events.tabRemoved.emit(tabId, false);
+    const next = this.tabs.find((t) => t.windowId === tab.windowId);
+    if (tab.active && next) this.userActivate(next.id);
+  }
+
+  userFocusWindow(windowId: number | null): void {
+    for (const w of this.windows) w.focused = w.id === windowId;
+    if (windowId !== null) this.lastFocusedWindowId = windowId;
+    this.events.windowFocus.emit(windowId);
+  }
+
+  userCloseWindow(windowId: number): void {
+    const closing = this.tabs.filter((t) => t.windowId === windowId);
+    this.tabs = this.tabs.filter((t) => t.windowId !== windowId);
+    this.windows = this.windows.filter((w) => w.id !== windowId);
+    for (const t of closing) this.events.tabRemoved.emit(t.id, true);
+  }
+
+  /** Session restore: a tab appears with its URL already known. */
+  restoreTab(windowId: number, url: string): TabInfo {
+    const tab = this.addTab(windowId, { url });
+    this.events.tabCreated.emit({ ...tab });
+    this.events.tabUpdated.emit({ ...tab }, { status: "complete" });
+    return { ...tab };
   }
 
   async ensureAlarm(name: string, periodInMinutes: number): Promise<void> {
@@ -141,4 +216,5 @@ export class FakeBrowser implements BrowserAdapter {
   onTabUpdated = (cb: (tab: TabInfo, change: { url?: string; status?: string }) => void) => this.events.tabUpdated.on(cb);
   onTabActivated = (cb: (tabId: number, windowId: number) => void) => this.events.tabActivated.on(cb);
   onWindowFocusChanged = (cb: (windowId: number | null) => void) => this.events.windowFocus.on(cb);
+  onStartup = (cb: () => void) => this.events.startup.on(cb);
 }

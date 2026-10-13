@@ -3,24 +3,14 @@
 
 import { createWebExtAdapter } from "../adapter/webext.js";
 import { ApiClient } from "../core/client.js";
-import {
-  continueHere,
-  createPairingCode,
-  disconnect,
-  handOver,
-  heartbeat,
-  pairFromPending,
-  refreshOwner,
-  resetForBrowserStartup,
-  updateMappedUrl,
-  type Deps,
-} from "../core/handover.js";
-import { BusyError, withRunLock } from "../core/lock.js";
+import { SyncEngine } from "../core/engine.js";
+import { createPairingCode, disconnect, pairFromPending, refreshOwner, type Deps } from "../core/handover.js";
 import { statusView, type Request, type Response } from "../core/messages.js";
-import { isLocked, isPaired, loadState, saveState } from "../core/state.js";
+import { isPaired, loadState, saveState } from "../core/state.js";
 
-const HEARTBEAT_ALARM = "heartbeat";
-const HEARTBEAT_MINUTES = 5;
+/** The 5-minute cycle (named "heartbeat" since v0.1 so existing alarms keep working). */
+const SYNC_ALARM = "heartbeat";
+const SYNC_MINUTES = 5;
 
 const adapter = createWebExtAdapter();
 const deps: Deps = {
@@ -29,26 +19,17 @@ const deps: Deps = {
   browser: __BROWSER__,
 };
 
-// In-process guard on top of the persisted run lock: two messages can interleave at awaits
-// before the persisted flag is written.
-let current: Promise<unknown> | null = null;
+// Events, runs and popup actions go through one queue (see core/engine.ts); nothing else in this
+// worker keeps state between events.
+const engine = new SyncEngine(deps);
 
-async function exclusive<T>(action: string, fn: () => Promise<T>): Promise<T> {
-  if (current) throw new BusyError(action);
-  const run = withRunLock(adapter.storage, action, fn);
-  current = run;
-  try {
-    return await run;
-  } finally {
-    current = null;
+/** Pairing can be triggered twice (popup message and permissions.onAdded); the later one finds nothing. */
+async function pairQueued(): Promise<void> {
+  const result = await engine.locked("pair", () => pairFromPending(deps));
+  if (result) {
+    engine.requestSync();
+    return;
   }
-}
-
-/** Pairing can be triggered twice (popup message and permissions.onAdded); the later one waits. */
-async function pairExclusive(): Promise<void> {
-  if (current) await current.catch(() => undefined);
-  const result = await exclusive("pair", () => pairFromPending(deps));
-  if (result) return;
   const s = await loadState(adapter.storage);
   // The other trigger may already have failed (e.g. invalid_code): report its error.
   if (!isPaired(s)) throw new Error(s.lastError ?? "Pairing form expired or was already used; enter the code again");
@@ -62,55 +43,36 @@ async function setup(): Promise<void> {
     const browserName = __BROWSER__ === "safari" ? "Safari" : "Brave";
     await saveState(adapter.storage, { deviceName: osName ? `${browserName} on ${osName}` : browserName });
   }
-  await adapter.ensureAlarm(HEARTBEAT_ALARM, HEARTBEAT_MINUTES);
+  await adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
 }
 
 // Safari keeps alarms in memory only: re-create on every worker start, not just on install.
-void adapter.ensureAlarm(HEARTBEAT_ALARM, HEARTBEAT_MINUTES);
+void adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
 
 // There is one worker instance per extension, so a run lock found at worker start belongs to a
-// worker that was terminated mid-run. Clear it rather than waiting for the TTL.
-void saveState(adapter.storage, { runLock: null });
+// worker that was terminated mid-run. Clear it rather than waiting for the TTL, then send what
+// that worker journaled.
+void engine.enqueue(() => saveState(adapter.storage, { runLock: null })).then(() => engine.resume());
 
 chrome.runtime.onInstalled.addListener(() => {
   void setup();
 });
 
-chrome.runtime.onStartup.addListener(() => {
-  void resetForBrowserStartup(deps).then(setup);
-});
+// Tab, window and startup listeners, registered synchronously.
+engine.attach();
+adapter.onStartup(() => void setup());
 
 adapter.onAlarm((name) => {
-  if (name !== HEARTBEAT_ALARM) return;
-  // Under the run lock; skipped while an action runs (that action refreshes liveness itself).
-  void exclusive("heartbeat", () => heartbeat(deps)).catch(() => undefined);
-});
-
-// Keep the last-known URL of mapped tabs current, serialized after any running action so the
-// read-modify-write never races an action's own mapping writes.
-let urlUpdates: Promise<unknown> = Promise.resolve();
-adapter.onTabUpdated((tab, change) => {
-  if (change.url === undefined && change.status !== "complete") return;
-  urlUpdates = urlUpdates
-    .then(() => current?.catch(() => undefined))
-    .then(() => updateMappedUrl(deps, tab.id, tab.url))
-    .catch(() => undefined);
-});
-
-// Remember the last focused normal window: it receives tabs created by Continue here.
-adapter.onWindowFocusChanged((windowId) => {
-  if (windowId === null) return;
-  void adapter.getWindows().then((windows) => {
-    const w = windows.find((x) => x.id === windowId);
-    if (w && w.type === "normal" && !w.incognito) return saveState(adapter.storage, { receivingWindowId: w.id });
-  });
+  if (name !== SYNC_ALARM) return;
+  // Owner: flush plus heartbeat (empty batch). Follower: pull changes.
+  void engine.runNow("alarm").catch(() => undefined);
 });
 
 // In Chromium the permission prompt may close the popup before it can send "pair"; finish the
 // pairing here from the form it saved.
 chrome.permissions?.onAdded?.addListener((perms) => {
   if (!perms.origins?.length) return;
-  void pairExclusive().catch(() => undefined);
+  void pairQueued().catch(() => undefined);
 });
 
 async function handle(req: Request): Promise<Response> {
@@ -118,24 +80,25 @@ async function handle(req: Request): Promise<Response> {
   let reachable: boolean | undefined;
   switch (req.type) {
     case "getStatus":
-      if (req.refresh && !current && !isLocked(await loadState(adapter.storage), Date.now())) {
-        reachable = await refreshOwner(deps);
-      }
+      if (req.refresh && !engine.busy) reachable = await engine.enqueue(() => refreshOwner(deps));
       break;
     case "pair":
-      await pairExclusive();
+      await pairQueued();
       break;
     case "handOver":
-      await exclusive("handOver", () => handOver(deps));
+      await engine.handOver();
       break;
     case "continueHere":
-      await exclusive("continueHere", () => continueHere(deps));
+      await engine.takeover("continueHere");
+      break;
+    case "syncNow":
+      await engine.runNow("syncNow");
       break;
     case "createPairingCode":
       pairingCode = await createPairingCode(deps);
       break;
     case "disconnect":
-      await exclusive("disconnect", () => disconnect(deps));
+      await engine.locked("disconnect", () => disconnect(deps));
       break;
     default:
       throw new Error("Unknown request");

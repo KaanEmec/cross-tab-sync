@@ -1,5 +1,6 @@
 import type { KeyValueStorage } from "../adapter/types.js";
 import type { Owner } from "./client.js";
+import type { Expectation } from "./changes.js";
 import type { Journal } from "./journal.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 
@@ -37,6 +38,26 @@ export interface State {
   pendingPair: PendingPair | null;
   /** Persisted run flag so two sync runs never overlap, even across service worker restarts. */
   runLock: { action: string; startedAt: number } | null;
+
+  // v0.2 automatic sync (PROTOCOL.md "Client behavior (v0.2 automatic sync)").
+  /** Echo suppression: what the extension is about to create, navigate, or remove. */
+  expected: Expectation[];
+  /**
+   * Tabs left open (they were active) when a remote `close` removed their entry, keyed by tab id
+   * (`stale-N` after a browser restart), value = the URL they showed. Not republished until they
+   * navigate or close.
+   */
+  detached: Record<string, string>;
+  /** Epoch ms of the last browser startup (startup grace for removals and activity). */
+  startupAt: number | null;
+  /** Epoch ms of the last activity signal (stored with a few seconds of granularity). */
+  lastActivityAt: number | null;
+  /** Epoch ms of the last takeover attempt (rate limit). */
+  lastTakeoverAt: number | null;
+  /** Set by manual Hand over; cleared by the next fresh interaction. */
+  suppressAutoTakeover: boolean;
+  /** The next activity signal counts as fresh (ownership was lost, or a takeover was deferred). */
+  freshPending: boolean;
 }
 
 export interface PendingPair {
@@ -67,6 +88,13 @@ export function defaultState(): State {
     receivingWindowId: null,
     pendingPair: null,
     runLock: null,
+    expected: [],
+    detached: {},
+    startupAt: null,
+    lastActivityAt: null,
+    lastTakeoverAt: null,
+    suppressAutoTakeover: false,
+    freshPending: false,
   };
 }
 
@@ -106,6 +134,11 @@ export function clearedCredentials(): Partial<State> {
     mappings: emptyMappings(),
     staleMappings: null,
     pending: [],
+    expected: [],
+    detached: {},
+    lastTakeoverAt: null,
+    suppressAutoTakeover: false,
+    freshPending: false,
   };
 }
 

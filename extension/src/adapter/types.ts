@@ -7,6 +7,8 @@ export interface TabInfo {
   incognito: boolean;
   index: number;
   active: boolean;
+  /** Load status ("loading" | "complete"; "unloaded" for discarded tabs) when the browser reports it. */
+  status?: string;
 }
 
 export interface WindowInfo {
@@ -51,5 +53,8 @@ export interface BrowserAdapter {
   /** `change` carries the changed `url` and/or load `status` ("loading" | "complete"). */
   onTabUpdated(cb: (tab: TabInfo, change: { url?: string; status?: string }) => void): Unsubscribe;
   onTabActivated(cb: (tabId: number, windowId: number) => void): Unsubscribe;
+  /** `null` when focus left the browser (WINDOW_ID_NONE). */
   onWindowFocusChanged(cb: (windowId: number | null) => void): Unsubscribe;
+  /** `runtime.onStartup`: a browser profile started (tab ids from before are invalid). */
+  onStartup(cb: () => void): Unsubscribe;
 }

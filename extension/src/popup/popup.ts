@@ -53,6 +53,7 @@ function render(s: StatusView): void {
   badge.textContent = reachable === false ? "Offline" : s.isOwner ? "Owner" : "Follower";
   badge.classList.toggle("owner", s.isOwner && reachable !== false);
 
+  $("role").textContent = s.isOwner ? "Owner (publishes changes)" : "Follower (applies changes)";
   const o = s.owner;
   $("owner").textContent = !o
     ? "No owner"
@@ -72,6 +73,7 @@ function render(s: StatusView): void {
   handOver.disabled = busy || s.running || !s.isOwner;
   handOver.title = s.isOwner ? "Publish this browser's tabs and release control" : "Only the owner can hand over";
   continueHere.disabled = busy || s.running;
+  $<HTMLButtonElement>("sync-now").disabled = busy || s.running;
 
   showError(s.lastError);
 }
@@ -140,6 +142,7 @@ pairView.addEventListener("submit", (ev) => {
 
 $("hand-over").addEventListener("click", () => void run({ type: "handOver" }));
 $("continue-here").addEventListener("click", () => void run({ type: "continueHere" }));
+$("sync-now").addEventListener("click", () => void run({ type: "syncNow" }));
 
 $("create-code").addEventListener("click", async () => {
   const res = await run({ type: "createPairingCode" });

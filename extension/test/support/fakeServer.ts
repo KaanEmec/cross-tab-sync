@@ -1,4 +1,4 @@
-// In-memory implementation of the PROTOCOL.md server semantics, enough to drive handover tests.
+// In-memory implementation of the PROTOCOL.md server semantics, enough to drive handover and sync tests.
 import {
   ApiError,
   type Entry,
@@ -53,8 +53,10 @@ export class FakeServer {
   /** Apply the next operations batch but fail as if the response was lost. */
   dropNextOperationsResponse = false;
   requests: { path: string; body?: unknown; device?: string }[] = [];
-  /** Test hook to delay a heartbeat between authentication and the ownership check. */
-  beforeHeartbeat?: () => Promise<void>;
+  /** `changes?since=` below this revision answers `410 history_expired`. */
+  historyStart = 0;
+  /** Test hook to delay an operations request between authentication and the ownership check. */
+  beforeOperations?: () => Promise<void>;
 
   addDevice(name: string): Device {
     const n = this.devices.length + 1;
@@ -183,11 +185,14 @@ export class FakeServer {
       if (this.owner?.deviceId === id) this.owner = null;
     },
     session: async () => {
-      this.auth(cfg.token);
+      const d = this.auth(cfg.token);
+      this.requests.push({ path: "session", device: d.id });
       return this.session();
     },
     changes: async (since) => {
-      this.auth(cfg.token);
+      const d = this.auth(cfg.token);
+      this.requests.push({ path: "changes", body: { since }, device: d.id });
+      if (since < this.historyStart) throw new ApiError(410, "history_expired", "history expired", { error: "history_expired" });
       return { revision: this.revision, owner: this.owner, operations: this.log.filter((l) => l.seq > since) };
     },
     acquire: async (force) => {
@@ -206,12 +211,12 @@ export class FakeServer {
     },
     heartbeat: async (generation) => {
       const d = this.auth(cfg.token);
-      await this.beforeHeartbeat?.();
       this.checkOwner(d, generation);
     },
     operations: async ({ generation, baseRevision, operations }) => {
       const d = this.auth(cfg.token);
       this.requests.push({ path: "operations", body: { generation, baseRevision, operations }, device: d.id });
+      await this.beforeOperations?.();
       this.checkOwner(d, generation);
       validateBatch({ baseRevision, operations });
       const catchUp = this.log.filter((l) => l.seq > baseRevision && l.deviceId !== d.id);
