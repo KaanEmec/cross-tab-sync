@@ -26,7 +26,7 @@ CTS_ALLOW_INSECURE=1 ./bin/cross-tab-sync serve     # local development over pla
 | `CTS_OWNER_LIVENESS` | `10m` | Owner is stale after this long without heartbeat or operations |
 | `CTS_SNAPSHOT_RETENTION` | `20` | Recovery snapshots kept |
 
-Logs are JSON on stdout with method, path, status, device id and latency only.
+Logs are JSON on stdout with method, route pattern, status, device id and latency only. The operation log is never pruned yet, so `changes` and `catchUp` history is unbounded until pruning and catch-up paging arrive in v1.0.0.
 
 ## curl examples
 

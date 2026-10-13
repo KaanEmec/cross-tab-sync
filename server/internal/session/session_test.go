@@ -135,3 +135,21 @@ func TestApplyUpdate(t *testing.T) {
 		t.Fatalf("sort order %+v", open)
 	}
 }
+
+func TestValidatePositionBounds(t *testing.T) {
+	t.Parallel()
+	ok := Op{OpID: op1, Type: TypeUpdate, EntryID: e1, Position: ptr(int64(MaxPosition))}
+	if err := Validate(ok); err != nil {
+		t.Fatalf("max position rejected: %v", err)
+	}
+	ok.Position = ptr(int64(MaxPosition + 1))
+	if err := Validate(ok); err == nil {
+		t.Fatal("position above 2^53-1 accepted")
+	}
+	// nextPos never exceeds MaxPosition.
+	s := NewState([]Entry{{ID: e1, URL: "https://a.example/", Position: MaxPosition}})
+	_, ch := s.Apply(Op{OpID: op2, Type: TypeOpen, EntryID: e2, URL: "https://b.example/"}, "dev", 2)
+	if ch.Position != MaxPosition {
+		t.Fatalf("default position %d", ch.Position)
+	}
+}

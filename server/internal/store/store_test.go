@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,5 +88,63 @@ func TestNormalizeCode(t *testing.T) {
 		if !strings.ContainsRune(CodeAlphabet, c) {
 			t.Fatalf("code %q has %q outside the alphabet", code, c)
 		}
+	}
+}
+
+func TestRevokedDeviceCannotWrite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "cts.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now()
+	pair := func(name string) string {
+		t.Helper()
+		code, _, err := st.CreatePairingCode(ctx, "", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _, err := st.Pair(ctx, code, name, "brave", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	a, b := pair("A"), pair("B")
+	gen, _, err := st.Acquire(ctx, a, false, now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulates a request authenticated just before the revocation committed.
+	if err := st.RevokeDevice(ctx, b, a, now); err != nil {
+		t.Fatal(err)
+	}
+
+	checks := map[string]error{}
+	_, _, checks["acquire"] = st.Acquire(ctx, a, true, now, time.Minute)
+	_, _, checks["pairing code"] = st.CreatePairingCode(ctx, a, now)
+	checks["release"] = st.Release(ctx, a, gen)
+	checks["heartbeat"] = st.Heartbeat(ctx, a, gen, now)
+	_, checks["operations"] = st.ApplyOperations(ctx, a, gen, 0, nil, now, 5)
+	_, checks["restore"] = st.RestoreSnapshot(ctx, a, gen, 1, now, 5)
+	checks["revoke"] = st.RevokeDevice(ctx, a, b, now)
+	for name, err := range checks {
+		if !errors.Is(err, ErrRevoked) {
+			t.Errorf("%s by revoked device: %v, want ErrRevoked", name, err)
+		}
+	}
+	sess, err := st.GetSession(ctx)
+	if err != nil || sess.Owner != nil {
+		t.Fatalf("owner after revocation: %+v %v", sess.Owner, err)
+	}
+}
+
+func TestTimestampJSON(t *testing.T) {
+	t.Parallel()
+	b, err := json.Marshal(Timestamp{time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("x", 3600))})
+	if err != nil || string(b) != `"2026-01-02T02:04:05.000Z"` {
+		t.Fatalf("got %s %v", b, err)
 	}
 }

@@ -173,6 +173,17 @@ func (s *Store) tx(ctx context.Context, fn func(*sql.Tx) error) error {
 	return nil
 }
 
+// TimestampLayout is RFC 3339 in UTC with exactly three fractional digits.
+const TimestampLayout = "2006-01-02T15:04:05.000Z07:00"
+
+// Timestamp is a time that marshals with TimestampLayout.
+type Timestamp struct{ time.Time }
+
+// MarshalJSON implements json.Marshaler.
+func (t Timestamp) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + t.UTC().Format(TimestampLayout) + `"`), nil
+}
+
 func ms(t time.Time) int64 { return t.UnixMilli() }
 
 func fromMS(v int64) time.Time { return time.UnixMilli(v).UTC() }

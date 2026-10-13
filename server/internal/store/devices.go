@@ -76,6 +76,11 @@ func (s *Store) CreatePairingCode(ctx context.Context, createdBy string, now tim
 		by = createdBy
 	}
 	err = s.tx(ctx, func(tx *sql.Tx) error {
+		if createdBy != "" {
+			if err := requireActiveDevice(ctx, tx, createdBy); err != nil {
+				return err
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM pairing_codes WHERE expires_at <= ?`, ms(now)); err != nil {
 			return err
 		}
@@ -84,6 +89,9 @@ func (s *Store) CreatePairingCode(ctx context.Context, createdBy string, now tim
 			hash(code), by, ms(now), ms(expires))
 		return err
 	})
+	if errors.Is(err, ErrRevoked) {
+		return "", time.Time{}, err
+	}
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("storing pairing code: %w", err)
 	}
@@ -202,10 +210,14 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 	return out, nil
 }
 
-// RevokeDevice revokes a device's token and clears ownership if it was the
-// owner. Returns ErrNotFound for unknown or already revoked devices.
-func (s *Store) RevokeDevice(ctx context.Context, id string, now time.Time) error {
+// RevokeDevice revokes device id on behalf of callerID (which may be the same
+// device) and clears ownership if id was the owner. Returns ErrNotFound for
+// unknown or already revoked devices.
+func (s *Store) RevokeDevice(ctx context.Context, callerID, id string, now time.Time) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, callerID); err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx, `UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, ms(now), id)
 		if err != nil {
 			return fmt.Errorf("revoking device: %w", err)

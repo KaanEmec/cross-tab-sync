@@ -31,6 +31,7 @@ const (
 	MaxBatchOps   = 500
 	MaxBodyBytes  = 64 << 10
 	MaxNameLength = 64
+	MaxPosition   = 1<<53 - 1 // largest integer JavaScript represents exactly
 )
 
 // Op is one client operation as sent on the wire and stored in the log.
@@ -77,8 +78,8 @@ func Validate(op Op) error {
 	if !IsUUID(op.EntryID) {
 		return fmt.Errorf("%w: entryId must be a lowercase UUID", ErrInvalid)
 	}
-	if op.Position != nil && *op.Position < 0 {
-		return fmt.Errorf("%w: position must be >= 0", ErrInvalid)
+	if op.Position != nil && (*op.Position < 0 || *op.Position > MaxPosition) {
+		return fmt.Errorf("%w: position must be 0..2^53-1", ErrInvalid)
 	}
 	switch op.Type {
 	case TypeOpen, TypeNavigate:
@@ -146,7 +147,7 @@ func NewState(entries []Entry) *State {
 		s.byID[e.ID] = &e
 		if e.Open() {
 			s.openByURL[e.URL] = e.ID
-			s.nextPos = max(s.nextPos, e.Position+1)
+			s.nextPos = min(max(s.nextPos, e.Position+1), MaxPosition)
 		}
 	}
 	return s
@@ -183,7 +184,7 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 		}
 		s.byID[ne.ID] = ne
 		s.openByURL[ne.URL] = ne.ID
-		s.nextPos = max(s.nextPos, ne.Position+1)
+		s.nextPos = min(max(s.nextPos, ne.Position+1), MaxPosition)
 		res.Status, res.EntryID = StatusApplied, ne.ID
 		return res, copyEntry(ne)
 
@@ -220,7 +221,7 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 		}
 		if op.Position != nil {
 			e.Position = *op.Position
-			s.nextPos = max(s.nextPos, e.Position+1)
+			s.nextPos = min(max(s.nextPos, e.Position+1), MaxPosition)
 		}
 		e.UpdatedRevision = rev
 		res.Status, res.EntryID = StatusApplied, e.ID

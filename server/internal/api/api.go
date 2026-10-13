@@ -106,13 +106,15 @@ func (s *Server) logRequests(mux *http.ServeMux, next http.Handler) http.Handler
 					writeError(rec, http.StatusInternalServerError, "internal", "internal error", nil)
 				}
 			}
+			// Log the route pattern, never the raw path: wildcard segments
+			// and unmatched paths are client-controlled.
 			pattern := r.Pattern
 			if pattern == "" { // rejected before routing
 				_, pattern = mux.Handler(r)
 			}
-			path := r.URL.Path
-			if pattern == "" || pattern == "/" {
-				path = "(unmatched)" // never echo arbitrary client paths
+			_, path, _ := strings.Cut(pattern, " ")
+			if path == "" || path == "/" {
+				path = "(unmatched)"
 			}
 			status := rec.status
 			if status == 0 {
@@ -211,6 +213,8 @@ func (s *Server) storeError(w http.ResponseWriter, r *http.Request, err error) {
 			msg = "another device owns the session"
 		}
 		writeError(w, http.StatusConflict, ce.Code, msg, map[string]any{"owner": ce.Owner})
+	case errors.Is(err, store.ErrRevoked):
+		writeError(w, http.StatusUnauthorized, "device_revoked", "this device has been revoked; pair again", nil)
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "not found", nil)
 	case errors.Is(err, store.ErrHistoryExpired):

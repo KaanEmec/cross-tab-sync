@@ -24,7 +24,7 @@ type Owner struct {
 	DeviceID   string    `json:"deviceId"`
 	Name       string    `json:"name"`
 	Generation int64     `json:"generation"`
-	LastSeenAt time.Time `json:"lastSeenAt"`
+	LastSeenAt Timestamp `json:"lastSeenAt"`
 }
 
 // Session is the current shared session with its open entries.
@@ -55,7 +55,7 @@ type Snapshot struct {
 	Revision   int64     `json:"revision"`
 	DeviceID   string    `json:"deviceId"`
 	Reason     string    `json:"reason"`
-	CreatedAt  time.Time `json:"createdAt"`
+	CreatedAt  Timestamp `json:"createdAt"`
 	EntryCount int       `json:"entryCount"`
 }
 
@@ -86,7 +86,7 @@ func loadSession(ctx context.Context, tx *sql.Tx) (sessionRow, error) {
 		return r, fmt.Errorf("loading session: %w", err)
 	}
 	if ownerID.Valid {
-		r.owner = &Owner{DeviceID: ownerID.String, Name: name.String, Generation: r.generation, LastSeenAt: fromMS(lastSeen.Int64)}
+		r.owner = &Owner{DeviceID: ownerID.String, Name: name.String, Generation: r.generation, LastSeenAt: Timestamp{fromMS(lastSeen.Int64)}}
 	}
 	return r, nil
 }
@@ -96,6 +96,21 @@ func loadSession(ctx context.Context, tx *sql.Tx) (sessionRow, error) {
 func (r sessionRow) requireOwner(deviceID string, gen int64) error {
 	if r.owner == nil || r.owner.DeviceID != deviceID || r.generation != gen {
 		return &ConflictError{Code: CodeStaleOwner, Owner: r.owner}
+	}
+	return nil
+}
+
+// requireActiveDevice fails with ErrRevoked unless the device exists and is
+// not revoked. Write paths call it inside their transaction because
+// authentication happens in an earlier, separate statement.
+func requireActiveDevice(ctx context.Context, tx *sql.Tx, deviceID string) error {
+	var revoked sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT revoked_at FROM devices WHERE id = ?`, deviceID).Scan(&revoked)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && revoked.Valid) {
+		return ErrRevoked
+	}
+	if err != nil {
+		return fmt.Errorf("checking device: %w", err)
 	}
 	return nil
 }
@@ -168,6 +183,9 @@ func (s *Store) Acquire(ctx context.Context, deviceID string, force bool, now ti
 		out Session
 	)
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, deviceID); err != nil {
+			return err
+		}
 		r, err := loadSession(ctx, tx)
 		if err != nil {
 			return err
@@ -177,7 +195,7 @@ func (s *Store) Acquire(ctx context.Context, deviceID string, force bool, now ti
 			if err := touchOwner(ctx, tx, now); err != nil {
 				return err
 			}
-		case r.owner != nil && !force && now.Sub(r.owner.LastSeenAt) <= liveness:
+		case r.owner != nil && !force && now.Sub(r.owner.LastSeenAt.Time) <= liveness:
 			return &ConflictError{Code: CodeOwnerActive, Owner: r.owner}
 		default:
 			if _, err := tx.ExecContext(ctx,
@@ -203,6 +221,9 @@ func (s *Store) Acquire(ctx context.Context, deviceID string, force bool, now ti
 // Release gives up ownership.
 func (s *Store) Release(ctx context.Context, deviceID string, gen int64) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, deviceID); err != nil {
+			return err
+		}
 		r, err := loadSession(ctx, tx)
 		if err != nil {
 			return err
@@ -220,6 +241,9 @@ func (s *Store) Release(ctx context.Context, deviceID string, gen int64) error {
 // Heartbeat refreshes the owner's lastSeenAt.
 func (s *Store) Heartbeat(ctx context.Context, deviceID string, gen int64, now time.Time) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, deviceID); err != nil {
+			return err
+		}
 		r, err := loadSession(ctx, tx)
 		if err != nil {
 			return err
@@ -282,6 +306,9 @@ func loggedOps(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]Lo
 func (s *Store) ApplyOperations(ctx context.Context, deviceID string, gen, baseRevision int64, ops []session.Op, now time.Time, retention int) (BatchResult, error) {
 	var out BatchResult
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, deviceID); err != nil {
+			return err
+		}
 		r, err := loadSession(ctx, tx)
 		if err != nil {
 			return err
@@ -315,21 +342,22 @@ type batch struct {
 	now        time.Time
 	retention  int
 	reason     string // snapshot reason
-	snapshot   bool   // always snapshot, regardless of op types
+	snapshot   bool   // snapshot when any op is new, regardless of op types
 }
 
 // applyBatch applies ops in order, saving a recovery snapshot first when the
-// batch contains new close or navigate operations (or b.snapshot is set).
+// batch contains new close or navigate operations (or, with b.snapshot, any
+// new operation). Pure replays never snapshot.
 func applyBatch(ctx context.Context, tx *sql.Tx, b batch) ([]session.Result, int64, error) {
 	stored := make(map[string]session.Result, len(b.ops))
 	ids := make([]string, 0, len(b.ops))
-	needSnapshot := b.snapshot
+	needSnapshot := false
 	for _, op := range b.ops {
 		var raw string
 		err := tx.QueryRowContext(ctx, `SELECT result FROM operations WHERE op_id = ?`, op.OpID).Scan(&raw)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			if op.Type == session.TypeClose || op.Type == session.TypeNavigate {
+			if b.snapshot || op.Type == session.TypeClose || op.Type == session.TypeNavigate {
 				needSnapshot = true
 			}
 		case err != nil:
@@ -459,7 +487,7 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
 		if err := rows.Scan(&sn.ID, &sn.Revision, &sn.DeviceID, &sn.Reason, &created, &sn.EntryCount); err != nil {
 			return nil, fmt.Errorf("scanning snapshot: %w", err)
 		}
-		sn.CreatedAt = fromMS(created)
+		sn.CreatedAt = Timestamp{fromMS(created)}
 		out = append(out, sn)
 	}
 	if err := rows.Err(); err != nil {
@@ -468,12 +496,25 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
 	return out, nil
 }
 
+// restoreNamespace seeds the deterministic (UUIDv5) ids of restore operations.
+var restoreNamespace = uuid.MustParse("5b0c6f0e-3d1a-4f7e-9c2b-8a4d6e1f2c30")
+
+// restoreID derives a stable id so that retrying the same restore in the same
+// generation replays the stored results instead of applying again.
+func restoreID(kind string, snapshotID, gen int64, index int) string {
+	return uuid.NewSHA1(restoreNamespace, fmt.Appendf(nil, "%s:%d:%d:%d", kind, snapshotID, gen, index)).String()
+}
+
 // RestoreSnapshot re-opens a snapshot's URLs as ordinary open operations
-// (new op and entry ids) under the caller's generation, after saving a
-// pre-restore snapshot. Open URLs coalesce; nothing is closed or rewound.
+// under the caller's generation, after saving a pre-restore snapshot. Open
+// URLs coalesce; nothing is closed or rewound. Op and entry ids derive from
+// (snapshot, generation, index), so a retry in the same generation is a replay.
 func (s *Store) RestoreSnapshot(ctx context.Context, deviceID string, gen, id int64, now time.Time, retention int) (BatchResult, error) {
 	var out BatchResult
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, deviceID); err != nil {
+			return err
+		}
 		r, err := loadSession(ctx, tx)
 		if err != nil {
 			return err
@@ -496,7 +537,7 @@ func (s *Store) RestoreSnapshot(ctx context.Context, deviceID string, gen, id in
 		ops := make([]session.Op, len(items))
 		for i, it := range items {
 			ops[i] = session.Op{
-				OpID: uuid.NewString(), Type: session.TypeOpen, EntryID: uuid.NewString(),
+				OpID: restoreID("op", id, gen, i), Type: session.TypeOpen, EntryID: restoreID("entry", id, gen, i),
 				URL: it.URL, Pinned: &it.Pinned, Position: &it.Position,
 			}
 		}

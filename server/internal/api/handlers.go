@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -102,10 +101,10 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createPairingCode(w http.ResponseWriter, r *http.Request) {
 	code, expires, err := s.store.CreatePairingCode(r.Context(), device(r).ID, s.now())
 	if err != nil {
-		s.internal(w, r, err)
+		s.storeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"code": code, "expiresAt": expires})
+	writeJSON(w, http.StatusCreated, map[string]any{"code": code, "expiresAt": store.Timestamp{Time: expires}})
 }
 
 func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
@@ -115,23 +114,23 @@ func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type deviceJSON struct {
-		ID         string    `json:"id"`
-		Name       string    `json:"name"`
-		Browser    string    `json:"browser"`
-		CreatedAt  time.Time `json:"createdAt"`
-		LastSeenAt time.Time `json:"lastSeenAt"`
-		IsSelf     bool      `json:"isSelf"`
+		ID         string          `json:"id"`
+		Name       string          `json:"name"`
+		Browser    string          `json:"browser"`
+		CreatedAt  store.Timestamp `json:"createdAt"`
+		LastSeenAt store.Timestamp `json:"lastSeenAt"`
+		IsSelf     bool            `json:"isSelf"`
 	}
 	self := device(r).ID
 	out := make([]deviceJSON, len(ds))
 	for i, d := range ds {
-		out[i] = deviceJSON{ID: d.ID, Name: d.Name, Browser: d.Browser, CreatedAt: d.CreatedAt, LastSeenAt: d.LastSeenAt, IsSelf: d.ID == self}
+		out[i] = deviceJSON{ID: d.ID, Name: d.Name, Browser: d.Browser, CreatedAt: store.Timestamp{Time: d.CreatedAt}, LastSeenAt: store.Timestamp{Time: d.LastSeenAt}, IsSelf: d.ID == self}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
 }
 
 func (s *Server) revokeDevice(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.RevokeDevice(r.Context(), r.PathValue("id"), s.now()); err != nil {
+	if err := s.store.RevokeDevice(r.Context(), device(r).ID, r.PathValue("id"), s.now()); err != nil {
 		s.storeError(w, r, err)
 		return
 	}
