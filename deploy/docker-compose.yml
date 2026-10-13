@@ -2,6 +2,8 @@
 # Pair:  docker compose exec cts /cross-tab-sync pair-code
 services:
   cts:
+    # `docker compose pull cts` fetches the release image; `--build` builds from source.
+    image: ghcr.io/kaanemec/cross-tab-sync:${CTS_VERSION:-latest}
     build:
       context: ../server
       dockerfile: ../deploy/Dockerfile
