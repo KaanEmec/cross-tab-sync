@@ -22,7 +22,7 @@ Sync ordinary HTTP/HTTPS webpage tabs, with tab order and pinned state where bro
 
 Exclude private tabs, browser-internal pages, tab groups, cookies, history, login sessions, unsaved forms, and in-memory page state. Automatic ownership is an inference from activity, with manual buttons as overrides.
 
-## Suggested architecture
+## Architecture
 
 - **Extensions:** shared TypeScript WebExtension logic and a small HTML/CSS popup, with browser-specific adapters and manifests.
 - **Safari:** minimal Swift macOS app wrapper, packaged with Xcode.
@@ -30,4 +30,8 @@ Exclude private tabs, browser-internal pages, tab groups, cookies, history, logi
 - **Hosting:** HTTPS on the VPS, optionally using Docker Compose and Caddy.
 - **Protocol:** snapshots plus retry-safe open, navigate, and close operations. Persist pending changes locally; enforce ownership and revisions on the server.
 
-See [the roadmap](ROADMAP.md) for version milestones, epics, and implementation jobs.
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). Build and run: [server/README.md](server/README.md), [extension/README.md](extension/README.md), [safari/README.md](safari/README.md). Milestones: [ROADMAP.md](ROADMAP.md).
+
+## License
+
+[MIT](LICENSE)

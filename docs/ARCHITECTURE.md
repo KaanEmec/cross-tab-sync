@@ -79,9 +79,9 @@ A minimal Swift macOS app whose only job is to host the extension. Produced from
 | Milestone | Epic | Status |
 | --- | --- | --- |
 | v0.1.0 | 01 Session contract | done (protocol + compatibility research; real-browser checks pending) |
-| v0.1.0 | 02 Backend | in progress |
-| v0.1.0 | 03 Extensions | in progress |
-| v0.2.0 | Automatic ownership, tab changes, reconciliation | planned |
+| v0.1.0 | 02 Backend | done (reviewed, tested; deploy files in `deploy/`) |
+| v0.1.0 | 03 Extensions | done in code (reviewed, unit tested, Safari wrapper builds); real-browser validation pending |
+| v0.2.0 | Automatic ownership, tab changes, reconciliation | in progress (design in PROTOCOL.md; extension-only) |
 | v1.0.0 | Offline merging, recovery, release | planned |
 
 See [ROADMAP.md](../ROADMAP.md) for completion criteria and `versions/` for the job files.
