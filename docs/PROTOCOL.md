@@ -105,7 +105,8 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 
 - The forked entry id is UUIDv5 with the `opId` as namespace and the name `forked`; it copies the source entry's pinned state and is appended after the highest position. If the forked URL is already open, the result is `coalesced` to that entry.
 - Later operations in the same batch that target the forked entry's source are redirected to the fork. Across requests this is not remembered: after a `forked` result the client must rewrite its remaining pending operations for that entry to the new id.
-- The log records operations as applied (a forked navigate is logged as an `open` of the fork), so `changes` and `catchUp` consumers never see `forked`.
+- The log records operations as applied (a forked navigate is logged as an applied `open` of the fork), so `changes` and `catchUp` consumers never see `forked`; only the direct merge response and its replay report `forked`.
+- Operations older than the retention window are treated as new if resubmitted, so a resent opening of a pruned closed entry recreates it.
 - Operations on closed or unknown entries are `ignored`. Merged operations carry generation 0 and do not refresh the owner's liveness.
 
 ### History retention (v1.0)
