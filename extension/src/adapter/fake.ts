@@ -43,6 +43,8 @@ export interface FakeTabInit {
 
 export class FakeBrowser implements BrowserAdapter {
   readonly storage = new MemoryStorage();
+  /** Cleared by `restart()`. Set to null to simulate an engine without storage.session. */
+  sessionStorage: MemoryStorage | null = new MemoryStorage();
   windows: WindowInfo[] = [];
   tabs: TabInfo[] = [];
   lastFocusedWindowId: number | null = null;
@@ -54,7 +56,8 @@ export class FakeBrowser implements BrowserAdapter {
   readonly events = {
     alarm: new Emitter<[string]>(),
     tabCreated: new Emitter<[TabInfo]>(),
-    tabRemoved: new Emitter<[number, boolean]>(),
+    tabRemoved: new Emitter<[number, boolean, number]>(),
+    windowRemoved: new Emitter<[number]>(),
     tabUpdated: new Emitter<[TabInfo, { url?: string; status?: string }]>(),
     tabActivated: new Emitter<[number, number]>(),
     windowFocus: new Emitter<[number | null]>(),
@@ -139,16 +142,48 @@ export class FakeBrowser implements BrowserAdapter {
 
   async removeTab(tabId: number): Promise<void> {
     this.calls.push({ method: "removeTab", args: [tabId] });
-    if (!this.tabs.some((t) => t.id === tabId)) return;
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (!tab) return;
     this.tabs = this.tabs.filter((t) => t.id !== tabId);
-    this.events.tabRemoved.emit(tabId, false);
+    this.events.tabRemoved.emit(tabId, false, tab.windowId);
   }
 
-  /** Load `url` in `tab`, following `redirects`, and report the committed URL. */
+  /**
+   * Load `url` in `tab` like a browser: a loading phase with the requested URL, the redirect target
+   * (from `redirects`) while still loading, then complete.
+   */
   private load(tab: TabInfo, url: string): void {
-    tab.url = this.redirects.get(url) ?? url;
+    tab.url = url;
+    tab.status = "loading";
+    this.events.tabUpdated.emit({ ...tab }, { url, status: "loading" });
+    const final = this.redirects.get(url);
+    if (final) {
+      tab.url = final;
+      this.events.tabUpdated.emit({ ...tab }, { url: final });
+    }
     tab.status = "complete";
-    this.events.tabUpdated.emit({ ...tab }, { url: tab.url, status: "complete" });
+    this.events.tabUpdated.emit({ ...tab }, { status: "complete" });
+  }
+
+  /** The loaded page changes its own URL (history.replaceState, hash, script redirect). */
+  pageRewritesUrl(tabId: number, url: string): void {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (!tab) throw new Error(`no tab ${tabId}`);
+    tab.url = url;
+    this.events.tabUpdated.emit({ ...tab }, { url });
+  }
+
+  /**
+   * Browser quit and relaunch: windows, tabs and session storage are gone and ids restart from 1,
+   * so restored tabs reuse ids of the previous session. Restore with `restoreTab`, then emit
+   * `events.startup` (possibly after the restored-tab events, as browsers may do).
+   */
+  restart(): void {
+    this.tabs = [];
+    this.windows = [];
+    this.lastFocusedWindowId = null;
+    this.nextId = 1;
+    void this.sessionStorage?.remove([...this.sessionStorage.data.keys()]);
   }
 
   // --- user actions -------------------------------------------------------------------------
@@ -180,7 +215,7 @@ export class FakeBrowser implements BrowserAdapter {
     const tab = this.tabs.find((t) => t.id === tabId);
     if (!tab) throw new Error(`no tab ${tabId}`);
     this.tabs = this.tabs.filter((t) => t.id !== tabId);
-    this.events.tabRemoved.emit(tabId, false);
+    this.events.tabRemoved.emit(tabId, false, tab.windowId);
     const next = this.tabs.find((t) => t.windowId === tab.windowId);
     if (tab.active && next) this.userActivate(next.id);
   }
@@ -191,11 +226,13 @@ export class FakeBrowser implements BrowserAdapter {
     this.events.windowFocus.emit(windowId);
   }
 
-  userCloseWindow(windowId: number): void {
+  /** `reportsWindowClosing: false` simulates an engine that reports each tab as an individual close. */
+  userCloseWindow(windowId: number, opts: { reportsWindowClosing?: boolean; windowEvent?: boolean } = {}): void {
     const closing = this.tabs.filter((t) => t.windowId === windowId);
     this.tabs = this.tabs.filter((t) => t.windowId !== windowId);
     this.windows = this.windows.filter((w) => w.id !== windowId);
-    for (const t of closing) this.events.tabRemoved.emit(t.id, true);
+    for (const t of closing) this.events.tabRemoved.emit(t.id, opts.reportsWindowClosing ?? true, windowId);
+    if (opts.windowEvent ?? true) this.events.windowRemoved.emit(windowId);
   }
 
   /** Session restore: a tab appears with its URL already known. */
@@ -212,7 +249,8 @@ export class FakeBrowser implements BrowserAdapter {
 
   onAlarm = (cb: (name: string) => void) => this.events.alarm.on(cb);
   onTabCreated = (cb: (tab: TabInfo) => void) => this.events.tabCreated.on(cb);
-  onTabRemoved = (cb: (tabId: number, windowClosing: boolean) => void) => this.events.tabRemoved.on(cb);
+  onTabRemoved = (cb: (tabId: number, windowClosing: boolean, windowId: number) => void) => this.events.tabRemoved.on(cb);
+  onWindowRemoved = (cb: (windowId: number) => void) => this.events.windowRemoved.on(cb);
   onTabUpdated = (cb: (tab: TabInfo, change: { url?: string; status?: string }) => void) => this.events.tabUpdated.on(cb);
   onTabActivated = (cb: (tabId: number, windowId: number) => void) => this.events.tabActivated.on(cb);
   onWindowFocusChanged = (cb: (windowId: number | null) => void) => this.events.windowFocus.on(cb);

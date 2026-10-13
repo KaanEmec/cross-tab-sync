@@ -8,6 +8,8 @@ import type { Operation } from "./client.js";
 export interface PendingOp {
   op: Operation;
   queuedAt: string;
+  /** For `navigate`: the entry's server URL before this change (detects divergent remote navigation). */
+  base?: string;
 }
 
 export type Journal = PendingOp[];
@@ -16,10 +18,22 @@ export function newOpId(): string {
   return crypto.randomUUID();
 }
 
-export function append(journal: Journal, ops: Operation[], now: Date = new Date()): Journal {
+export function append(
+  journal: Journal,
+  ops: Operation[],
+  now: Date = new Date(),
+  bases: Record<string, string> = {},
+): Journal {
   const known = new Set(journal.map((p) => p.op.opId));
-  const added = ops.filter((op) => !known.has(op.opId)).map((op) => ({ op, queuedAt: now.toISOString() }));
+  const added = ops
+    .filter((op) => !known.has(op.opId))
+    .map((op): PendingOp => (bases[op.opId] ? { op, queuedAt: now.toISOString(), base: bases[op.opId] } : { op, queuedAt: now.toISOString() }));
   return [...journal, ...added];
+}
+
+/** Pending `navigate`/`open` of this device for an entry: local changes a remote one would overwrite. */
+export function pendingChanges(journal: Journal, entryId: string): PendingOp[] {
+  return journal.filter((p) => p.op.entryId === entryId && (p.op.type === "navigate" || p.op.type === "open"));
 }
 
 export function acknowledge(journal: Journal, opIds: Iterable<string>): Journal {

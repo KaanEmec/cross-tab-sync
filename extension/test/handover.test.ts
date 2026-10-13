@@ -465,12 +465,15 @@ describe("review fixes", () => {
     );
     await continueHere(mac.deps);
     const revision = server.revision;
-    // The b tab's last-known URL moved (as change recording keeps it current).
+    // The user navigated the b tab while following: recorded as a pending navigate.
     const bTab = mac.b.tabs[1]!;
     bTab.url = "https://b/next";
     const before = await mac.state();
+    const bEntry = before.mappings.tabs[String(bTab.id)]!.entryId;
     await saveState(mac.b.storage, {
-      mappings: setMapping(before.mappings, bTab.id, before.mappings.tabs[String(bTab.id)]!.entryId, bTab.url),
+      generation: null,
+      mappings: setMapping(before.mappings, bTab.id, bEntry, bTab.url),
+      pending: [{ op: { opId: crypto.randomUUID(), type: "navigate", entryId: bEntry, url: bTab.url }, queuedAt: "", base: "https://b/" }],
     });
     const entriesBefore = (await mac.state()).mappings.tabs;
 
@@ -482,7 +485,8 @@ describe("review fixes", () => {
 
     const s = await continueHere(mac.deps);
     expect(createCalls(mac.b)).toEqual([]); // nothing recreated (https://b/ is satisfied by the moved tab)
-    expect(server.revision).toBe(revision); // nothing republished
+    expect(server.revision).toBe(revision + 1); // only the pending navigate; nothing republished
+    expect(server.openUrls().sort()).toEqual(["https://a/", "https://b/next"]);
     expect(s.staleMappings).toBeNull();
     expect(Object.values(s.mappings.tabs).map((m) => m.entryId).sort()).toEqual(
       Object.values(entriesBefore).map((m) => m.entryId).sort(),

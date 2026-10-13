@@ -4,6 +4,13 @@ import type { TabInfo } from "../adapter/types.js";
 export interface MappedTab {
   entryId: string;
   url: string;
+  /** The entry's URL on the server, when the tab shows another one (a redirect the extension caused). */
+  base?: string;
+}
+
+/** The entry URL this device last agreed on with the server for a mapped tab. */
+export function serverUrl(m: MappedTab): string {
+  return m.base ?? m.url;
 }
 
 export interface Mappings {
@@ -78,7 +85,7 @@ export function claimByUrl(
       continue;
     }
     claimed.add(tab.id);
-    m = setMapping(m, tab.id, old.entryId, old.url);
+    m = { ...m, tabs: { ...m.tabs, [String(tab.id)]: old } };
   }
   return { mappings: m, rest: Object.keys(rest).length > 0 ? { ...stored, tabs: rest } : null };
 }

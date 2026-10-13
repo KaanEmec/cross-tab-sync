@@ -38,7 +38,9 @@
       lastActivityAt: null,
       lastTakeoverAt: null,
       suppressAutoTakeover: false,
-      freshPending: false
+      freshPending: false,
+      heldCloses: [],
+      removedWindows: {}
     };
   }
   var PREFIX = "cts.";

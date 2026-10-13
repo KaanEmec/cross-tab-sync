@@ -1,6 +1,6 @@
 import type { KeyValueStorage } from "../adapter/types.js";
 import type { Owner } from "./client.js";
-import type { Expectation } from "./changes.js";
+import type { Expectation, HeldClose } from "./changes.js";
 import type { Journal } from "./journal.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 
@@ -58,6 +58,10 @@ export interface State {
   suppressAutoTakeover: boolean;
   /** The next activity signal counts as fresh (ownership was lost, or a takeover was deferred). */
   freshPending: boolean;
+  /** Removals of mapped tabs waiting CLOSE_HOLD_MS before they may become `close` operations. */
+  heldCloses: HeldClose[];
+  /** Recently removed windows (windows.onRemoved), window id -> epoch ms. */
+  removedWindows: Record<string, number>;
 }
 
 export interface PendingPair {
@@ -95,6 +99,8 @@ export function defaultState(): State {
     lastTakeoverAt: null,
     suppressAutoTakeover: false,
     freshPending: false,
+    heldCloses: [],
+    removedWindows: {},
   };
 }
 
@@ -139,6 +145,8 @@ export function clearedCredentials(): Partial<State> {
     lastTakeoverAt: null,
     suppressAutoTakeover: false,
     freshPending: false,
+    heldCloses: [],
+    removedWindows: {},
   };
 }
 

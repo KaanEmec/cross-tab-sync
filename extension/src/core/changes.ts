@@ -4,10 +4,19 @@
 
 import type { Operation } from "./client.js";
 import { append, type Journal } from "./journal.js";
-import { removeMappings, setMapping, tabsForEntry, type MappedTab, type Mappings } from "./mapping.js";
+import { removeMappings, serverUrl, setMapping, tabsForEntry, type MappedTab, type Mappings } from "./mapping.js";
 
 /** How long an expectation (echo suppression) waits for its event. */
 export const EXPECT_TTL_MS = 30_000;
+/**
+ * A load the extension started stays "ours" until this long after its first committed event, so
+ * post-load URL rewrites (replaceState, hash changes, script redirects) are not published.
+ */
+export const LOAD_GRACE_MS = 10_000;
+/** Closes are held this long: a window closing or browser quitting shows up as a burst first. */
+export const CLOSE_HOLD_MS = 2_000;
+/** This many removals from one window within CLOSE_HOLD_MS are treated as the window going away. */
+export const BURST_REMOVALS = 3;
 /** Removals right after browser startup are restore/shutdown noise: unmap only. */
 export const STARTUP_GRACE_MS = 10_000;
 /** Mappings from the previous browser session that found no tab by then are forgotten. */
@@ -16,10 +25,23 @@ export const STALE_MAPPINGS_TTL_MS = 60_000;
 export type Expectation =
   /** About to create a tab for `entryId` (tab id not known yet). */
   | { kind: "create"; url: string; entryId: string; until: number }
-  /** The extension created or navigated this tab: URL changes until the load completes are ours. */
-  | { kind: "load"; tabId: number; until: number }
+  /**
+   * The extension created or navigated this tab: URL changes are ours until `until`, which is cut to
+   * LOAD_GRACE_MS after the first committed event (`completed`).
+   */
+  | { kind: "load"; tabId: number; until: number; completed?: boolean; created?: boolean }
   /** The extension is removing this tab. */
   | { kind: "remove"; tabId: number; until: number };
+
+/** A removal of a mapped tab waiting CLOSE_HOLD_MS before it may become a `close`. */
+export interface HeldClose {
+  entryId: string;
+  tabId: number;
+  windowId: number;
+  at: number;
+  /** Already released; kept until 2 x CLOSE_HOLD_MS old to count bursts. */
+  done?: boolean;
+}
 
 export interface LocalState {
   mappings: Mappings;
@@ -28,6 +50,9 @@ export interface LocalState {
   expected: Expectation[];
   detached: Record<string, string>;
   startupAt: number | null;
+  heldCloses: HeldClose[];
+  /** windows.onRemoved seen recently: window id -> epoch ms. */
+  removedWindows: Record<string, number>;
 }
 
 /** A tab as seen in an event. `eligible`: shareable URL in a normal, non-private window. */
@@ -62,9 +87,18 @@ export function pruneExpected(expected: Expectation[], now: number): Expectation
   return kept.length === expected.length ? expected : kept;
 }
 
+/** Announce loads the extension is about to start; each replaces an earlier one for the same tab. */
+export function expectLoads(expected: Expectation[], tabIds: Iterable<number>, now: number, until: number): Expectation[] {
+  const ids = new Set(tabIds);
+  const others = pruneExpected(expected, now).filter((e) => !(e.kind === "load" && ids.has(e.tabId)));
+  return [...others, ...[...ids].map((tabId): Expectation => ({ kind: "load", tabId, until }))];
+}
+
 class Draft {
   private readonly changed = new Set<keyof LocalState>();
   readonly ops: Operation[] = [];
+  /** Server URL before each journaled `navigate`, by opId. */
+  readonly bases: Record<string, string> = {};
 
   constructor(
     public s: LocalState,
@@ -115,7 +149,7 @@ class Draft {
   }
 
   done(activity: boolean): Outcome {
-    if (this.ops.length > 0) this.set("pending", append(this.s.pending, this.ops, new Date(this.ctx.now)));
+    if (this.ops.length > 0) this.set("pending", append(this.s.pending, this.ops, new Date(this.ctx.now), this.bases));
     const patch: Partial<LocalState> = {};
     for (const k of this.changed) (patch as Record<string, unknown>)[k] = this.s[k];
     return { patch, ops: this.ops, activity };
@@ -185,9 +219,19 @@ export function recordUpdated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
   const key = String(tab.id);
   const mapped = d.s.mappings.tabs[key];
 
-  // Loads started by the extension, including redirects, are not user navigation.
-  if (d.take((e) => e.kind === "load" && e.tabId === tab.id)) {
-    if (mapped && tab.eligible && tab.url && tab.url !== mapped.url) d.map(tab.id, mapped.entryId, tab.url);
+  // Loads started by the extension, including redirects and post-load URL rewrites, are not user
+  // navigation. The expectation only expires by time.
+  const load = d.s.expected.find((e) => e.kind === "load" && e.tabId === tab.id);
+  if (load) {
+    if (load.kind === "load" && !load.completed) {
+      const settled: Expectation = { ...load, completed: true, until: ctx.now + LOAD_GRACE_MS };
+      d.set("expected", d.s.expected.map((e) => (e === load ? settled : e)));
+    }
+    if (mapped && tab.eligible && tab.url && tab.url !== mapped.url) {
+      const base = serverUrl(mapped);
+      const tabs = { ...d.s.mappings.tabs, [key]: tab.url === base ? { entryId: mapped.entryId, url: base } : { entryId: mapped.entryId, url: tab.url, base } };
+      d.set("mappings", { ...d.s.mappings, tabs });
+    }
     return d.done(false);
   }
   // Non-shareable destinations (browser pages, bad URLs) keep the mapping and publish nothing.
@@ -216,7 +260,9 @@ export function recordUpdated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
     d.map(tab.id, dest.entryId, tab.url);
     if (copies.length === 1) d.ops.push({ opId: ctx.newId(), type: "close", entryId: mapped.entryId });
   } else if (copies.length === 1) {
-    d.ops.push({ opId: ctx.newId(), type: "navigate", entryId: mapped.entryId, url: tab.url });
+    const opId = ctx.newId();
+    d.ops.push({ opId, type: "navigate", entryId: mapped.entryId, url: tab.url });
+    d.bases[opId] = serverUrl(mapped);
     d.map(tab.id, mapped.entryId, tab.url);
   } else {
     // One of several copies left: it detaches from the entry and is a fresh opening.
@@ -227,8 +273,11 @@ export function recordUpdated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
   return d.done(tab.active);
 }
 
-/** `tabs.onRemoved`. Only an individual close of the last local copy deletes the shared entry. */
-export function recordRemoved(s: LocalState, tabId: number, windowClosing: boolean, ctx: Ctx): Outcome {
+/**
+ * `tabs.onRemoved`. Only an individual close of the last local copy deletes the shared entry, and
+ * only after CLOSE_HOLD_MS (see releaseHeld): `isWindowClosing` is a hint, not proof.
+ */
+export function recordRemoved(s: LocalState, tabId: number, windowClosing: boolean, windowId: number, ctx: Ctx): Outcome {
   const d = new Draft(s, ctx);
   const ours = d.take((e) => e.kind === "remove" && e.tabId === tabId) !== undefined;
   d.take((e) => e.kind === "load" && e.tabId === tabId);
@@ -237,8 +286,42 @@ export function recordRemoved(s: LocalState, tabId: number, windowClosing: boole
   if (!mapped) return d.done(false);
   d.unmap(tabId);
   if (ours || windowClosing || inStartupGrace(d.s.startupAt, ctx.now)) return d.done(false);
-  if (tabsForEntry(d.s.mappings, mapped.entryId).length === 0) {
-    d.ops.push({ opId: ctx.newId(), type: "close", entryId: mapped.entryId });
-  }
+  const recent = d.s.heldCloses.filter((h) => !h.done || ctx.now - h.at < 2 * CLOSE_HOLD_MS);
+  d.set("heldCloses", [...recent, { entryId: mapped.entryId, tabId, windowId, at: ctx.now }]);
   return d.done(false);
+}
+
+/** `windows.onRemoved`: held closes from this window are dropped at release. */
+export function recordWindowRemoved(s: LocalState, windowId: number, ctx: Ctx): Outcome {
+  const d = new Draft(s, ctx);
+  d.set("removedWindows", { ...d.s.removedWindows, [String(windowId)]: ctx.now });
+  return d.done(false);
+}
+
+/**
+ * Turn held removals older than CLOSE_HOLD_MS into `close` operations, one per entry that still has
+ * no local copy. Dropped (unmap only): the tab's window no longer exists or was reported removed,
+ * or BURST_REMOVALS or more removals came from that window within CLOSE_HOLD_MS.
+ */
+export function releaseHeld(s: LocalState, aliveWindows: Set<number>, ctx: Ctx): Outcome & { waiting: boolean } {
+  const d = new Draft(s, ctx);
+  const held = d.s.heldCloses;
+  const due = held.filter((h) => !h.done && ctx.now - h.at >= CLOSE_HOLD_MS);
+  const waiting = held.some((h) => !h.done && ctx.now - h.at < CLOSE_HOLD_MS);
+  const kept = held
+    .filter((h) => ctx.now - h.at < 2 * CLOSE_HOLD_MS || (!h.done && !due.includes(h)))
+    .map((h) => (due.includes(h) ? { ...h, done: true } : h));
+  if (due.length > 0 || kept.length !== held.length) d.set("heldCloses", kept);
+  const closed = new Set<string>();
+  for (const h of due) {
+    const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS).length;
+    const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== undefined;
+    if (windowGone || burst >= BURST_REMOVALS || closed.has(h.entryId)) continue;
+    if (tabsForEntry(d.s.mappings, h.entryId).length > 0) continue;
+    closed.add(h.entryId);
+    d.ops.push({ opId: ctx.newId(), type: "close", entryId: h.entryId });
+  }
+  const recent = Object.entries(d.s.removedWindows).filter(([, at]) => ctx.now - at < EXPECT_TTL_MS);
+  if (recent.length !== Object.keys(d.s.removedWindows).length) d.set("removedWindows", Object.fromEntries(recent));
+  return { ...d.done(false), waiting };
 }

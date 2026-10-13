@@ -33,9 +33,19 @@
     set: (items) => chrome.storage.local.set(items),
     remove: (keys) => chrome.storage.local.remove(keys)
   };
+  function storageSession() {
+    const area = chrome.storage.session;
+    if (!area) return null;
+    return {
+      get: (keys) => area.get(keys),
+      set: (items) => area.set(items),
+      remove: (keys) => area.remove(keys)
+    };
+  }
   function createWebExtAdapter() {
     return {
       storage: storageLocal,
+      sessionStorage: storageSession(),
       async queryTabs() {
         const tabs = await chrome.tabs.query({});
         return tabs.map(toTab).filter((t) => t !== null);
@@ -81,7 +91,10 @@
         const tab = toTab(t);
         if (tab) cb(tab);
       }),
-      onTabRemoved: (cb) => listen(chrome.tabs.onRemoved, (tabId, info) => cb(tabId, info.isWindowClosing)),
+      onTabRemoved: (cb) => listen(
+        chrome.tabs.onRemoved,
+        (tabId, info) => cb(tabId, info.isWindowClosing, info.windowId)
+      ),
       onTabUpdated: (cb) => listen(chrome.tabs.onUpdated, (_id, change, t) => {
         const tab = toTab(t);
         if (tab) cb(tab, { url: change.url, status: change.status });
@@ -91,6 +104,7 @@
         chrome.windows.onFocusChanged,
         (windowId) => cb(windowId === chrome.windows.WINDOW_ID_NONE ? null : windowId)
       ),
+      onWindowRemoved: (cb) => listen(chrome.windows.onRemoved, (windowId) => cb(windowId)),
       onStartup: (cb) => listen(chrome.runtime.onStartup, () => cb())
     };
   }
@@ -240,10 +254,13 @@
   function newOpId() {
     return crypto.randomUUID();
   }
-  function append(journal, ops, now = /* @__PURE__ */ new Date()) {
+  function append(journal, ops, now = /* @__PURE__ */ new Date(), bases = {}) {
     const known = new Set(journal.map((p) => p.op.opId));
-    const added = ops.filter((op) => !known.has(op.opId)).map((op) => ({ op, queuedAt: now.toISOString() }));
+    const added = ops.filter((op) => !known.has(op.opId)).map((op) => bases[op.opId] ? { op, queuedAt: now.toISOString(), base: bases[op.opId] } : { op, queuedAt: now.toISOString() });
     return [...journal, ...added];
+  }
+  function pendingChanges(journal, entryId) {
+    return journal.filter((p) => p.op.entryId === entryId && (p.op.type === "navigate" || p.op.type === "open"));
   }
   function acknowledge(journal, opIds) {
     const acked = new Set(opIds);
@@ -277,6 +294,9 @@
   }
 
   // src/core/mapping.ts
+  function serverUrl(m) {
+    return m.base ?? m.url;
+  }
   function emptyMappings() {
     return { tabs: {}, urlCounts: {} };
   }
@@ -315,7 +335,7 @@
         continue;
       }
       claimed.add(tab.id);
-      m = setMapping(m, tab.id, old.entryId, old.url);
+      m = { ...m, tabs: { ...m.tabs, [String(tab.id)]: old } };
     }
     return { mappings: m, rest: Object.keys(rest).length > 0 ? { ...stored, tabs: rest } : null };
   }
@@ -328,6 +348,9 @@
 
   // src/core/changes.ts
   var EXPECT_TTL_MS = 3e4;
+  var LOAD_GRACE_MS = 1e4;
+  var CLOSE_HOLD_MS = 2e3;
+  var BURST_REMOVALS = 3;
   var STARTUP_GRACE_MS = 1e4;
   var STALE_MAPPINGS_TTL_MS = 6e4;
   function inStartupGrace(startupAt, now, windowMs = STARTUP_GRACE_MS) {
@@ -336,6 +359,11 @@
   function pruneExpected(expected, now) {
     const kept = expected.filter((e) => e.until > now);
     return kept.length === expected.length ? expected : kept;
+  }
+  function expectLoads(expected, tabIds, now, until) {
+    const ids = new Set(tabIds);
+    const others = pruneExpected(expected, now).filter((e) => !(e.kind === "load" && ids.has(e.tabId)));
+    return [...others, ...[...ids].map((tabId) => ({ kind: "load", tabId, until }))];
   }
   var Draft = class {
     constructor(s, ctx) {
@@ -355,6 +383,8 @@
     ctx;
     changed = /* @__PURE__ */ new Set();
     ops = [];
+    /** Server URL before each journaled `navigate`, by opId. */
+    bases = {};
     set(key, value) {
       this.s = { ...this.s, [key]: value };
       this.changed.add(key);
@@ -383,7 +413,7 @@
       this.set("expected", [...this.s.expected, e]);
     }
     done(activity) {
-      if (this.ops.length > 0) this.set("pending", append(this.s.pending, this.ops, new Date(this.ctx.now)));
+      if (this.ops.length > 0) this.set("pending", append(this.s.pending, this.ops, new Date(this.ctx.now), this.bases));
       const patch = {};
       for (const k of this.changed) patch[k] = this.s[k];
       return { patch, ops: this.ops, activity };
@@ -439,8 +469,17 @@
     const d = new Draft(s, ctx);
     const key = String(tab.id);
     const mapped = d.s.mappings.tabs[key];
-    if (d.take((e) => e.kind === "load" && e.tabId === tab.id)) {
-      if (mapped && tab.eligible && tab.url && tab.url !== mapped.url) d.map(tab.id, mapped.entryId, tab.url);
+    const load = d.s.expected.find((e) => e.kind === "load" && e.tabId === tab.id);
+    if (load) {
+      if (load.kind === "load" && !load.completed) {
+        const settled = { ...load, completed: true, until: ctx.now + LOAD_GRACE_MS };
+        d.set("expected", d.s.expected.map((e) => e === load ? settled : e));
+      }
+      if (mapped && tab.eligible && tab.url && tab.url !== mapped.url) {
+        const base = serverUrl(mapped);
+        const tabs = { ...d.s.mappings.tabs, [key]: tab.url === base ? { entryId: mapped.entryId, url: base } : { entryId: mapped.entryId, url: tab.url, base } };
+        d.set("mappings", { ...d.s.mappings, tabs });
+      }
       return d.done(false);
     }
     if (!tab.eligible || !tab.url) return d.done(false);
@@ -464,7 +503,9 @@
       d.map(tab.id, dest.entryId, tab.url);
       if (copies.length === 1) d.ops.push({ opId: ctx.newId(), type: "close", entryId: mapped.entryId });
     } else if (copies.length === 1) {
-      d.ops.push({ opId: ctx.newId(), type: "navigate", entryId: mapped.entryId, url: tab.url });
+      const opId = ctx.newId();
+      d.ops.push({ opId, type: "navigate", entryId: mapped.entryId, url: tab.url });
+      d.bases[opId] = serverUrl(mapped);
       d.map(tab.id, mapped.entryId, tab.url);
     } else {
       const entryId = ctx.newId();
@@ -473,7 +514,7 @@
     }
     return d.done(tab.active);
   }
-  function recordRemoved(s, tabId, windowClosing, ctx) {
+  function recordRemoved(s, tabId, windowClosing, windowId, ctx) {
     const d = new Draft(s, ctx);
     const ours = d.take((e) => e.kind === "remove" && e.tabId === tabId) !== void 0;
     d.take((e) => e.kind === "load" && e.tabId === tabId);
@@ -482,10 +523,34 @@
     if (!mapped) return d.done(false);
     d.unmap(tabId);
     if (ours || windowClosing || inStartupGrace(d.s.startupAt, ctx.now)) return d.done(false);
-    if (tabsForEntry(d.s.mappings, mapped.entryId).length === 0) {
-      d.ops.push({ opId: ctx.newId(), type: "close", entryId: mapped.entryId });
-    }
+    const recent = d.s.heldCloses.filter((h) => !h.done || ctx.now - h.at < 2 * CLOSE_HOLD_MS);
+    d.set("heldCloses", [...recent, { entryId: mapped.entryId, tabId, windowId, at: ctx.now }]);
     return d.done(false);
+  }
+  function recordWindowRemoved(s, windowId, ctx) {
+    const d = new Draft(s, ctx);
+    d.set("removedWindows", { ...d.s.removedWindows, [String(windowId)]: ctx.now });
+    return d.done(false);
+  }
+  function releaseHeld(s, aliveWindows, ctx) {
+    const d = new Draft(s, ctx);
+    const held = d.s.heldCloses;
+    const due = held.filter((h) => !h.done && ctx.now - h.at >= CLOSE_HOLD_MS);
+    const waiting = held.some((h) => !h.done && ctx.now - h.at < CLOSE_HOLD_MS);
+    const kept = held.filter((h) => ctx.now - h.at < 2 * CLOSE_HOLD_MS || !h.done && !due.includes(h)).map((h) => due.includes(h) ? { ...h, done: true } : h);
+    if (due.length > 0 || kept.length !== held.length) d.set("heldCloses", kept);
+    const closed = /* @__PURE__ */ new Set();
+    for (const h of due) {
+      const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS).length;
+      const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== void 0;
+      if (windowGone || burst >= BURST_REMOVALS || closed.has(h.entryId)) continue;
+      if (tabsForEntry(d.s.mappings, h.entryId).length > 0) continue;
+      closed.add(h.entryId);
+      d.ops.push({ opId: ctx.newId(), type: "close", entryId: h.entryId });
+    }
+    const recent = Object.entries(d.s.removedWindows).filter(([, at]) => ctx.now - at < EXPECT_TTL_MS);
+    if (recent.length !== Object.keys(d.s.removedWindows).length) d.set("removedWindows", Object.fromEntries(recent));
+    return { ...d.done(false), waiting };
   }
 
   // src/core/eligibility.ts
@@ -508,54 +573,6 @@
   function eligibleTabs(tabs, windows) {
     const normal = new Set(windows.filter((w) => w.type === "normal" && !w.incognito).map((w) => w.id));
     return tabs.filter((t) => !t.incognito && normal.has(t.windowId) && isShareableUrl(t.url)).sort((a, b) => a.windowId - b.windowId || a.index - b.index);
-  }
-
-  // src/core/plan.ts
-  function plan(input) {
-    const { entries, tabs, pendingEntries, newId } = input;
-    let mappings = input.mappings;
-    const eligibleById = new Map(tabs.map((t) => [t.id, t]));
-    if (entries) {
-      const byId = new Set(entries.map((e) => e.id));
-      const sessionUrls = new Set(entries.map((e) => e.url));
-      const drop = [];
-      for (const [key, m] of Object.entries(mappings.tabs)) {
-        const tab = eligibleById.get(Number(key));
-        if (!tab || byId.has(m.entryId)) continue;
-        if (!pendingEntries.has(m.entryId) || sessionUrls.has(tab.url)) drop.push(tab.id);
-      }
-      mappings = removeMappings(mappings, drop);
-    }
-    const isMapped = (tabId) => mappings.tabs[String(tabId)] !== void 0;
-    const create = [];
-    const urlToEntry = /* @__PURE__ */ new Map();
-    if (entries) {
-      const mappedEntries = new Set(Object.values(mappings.tabs).map((m) => m.entryId));
-      for (const entry of entries) {
-        if (!urlToEntry.has(entry.url)) urlToEntry.set(entry.url, entry.id);
-        if (mappedEntries.has(entry.id)) continue;
-        const reuse = tabs.filter((t) => t.url === entry.url && !isMapped(t.id));
-        if (reuse.length === 0) {
-          create.push({ entryId: entry.id, url: entry.url, pinned: entry.pinned });
-        } else {
-          for (const t of reuse) mappings = setMapping(mappings, t.id, entry.id, entry.url);
-        }
-        mappedEntries.add(entry.id);
-      }
-    }
-    for (const m of Object.values(mappings.tabs)) if (!urlToEntry.has(m.url)) urlToEntry.set(m.url, m.entryId);
-    const open = [];
-    tabs.forEach((tab, position) => {
-      if (isMapped(tab.id)) return;
-      let entryId = urlToEntry.get(tab.url);
-      if (!entryId) {
-        entryId = newId();
-        urlToEntry.set(tab.url, entryId);
-        open.push({ opId: newId(), type: "open", entryId, url: tab.url, pinned: tab.pinned, position });
-      }
-      mappings = setMapping(mappings, tab.id, entryId, tab.url);
-    });
-    return { mappings: { ...mappings, urlCounts: countUrls(tabs) }, create, open };
   }
 
   // src/core/state.ts
@@ -584,7 +601,9 @@
       lastActivityAt: null,
       lastTakeoverAt: null,
       suppressAutoTakeover: false,
-      freshPending: false
+      freshPending: false,
+      heldCloses: [],
+      removedWindows: {}
     };
   }
   var PREFIX = "cts.";
@@ -622,7 +641,9 @@
       detached: {},
       lastTakeoverAt: null,
       suppressAutoTakeover: false,
-      freshPending: false
+      freshPending: false,
+      heldCloses: [],
+      removedWindows: {}
     };
   }
   var RUN_LOCK_TTL_MS = 2 * 60 * 1e3;
@@ -736,6 +757,26 @@
     return windows[0]?.id ?? null;
   }
   var expiry = (store) => nowMs(store.deps) + EXPECT_TTL_MS;
+  function forkEntry(mappings, pending, entryId, newId, now) {
+    const copies = tabsForEntry(mappings, entryId);
+    const first = mappings.tabs[String(copies[0])];
+    if (!first) return null;
+    const changes = new Set(pendingChanges(pending, entryId));
+    const fresh = newId();
+    return {
+      mappings: remapEntry(mappings, entryId, fresh, first.url),
+      pending: append(
+        pending.filter((p) => !changes.has(p)),
+        [{ opId: newId(), type: "open", entryId: fresh, url: first.url }],
+        now
+      )
+    };
+  }
+  function pendingBase(pending, entryId) {
+    const p = pendingChanges(pending, entryId)[0];
+    if (!p) return void 0;
+    return p.op.type === "open" ? p.op.url : p.base;
+  }
   async function createTabs(store, items) {
     if (items.length === 0) return { created: 0, failed: 0 };
     const { adapter: adapter2 } = store.deps;
@@ -777,11 +818,12 @@
         await store.set({
           mappings: setMapping(store.s.mappings, tab.id, item.entryId, item.url),
           receivingWindowId: windowId,
-          expected: [...store.s.expected.filter(others), { kind: "load", tabId: tab.id, until: expiry(store) }]
+          expected: [...store.s.expected.filter(others), { kind: "load", tabId: tab.id, until: expiry(store), created: true }]
         });
         created++;
       } catch {
         failed++;
+        await store.set({ expected: store.s.expected.filter(others) });
       }
     }
     return { created, failed };
@@ -796,14 +838,17 @@
     }
     return m;
   }
-  async function applyRemote(store, ops) {
+  async function applyRemote(store, ops, sentNavigated = /* @__PURE__ */ new Set()) {
     const foreign = ops.filter((l) => l.deviceId !== store.s.deviceId && l.result.status !== "ignored").sort((a, b) => a.seq - b.seq);
     if (foreign.length === 0) return;
     const { adapter: adapter2 } = store.deps;
     const { all, eligible } = await captureTabs(adapter2);
     let mappings = await currentMappings(store, all, eligible);
+    let pending = store.s.pending;
+    const newId = idGen(store.deps);
     const detached = { ...store.s.detached };
     const byId = new Map(all.map((t) => [t.id, t]));
+    const loading = (id) => store.s.expected.some((e) => e.kind === "load" && e.tabId === id);
     const toCreate = [];
     const navigateTo = /* @__PURE__ */ new Map();
     const remove = /* @__PURE__ */ new Set();
@@ -816,6 +861,17 @@
         mappings = setMapping(mappings, t.id, entryId, url);
         delete detached[String(t.id)];
       }
+    };
+    const fork = (entryId) => {
+      const f = forkEntry(mappings, pending, entryId, newId, nowDate(store.deps));
+      if (!f) return false;
+      ({ mappings, pending } = f);
+      return true;
+    };
+    const ensureTab = (entryId, url) => {
+      const dest = localWithUrl(url);
+      if (dest.length > 0) adopt(dest, entryId, url);
+      else if (!toCreate.some((c) => c.entryId === entryId)) toCreate.push({ entryId, url, pinned: false });
     };
     const dropTab = (id) => {
       const url = urlOf(id);
@@ -840,6 +896,17 @@
         }
         case "navigate": {
           const copies = tabsForEntry(mappings, op.entryId).filter((id) => !remove.has(id));
+          const localUrl = mappings.tabs[String(copies[0])]?.url;
+          if (copies.length > 0 && localUrl !== op.url && sentNavigated.has(op.entryId)) {
+            const fresh = newId();
+            pending = append(pending, [{ opId: newId(), type: "open", entryId: fresh, url: op.url }], nowDate(store.deps));
+            ensureTab(fresh, op.url);
+            break;
+          }
+          if (localUrl !== op.url && pendingChanges(pending, op.entryId).length > 0 && fork(op.entryId)) {
+            ensureTab(target, op.url);
+            break;
+          }
           const planned = toCreate.find((c) => c.entryId === op.entryId);
           if (planned) Object.assign(planned, { entryId: target, url: op.url });
           const dest = localWithUrl(op.url, copies);
@@ -859,7 +926,17 @@
         case "close": {
           const i = toCreate.findIndex((c) => c.entryId === op.entryId);
           if (i >= 0) toCreate.splice(i, 1);
-          for (const id of tabsForEntry(mappings, op.entryId)) dropTab(id);
+          if (pendingChanges(pending, op.entryId).length > 0 && fork(op.entryId)) break;
+          for (const id of tabsForEntry(mappings, op.entryId)) {
+            const live = byId.get(id)?.url;
+            const m = mappings.tabs[String(id)];
+            if (live !== void 0 && live !== m.url && !loading(id)) {
+              mappings = removeMappings(mappings, [id]);
+              detached[String(id)] = m.url;
+            } else {
+              dropTab(id);
+            }
+          }
           break;
         }
         case "update": {
@@ -884,11 +961,10 @@
     for (const id of [...navigateTo.keys()]) if (!current.has(id) || remove.has(id)) navigateTo.delete(id);
     const until = expiry(store);
     const expected = [
-      ...pruneExpected(store.s.expected, nowMs(store.deps)),
-      ...[...navigateTo.keys()].map((tabId) => ({ kind: "load", tabId, until })),
+      ...expectLoads(store.s.expected, navigateTo.keys(), nowMs(store.deps), until),
       ...[...remove].map((tabId) => ({ kind: "remove", tabId, until }))
     ];
-    await store.set({ mappings, detached, expected });
+    await store.set({ mappings, detached, expected, pending });
     for (const [id, url] of navigateTo) await adapter2.updateTab(id, { url }).catch(() => void 0);
     for (const id of remove) await adapter2.removeTab(id).catch(() => void 0);
     for (const [id, pinned] of pin) {
@@ -897,12 +973,72 @@
     }
     await createTabs(store, toCreate);
   }
+
+  // src/core/plan.ts
+  function plan(input) {
+    const { entries, tabs, pendingEntries, newId } = input;
+    let mappings = input.mappings;
+    const eligibleById = new Map(tabs.map((t) => [t.id, t]));
+    if (entries) {
+      const byId = new Set(entries.map((e) => e.id));
+      const sessionUrls = new Set(entries.map((e) => e.url));
+      const drop = [];
+      for (const [key, m] of Object.entries(mappings.tabs)) {
+        const tab = eligibleById.get(Number(key));
+        if (!tab || byId.has(m.entryId)) continue;
+        if (!pendingEntries.has(m.entryId) || sessionUrls.has(tab.url)) drop.push(tab.id);
+      }
+      mappings = removeMappings(mappings, drop);
+    }
+    const isMapped = (tabId) => mappings.tabs[String(tabId)] !== void 0;
+    const create = [];
+    const urlToEntry = /* @__PURE__ */ new Map();
+    if (entries) {
+      const mappedEntries = new Set(Object.values(mappings.tabs).map((m) => m.entryId));
+      for (const entry of entries) {
+        if (!urlToEntry.has(entry.url)) urlToEntry.set(entry.url, entry.id);
+        if (mappedEntries.has(entry.id)) continue;
+        const reuse = tabs.filter((t) => t.url === entry.url && !isMapped(t.id));
+        if (reuse.length === 0) {
+          create.push({ entryId: entry.id, url: entry.url, pinned: entry.pinned });
+        } else {
+          for (const t of reuse) mappings = setMapping(mappings, t.id, entry.id, entry.url);
+        }
+        mappedEntries.add(entry.id);
+      }
+    }
+    for (const m of Object.values(mappings.tabs)) if (!urlToEntry.has(m.url)) urlToEntry.set(m.url, m.entryId);
+    const open = [];
+    tabs.forEach((tab, position) => {
+      if (isMapped(tab.id)) return;
+      let entryId = urlToEntry.get(tab.url);
+      if (!entryId) {
+        entryId = newId();
+        urlToEntry.set(tab.url, entryId);
+        open.push({ opId: newId(), type: "open", entryId, url: tab.url, pinned: tab.pinned, position });
+      }
+      mappings = setMapping(mappings, tab.id, entryId, tab.url);
+    });
+    return { mappings: { ...mappings, urlCounts: countUrls(tabs) }, create, open };
+  }
+
+  // src/core/materialize.ts
   async function materialize(store, entries, publish) {
     const { all, eligible } = await captureTabs(store.deps.adapter);
-    const before = await currentMappings(store, all, eligible);
-    const pendingIds = pendingEntryIds(store.s.pending);
-    const closed = pendingClosedIds(store.s.pending);
+    let before = await currentMappings(store, all, eligible);
+    let pending = store.s.pending;
+    const newId = idGen(store.deps);
+    const now = nowDate(store.deps);
     const sessionIds = entries ? new Set(entries.map((e) => e.id)) : null;
+    if (sessionIds) {
+      for (const entryId of new Set(Object.values(before.tabs).map((m) => m.entryId))) {
+        if (sessionIds.has(entryId) || !pendingChanges(pending, entryId).some((p2) => p2.op.type === "navigate")) continue;
+        const f = forkEntry(before, pending, entryId, newId, now);
+        if (f) ({ mappings: before, pending } = f);
+      }
+    }
+    const pendingIds = pendingEntryIds(pending);
+    const closed = pendingClosedIds(pending);
     const detached = { ...store.s.detached };
     const urlOf = new Map(eligible.map((t) => [String(t.id), t.url]));
     const orphan = (key) => {
@@ -915,7 +1051,7 @@
       tabs: eligible,
       mappings: before,
       pendingEntries: pendingIds,
-      newId: idGen(store.deps)
+      newId
     });
     let mappings = p.mappings;
     const open = [];
@@ -933,8 +1069,36 @@
       mappings = removeMappings(mappings, keys.map(Number));
       for (const k of keys) if (orphan(k)) detached[k] = op.url;
     }
-    await store.set({ mappings, detached, pending: append(store.s.pending, open) });
-    const { failed } = await createTabs(store, p.create);
+    pending = append(pending, open, now);
+    const create = [...p.create];
+    const navigateTo = /* @__PURE__ */ new Map();
+    for (const entry of entries ?? []) {
+      const copies = tabsForEntry(mappings, entry.id);
+      const m = mappings.tabs[String(copies[0])];
+      if (!m || entry.url === m.url || entry.url === serverUrl(m)) continue;
+      if (pendingChanges(pending, entry.id).length === 0) {
+        for (const id of copies) navigateTo.set(id, entry.url);
+        mappings = remapEntry(mappings, entry.id, entry.id, entry.url);
+        continue;
+      }
+      const base = pendingBase(pending, entry.id);
+      if (base === void 0 || base === entry.url) continue;
+      const f = forkEntry(mappings, pending, entry.id, newId, now);
+      if (!f) continue;
+      ({ mappings, pending } = f);
+      const local = eligible.find((t) => t.url === entry.url && !mappings.tabs[String(t.id)]);
+      if (local) mappings = setMapping(mappings, local.id, entry.id, entry.url);
+      else create.push({ entryId: entry.id, url: entry.url, pinned: entry.pinned });
+    }
+    const until = expiry(store);
+    await store.set({
+      mappings,
+      detached,
+      pending,
+      expected: expectLoads(store.s.expected, navigateTo.keys(), nowMs(store.deps), until)
+    });
+    for (const [id, url] of navigateTo) await store.deps.adapter.updateTab(id, { url }).catch(() => void 0);
+    const { failed } = await createTabs(store, create);
     return { open, failed };
   }
 
@@ -954,10 +1118,10 @@
     const generation = store.s.generation;
     if (generation === null) throw new Error("This device is not the owner");
     const api = apiFor(deps2, store.s);
-    const pending = batches(list(store.s.pending));
-    if (pending.length === 0) pending.push([]);
     let rejected = 0;
-    for (const batch of pending) {
+    for (let first = true; ; first = false) {
+      const batch = batches(list(store.s.pending))[0] ?? [];
+      if (batch.length === 0 && !first) break;
       let res;
       try {
         res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
@@ -972,12 +1136,22 @@
         rejected += batch.length;
         continue;
       }
-      await store.set({
-        pending: acknowledge(store.s.pending, res.results.map((r) => r.opId)),
-        mappings: applyResults(store.s.mappings, batch, res.results)
-      });
-      await applyRemote(store, res.catchUp?.operations ?? []);
+      let mappings = applyResults(store.s.mappings, batch, res.results);
+      let pending = acknowledge(store.s.pending, res.results.map((r) => r.opId));
+      const status = new Map(res.results.map((r) => [r.opId, r.status]));
+      const navigated = /* @__PURE__ */ new Set();
+      for (const op of batch) {
+        if (op.type !== "navigate") continue;
+        if (status.get(op.opId) === "applied") navigated.add(op.entryId);
+        if (status.get(op.opId) === "ignored") {
+          const f = forkEntry(mappings, pending, op.entryId, idGen(deps2), nowDate(deps2));
+          if (f) ({ mappings, pending } = f);
+        }
+      }
+      await store.set({ pending, mappings });
+      await applyRemote(store, res.catchUp?.operations ?? [], navigated);
       await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), lastSync: nowIso(deps2) });
+      if (batch.length > 0 && batch.every((op) => store.s.pending.some((p) => p.op.opId === op.opId))) break;
     }
     return { rejected };
   }
@@ -1067,7 +1241,17 @@
     try {
       requirePaired(store.s);
       await store.set({ lastTakeoverAt: nowMs(deps2), suppressAutoTakeover: false, freshPending: false });
-      const { generation, session } = await apiFor(deps2, store.s).acquire(true);
+      const api = apiFor(deps2, store.s);
+      if (store.s.lastRevision > 0) {
+        try {
+          const res = await api.changes(store.s.lastRevision);
+          await applyRemote(store, res.operations);
+          await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), owner: res.owner });
+        } catch (e) {
+          if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
+        }
+      }
+      const { generation, session } = await api.acquire(true);
       await store.set({
         generation,
         owner: session.owner ?? {
@@ -1095,16 +1279,16 @@
   async function pair(deps2, input) {
     const store = await Store.open(deps2);
     try {
-      const serverUrl = normalizeServerUrl(input.serverUrl);
+      const serverUrl2 = normalizeServerUrl(input.serverUrl);
       const deviceName = input.deviceName.trim();
       const code = input.code.replace(/\s+/g, "");
       if (!deviceName) throw new Error("Device name is required");
       if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
       if (!code) throw new Error("Pairing code is required");
-      const res = await deps2.api({ baseUrl: serverUrl, token: null }).pair({ code, name: deviceName, browser: deps2.browser });
+      const res = await deps2.api({ baseUrl: serverUrl2, token: null }).pair({ code, name: deviceName, browser: deps2.browser });
       await store.set({
         ...clearedCredentials(),
-        serverUrl,
+        serverUrl: serverUrl2,
         deviceName,
         deviceId: res.deviceId,
         token: res.token,
@@ -1180,6 +1364,9 @@
       staleMappings: previous.length > 0 ? staleMappings : null,
       detached,
       expected: [],
+      // Removals still held belong to the shutdown of the previous session: unmap only.
+      heldCloses: [],
+      removedWindows: {},
       receivingWindowId: null,
       runLock: null,
       startupAt: nowMs(deps2)
@@ -1206,6 +1393,7 @@
 
   // src/core/engine.ts
   var SYNC_DEBOUNCE_MS = 2e3;
+  var SESSION_MARKER = "cts.browserSession";
   var timeoutScheduler = (fn, ms) => {
     const h = setTimeout(fn, ms);
     return () => clearTimeout(h);
@@ -1227,6 +1415,7 @@
     chain = Promise.resolve();
     depth = 0;
     cancelTimer = null;
+    cancelRelease = null;
     /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
     attach() {
       const a = this.deps.adapter;
@@ -1235,9 +1424,16 @@
         if (!isCommitted(tab, change)) return;
         this.event(async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab), ctx)));
       });
-      a.onTabRemoved((tabId, windowClosing) => this.event(async (s, ctx) => outcome(recordRemoved(s, tabId, windowClosing, ctx))));
+      a.onTabRemoved(
+        (tabId, windowClosing, windowId) => this.event(async (s, ctx) => outcome(recordRemoved(s, tabId, windowClosing, windowId, ctx)))
+      );
+      a.onWindowRemoved((windowId) => this.event(async (s, ctx) => outcome(recordWindowRemoved(s, windowId, ctx))));
       a.onTabActivated(
-        (tabId) => this.event(async (s) => ({ patch: {}, ops: 0, activity: !s.expected.some((e) => e.kind === "load" && e.tabId === tabId) }))
+        (tabId) => this.event(async (s, ctx) => ({
+          patch: {},
+          ops: 0,
+          activity: !s.expected.some((e) => e.kind === "load" && e.created && e.tabId === tabId && e.until > ctx.now)
+        }))
       );
       a.onWindowFocusChanged((windowId) => {
         if (windowId !== null) this.event((s) => this.focused(s, windowId));
@@ -1264,7 +1460,26 @@
     }
     /** Queued run under the persisted run lock; a run that finds the lock held exits (BusyError). */
     locked(action, fn) {
-      return this.enqueue(() => withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps)));
+      return this.enqueue(async () => {
+        await this.ensureSession();
+        return withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps));
+      });
+    }
+    /**
+     * Tab ids from a previous browser session must never be read against the current tabs, and
+     * restored tabs' events can arrive before runtime.onStartup. So every queued task first checks a
+     * marker in session storage (cleared when the browser exits) and runs the startup reset when it
+     * is missing. Without session storage, only runtime.onStartup resets.
+     */
+    async ensureSession(force = false) {
+      const marker = this.deps.adapter.sessionStorage;
+      if (!marker) {
+        if (force) await resetForBrowserStartup(this.deps);
+        return;
+      }
+      if ((await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== void 0) return;
+      await resetForBrowserStartup(this.deps);
+      await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
     }
     /** Owner or follower run now (alarm, Sync now, debounced local changes). */
     runNow(action = "sync") {
@@ -1294,15 +1509,32 @@
     handOver() {
       return this.locked("handOver", () => handOver(this.deps));
     }
-    /** Browser startup: set mappings aside, start the grace period, catch up shortly after. */
+    /** Browser startup: set mappings aside (unless already done), start the grace period, catch up shortly after. */
     async startup() {
-      await this.enqueue(() => resetForBrowserStartup(this.deps));
+      await this.enqueue(() => this.ensureSession(true));
       this.requestSync();
     }
-    /** Worker (re)start: send what an earlier worker journaled but did not get to send. */
+    /** Worker (re)start: send what an earlier worker journaled, release closes it held. */
     async resume() {
-      const s = await this.enqueue(() => loadState(this.deps.adapter.storage));
+      const s = await this.enqueue(async () => {
+        await this.ensureSession();
+        return loadState(this.deps.adapter.storage);
+      });
       if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
+      if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease();
+    }
+    /** Release held closes once CLOSE_HOLD_MS has passed (see changes.releaseHeld). */
+    scheduleRelease() {
+      if (this.cancelRelease) return;
+      this.cancelRelease = this.schedule(() => {
+        this.cancelRelease = null;
+        this.event(async (s, ctx) => {
+          const alive = new Set((await this.deps.adapter.getWindows()).map((w) => w.id));
+          const out = releaseHeld(s, alive, ctx);
+          if (out.waiting) this.scheduleRelease();
+          return outcome(out);
+        });
+      }, CLOSE_HOLD_MS);
     }
     event(step) {
       void this.enqueue(() => this.process(step)).catch(ignore);
@@ -1310,6 +1542,7 @@
     /** Load state, apply one event, write all changed fields at once, then schedule follow-ups. */
     async process(step) {
       const storage = this.deps.adapter.storage;
+      await this.ensureSession();
       const s = await loadState(storage);
       if (!isPaired(s)) return;
       const now = nowMs(this.deps);
@@ -1317,6 +1550,7 @@
       const isOwner = s.generation !== null;
       const decision = out.activity ? onActivity(s, { now, isOwner }) : null;
       await saveState(storage, { ...out.patch, ...decision?.patch });
+      if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
       if (decision?.takeover) void this.takeover().catch(ignore);
       else if (isOwner && (out.ops > 0 || decision?.fresh)) this.requestSync();
     }

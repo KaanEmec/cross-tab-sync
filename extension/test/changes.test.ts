@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  BURST_REMOVALS,
+  CLOSE_HOLD_MS,
   EXPECT_TTL_MS,
+  LOAD_GRACE_MS,
   recordCreated,
   recordRemoved,
   recordUpdated,
+  recordWindowRemoved,
+  releaseHeld,
   STALE_MAPPINGS_TTL_MS,
   STARTUP_GRACE_MS,
   type LocalState,
@@ -27,6 +32,8 @@ const state = (over: Partial<LocalState> = {}): LocalState => ({
   expected: [],
   detached: {},
   startupAt: null,
+  heldCloses: [],
+  removedWindows: {},
   ...over,
 });
 
@@ -82,34 +89,64 @@ describe("additions", () => {
   });
 });
 
+const W = 1;
+const alive = new Set([W]);
+/** Remove a tab individually, then release held closes after the hold. */
+function closeTab(s: LocalState, tabId: number, at = T0): { s: LocalState; ops: Outcome["ops"] } {
+  const removed = next(s, recordRemoved(s, tabId, false, W, ctx(at)));
+  const released = releaseHeld(removed, alive, ctx(at + CLOSE_HOLD_MS));
+  return { s: next(removed, released), ops: released.ops };
+}
+
 describe("closures", () => {
   const two = () => state({ mappings: mapped([[1, "E", "https://x/"], [2, "E", "https://x/"]]) });
 
-  it("closing one of two copies emits nothing; closing the last emits close", () => {
-    let s = two();
-    const first = recordRemoved(s, 1, false, ctx());
+  it("closing one of two copies emits nothing; closing the last emits close after the hold", () => {
+    const first = closeTab(two(), 1);
     expect(first.ops).toEqual([]);
-    s = next(s, first);
-    const last = recordRemoved(s, 2, false, ctx());
-    expect(last.ops).toEqual([{ opId: "id1", type: "close", entryId: "E" }]);
-    expect(next(s, last).mappings.tabs).toEqual({});
+    const removed = recordRemoved(first.s, 2, false, W, ctx(T0 + 5000));
+    expect(removed.ops).toEqual([]); // held, not journaled yet
+    const s = next(first.s, removed);
+    expect(releaseHeld(s, alive, ctx(T0 + 5000 + CLOSE_HOLD_MS - 1))).toMatchObject({ ops: [], waiting: true });
+    const released = releaseHeld(s, alive, ctx(T0 + 5000 + CLOSE_HOLD_MS));
+    expect(released.ops).toEqual([{ opId: "id1", type: "close", entryId: "E" }]);
+    expect(released.waiting).toBe(false);
+    expect(next(s, released).mappings.tabs).toEqual({});
   });
 
   it("window closure only unmaps", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"]]) });
-    const o = recordRemoved(s, 1, true, ctx());
+    const o = recordRemoved(s, 1, true, W, ctx());
     expect(o.ops).toEqual([]);
     expect(next(s, o).mappings.tabs).toEqual({});
+    expect(next(s, o).heldCloses).toEqual([]);
+  });
+
+  it("held closes are dropped when the window is gone, was reported removed, or closed in a burst", () => {
+    const s = state({ mappings: mapped([[1, "E", "https://x/"], [2, "F", "https://y/"], [3, "G", "https://z/"]]) });
+    expect(closeTab(s, 1).ops).toHaveLength(1);
+    const removed = next(s, recordRemoved(s, 1, false, W, ctx()));
+    expect(releaseHeld(removed, new Set(), ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
+    const reported = next(removed, recordWindowRemoved(removed, W, ctx(T0 + 10)));
+    expect(releaseHeld(reported, alive, ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
+
+    let burst = s;
+    for (const [i, id] of [1, 2, 3].entries()) burst = next(burst, recordRemoved(burst, id, false, W, ctx(T0 + i * 300)));
+    expect(BURST_REMOVALS).toBe(3);
+    // Released in two steps: the early removal still counts toward the burst.
+    const early = releaseHeld(burst, alive, ctx(T0 + CLOSE_HOLD_MS));
+    expect(early.ops).toEqual([]);
+    expect(releaseHeld(next(burst, early), alive, ctx(T0 + 600 + CLOSE_HOLD_MS)).ops).toEqual([]);
   });
 
   it("removals during the startup grace only unmap", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"]]), startupAt: T0 });
-    expect(recordRemoved(s, 1, false, ctx(T0 + STARTUP_GRACE_MS - 1)).ops).toEqual([]);
-    expect(recordRemoved(s, 1, false, ctx(T0 + STARTUP_GRACE_MS)).ops).toHaveLength(1);
+    expect(next(s, recordRemoved(s, 1, false, W, ctx(T0 + STARTUP_GRACE_MS - 1))).heldCloses).toEqual([]);
+    expect(closeTab(s, 1, T0 + STARTUP_GRACE_MS).ops).toHaveLength(1);
   });
 
   it("unmapped tabs produce nothing", () => {
-    expect(recordRemoved(state(), 9, false, ctx())).toEqual({ patch: {}, ops: [], activity: false });
+    expect(recordRemoved(state(), 9, false, W, ctx())).toEqual({ patch: {}, ops: [], activity: false });
   });
 });
 
@@ -148,21 +185,31 @@ describe("navigation", () => {
 });
 
 describe("echo suppression", () => {
-  it("a load started by the extension is not navigation, redirects included", () => {
+  it("a load started by the extension is not navigation, redirects and later rewrites included", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"]]), expected: [{ kind: "load", tabId: 1, until: T0 + 1 }] });
     const o = recordUpdated(s, tab(1, "https://x/redirected", { active: true }), ctx());
     expect(o.ops).toEqual([]);
     expect(o.activity).toBe(false);
-    const after = next(s, o);
-    expect(after.expected).toEqual([]);
-    expect(after.mappings.tabs["1"]?.url).toBe("https://x/redirected");
+    let after = next(s, o);
+    // Kept for a grace period after the first committed event, remembering the server URL.
+    expect(after.expected).toEqual([{ kind: "load", tabId: 1, until: T0 + LOAD_GRACE_MS, completed: true }]);
+    expect(after.mappings.tabs["1"]).toEqual({ entryId: "E", url: "https://x/redirected", base: "https://x/" });
+    const rewrite = recordUpdated(after, tab(1, "https://x/redirected#tab=2"), ctx(T0 + LOAD_GRACE_MS - 1));
+    expect(rewrite.ops).toEqual([]);
+    after = next(after, rewrite);
+    expect(after.expected[0]).toMatchObject({ until: T0 + LOAD_GRACE_MS }); // not extended
+    // After the grace a user navigation is recorded, based on the server URL.
+    const user = recordUpdated(after, tab(1, "https://elsewhere/"), ctx(T0 + LOAD_GRACE_MS));
+    expect(user.ops).toEqual([{ opId: "id1", type: "navigate", entryId: "E", url: "https://elsewhere/" }]);
+    expect(next(after, user).pending[0]?.base).toBe("https://x/");
   });
 
   it("a removal by the extension does not close the entry", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"]]), expected: [{ kind: "remove", tabId: 1, until: T0 + 1 }] });
-    const o = recordRemoved(s, 1, false, ctx());
+    const o = recordRemoved(s, 1, false, W, ctx());
     expect(o.ops).toEqual([]);
     expect(next(s, o).expected).toEqual([]);
+    expect(next(s, o).heldCloses).toEqual([]);
   });
 
   it("a create announced by URL maps the tab to its entry when the run could not", () => {
@@ -196,7 +243,7 @@ describe("detached tabs", () => {
   });
 
   it("closing ends the detachment without an operation", () => {
-    const o = recordRemoved(s(), 1, false, ctx());
+    const o = recordRemoved(s(), 1, false, W, ctx());
     expect(o).toEqual({ patch: { detached: {} }, ops: [], activity: false });
   });
 });

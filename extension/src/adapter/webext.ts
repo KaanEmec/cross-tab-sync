@@ -39,9 +39,21 @@ export const storageLocal: KeyValueStorage = {
   remove: (keys) => chrome.storage.local.remove(keys),
 };
 
+/** `chrome.storage.session` (Safari 16.4+, Chrome 102+), or null where the engine lacks it. */
+function storageSession(): KeyValueStorage | null {
+  const area = chrome.storage.session;
+  if (!area) return null;
+  return {
+    get: (keys) => area.get(keys) as Promise<Record<string, unknown>>,
+    set: (items) => area.set(items),
+    remove: (keys) => area.remove(keys),
+  };
+}
+
 export function createWebExtAdapter(): BrowserAdapter {
   return {
     storage: storageLocal,
+    sessionStorage: storageSession(),
 
     async queryTabs() {
       const tabs = await chrome.tabs.query({});
@@ -100,7 +112,9 @@ export function createWebExtAdapter(): BrowserAdapter {
         if (tab) cb(tab);
       }),
     onTabRemoved: (cb) =>
-      listen(chrome.tabs.onRemoved, (tabId: number, info: chrome.tabs.OnRemovedInfo) => cb(tabId, info.isWindowClosing)),
+      listen(chrome.tabs.onRemoved, (tabId: number, info: chrome.tabs.OnRemovedInfo) =>
+        cb(tabId, info.isWindowClosing, info.windowId),
+      ),
     onTabUpdated: (cb) =>
       listen(chrome.tabs.onUpdated, (_id: number, change: chrome.tabs.OnUpdatedInfo, t: chrome.tabs.Tab) => {
         const tab = toTab(t);
@@ -112,6 +126,7 @@ export function createWebExtAdapter(): BrowserAdapter {
       listen(chrome.windows.onFocusChanged, (windowId: number) =>
         cb(windowId === chrome.windows.WINDOW_ID_NONE ? null : windowId),
       ),
+    onWindowRemoved: (cb) => listen(chrome.windows.onRemoved, (windowId: number) => cb(windowId)),
     onStartup: (cb) => listen(chrome.runtime.onStartup, () => cb()),
   };
 }

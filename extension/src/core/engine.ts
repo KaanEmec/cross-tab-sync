@@ -5,7 +5,17 @@
 
 import type { TabInfo } from "../adapter/types.js";
 import { onActivity } from "./activity.js";
-import { recordCreated, recordRemoved, recordUpdated, type Ctx, type Outcome, type TabEvent } from "./changes.js";
+import {
+  CLOSE_HOLD_MS,
+  recordCreated,
+  recordRemoved,
+  recordUpdated,
+  recordWindowRemoved,
+  releaseHeld,
+  type Ctx,
+  type Outcome,
+  type TabEvent,
+} from "./changes.js";
 import { isShareableUrl } from "./eligibility.js";
 import { continueHere, handOver, resetForBrowserStartup } from "./handover.js";
 import { BusyError, withRunLock } from "./lock.js";
@@ -15,6 +25,9 @@ import { syncRun } from "./sync.js";
 
 /** Local changes are sent about this long after the first one. */
 export const SYNC_DEBOUNCE_MS = 2_000;
+
+/** Key in session storage present for the lifetime of one browser session. */
+export const SESSION_MARKER = "cts.browserSession";
 
 /** Schedules `fn` after `ms`; returns a cancel function. */
 export type Scheduler = (fn: () => void, ms: number) => () => void;
@@ -46,6 +59,7 @@ export class SyncEngine {
   private chain: Promise<unknown> = Promise.resolve();
   private depth = 0;
   private cancelTimer: (() => void) | null = null;
+  private cancelRelease: (() => void) | null = null;
 
   constructor(
     readonly deps: Deps,
@@ -60,10 +74,17 @@ export class SyncEngine {
       if (!isCommitted(tab, change)) return;
       this.event(async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab), ctx)));
     });
-    a.onTabRemoved((tabId, windowClosing) => this.event(async (s, ctx) => outcome(recordRemoved(s, tabId, windowClosing, ctx))));
+    a.onTabRemoved((tabId, windowClosing, windowId) =>
+      this.event(async (s, ctx) => outcome(recordRemoved(s, tabId, windowClosing, windowId, ctx))),
+    );
+    a.onWindowRemoved((windowId) => this.event(async (s, ctx) => outcome(recordWindowRemoved(s, windowId, ctx))));
     // A tab the extension just created can become active in its own new window: not the user.
     a.onTabActivated((tabId) =>
-      this.event(async (s) => ({ patch: {}, ops: 0, activity: !s.expected.some((e) => e.kind === "load" && e.tabId === tabId) })),
+      this.event(async (s, ctx) => ({
+        patch: {},
+        ops: 0,
+        activity: !s.expected.some((e) => e.kind === "load" && e.created && e.tabId === tabId && e.until > ctx.now),
+      })),
     );
     a.onWindowFocusChanged((windowId) => {
       if (windowId !== null) this.event((s) => this.focused(s, windowId));
@@ -94,7 +115,27 @@ export class SyncEngine {
 
   /** Queued run under the persisted run lock; a run that finds the lock held exits (BusyError). */
   locked<T>(action: string, fn: () => Promise<T>): Promise<T> {
-    return this.enqueue(() => withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps)));
+    return this.enqueue(async () => {
+      await this.ensureSession();
+      return withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps));
+    });
+  }
+
+  /**
+   * Tab ids from a previous browser session must never be read against the current tabs, and
+   * restored tabs' events can arrive before runtime.onStartup. So every queued task first checks a
+   * marker in session storage (cleared when the browser exits) and runs the startup reset when it
+   * is missing. Without session storage, only runtime.onStartup resets.
+   */
+  private async ensureSession(force = false): Promise<void> {
+    const marker = this.deps.adapter.sessionStorage;
+    if (!marker) {
+      if (force) await resetForBrowserStartup(this.deps);
+      return;
+    }
+    if ((await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== undefined) return;
+    await resetForBrowserStartup(this.deps);
+    await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
   }
 
   /** Owner or follower run now (alarm, Sync now, debounced local changes). */
@@ -129,16 +170,34 @@ export class SyncEngine {
     return this.locked("handOver", () => handOver(this.deps));
   }
 
-  /** Browser startup: set mappings aside, start the grace period, catch up shortly after. */
+  /** Browser startup: set mappings aside (unless already done), start the grace period, catch up shortly after. */
   async startup(): Promise<void> {
-    await this.enqueue(() => resetForBrowserStartup(this.deps));
+    await this.enqueue(() => this.ensureSession(true));
     this.requestSync();
   }
 
-  /** Worker (re)start: send what an earlier worker journaled but did not get to send. */
+  /** Worker (re)start: send what an earlier worker journaled, release closes it held. */
   async resume(): Promise<void> {
-    const s = await this.enqueue(() => loadState(this.deps.adapter.storage));
+    const s = await this.enqueue(async () => {
+      await this.ensureSession();
+      return loadState(this.deps.adapter.storage);
+    });
     if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
+    if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease();
+  }
+
+  /** Release held closes once CLOSE_HOLD_MS has passed (see changes.releaseHeld). */
+  private scheduleRelease(): void {
+    if (this.cancelRelease) return;
+    this.cancelRelease = this.schedule(() => {
+      this.cancelRelease = null;
+      this.event(async (s, ctx) => {
+        const alive = new Set((await this.deps.adapter.getWindows()).map((w) => w.id));
+        const out = releaseHeld(s, alive, ctx);
+        if (out.waiting) this.scheduleRelease();
+        return outcome(out);
+      });
+    }, CLOSE_HOLD_MS);
   }
 
   private event(step: (s: State, ctx: Ctx) => Promise<Step>): void {
@@ -148,6 +207,7 @@ export class SyncEngine {
   /** Load state, apply one event, write all changed fields at once, then schedule follow-ups. */
   private async process(step: (s: State, ctx: Ctx) => Promise<Step>): Promise<void> {
     const storage = this.deps.adapter.storage;
+    await this.ensureSession();
     const s = await loadState(storage);
     if (!isPaired(s)) return;
     const now = nowMs(this.deps);
@@ -155,6 +215,7 @@ export class SyncEngine {
     const isOwner = s.generation !== null;
     const decision = out.activity ? onActivity(s, { now, isOwner }) : null;
     await saveState(storage, { ...out.patch, ...decision?.patch });
+    if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
     if (decision?.takeover) void this.takeover().catch(ignore);
     else if (isOwner && (out.ops > 0 || decision?.fresh)) this.requestSync();
   }

@@ -3,7 +3,7 @@
 import { FakeBrowser, type FakeTabInit } from "../../src/adapter/fake.js";
 import type { Operation } from "../../src/core/client.js";
 import { eligibleTabs } from "../../src/core/eligibility.js";
-import { SyncEngine, type Scheduler } from "../../src/core/engine.js";
+import { SESSION_MARKER, SyncEngine, type Scheduler } from "../../src/core/engine.js";
 import { pair, type Deps } from "../../src/core/handover.js";
 import { loadState, saveState, type State } from "../../src/core/state.js";
 import type { FakeServer } from "./fakeServer.js";
@@ -16,11 +16,13 @@ export class Clock {
   }
 }
 
+/** Timers fired by hand; firing moves the shared clock to the latest due time (never backwards). */
 export class ManualTimers {
-  private readonly tasks = new Set<() => void>();
-  schedule: Scheduler = (fn) => {
+  private readonly tasks = new Map<() => void, number>();
+  constructor(private readonly clock: Clock) {}
+  schedule: Scheduler = (fn, ms) => {
     const task = () => fn();
-    this.tasks.add(task);
+    this.tasks.set(task, this.clock.t + ms);
     return () => this.tasks.delete(task);
   };
   get size(): number {
@@ -29,7 +31,9 @@ export class ManualTimers {
   fire(): void {
     const due = [...this.tasks];
     this.tasks.clear();
-    for (const t of due) t();
+    const latest = Math.max(...due.map(([, at]) => at));
+    if (latest > this.clock.t) this.clock.t = latest;
+    for (const [t] of due) t();
   }
 }
 
@@ -70,7 +74,9 @@ export async function device(
   server.codes.add(code);
   const s = await pair(deps, { serverUrl: "https://sync.example", deviceName: name, code });
   const id = s.deviceId!;
-  const timers = new ManualTimers();
+  // The browser session is already running (a restart() clears this marker).
+  await b.sessionStorage?.set({ [SESSION_MARKER]: clock.t });
+  const timers = new ManualTimers(clock);
   const engine = new SyncEngine(deps, timers.schedule);
   engine.attach();
   return {

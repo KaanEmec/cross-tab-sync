@@ -1,12 +1,13 @@
 // Sync runs (PROTOCOL.md "Roles and cadence"): the owner flushes its journal and applies catchUp,
 // a follower pulls `changes` and applies them; `410 history_expired` falls back to a full resync.
 
-import { applyRemote, applyResults, materialize } from "./apply.js";
+import { applyRemote, applyResults, forkEntry } from "./apply.js";
+import { materialize } from "./materialize.js";
 import { ApiError, type Operation, type OperationsResponse, type Owner } from "./client.js";
 import { acknowledge, batches, list } from "./journal.js";
 import { removeMappings } from "./mapping.js";
 import { isPaired, type State } from "./state.js";
-import { apiFor, demote, fail, isStaleOwner, nowIso, Store, type Deps } from "./store.js";
+import { apiFor, demote, fail, idGen, isStaleOwner, nowDate, nowIso, Store, type Deps } from "./store.js";
 
 export function rejectedMessage(rejected: number): string | null {
   return rejected > 0 ? `${rejected} change(s) were rejected by the server and dropped` : null;
@@ -23,17 +24,18 @@ function followingText(owner: Owner | null, deviceId: string | null, revision: n
 
 /**
  * Send every journaled operation in server-sized batches (an empty batch when nothing is pending:
- * heartbeat plus catch-up) and apply results and catchUp after each batch.
+ * heartbeat plus catch-up) and apply results and catchUp after each batch. Batches are cut from the
+ * live journal each time because applying catchUp may rewrite it (forkEntry).
  */
 export async function flush(store: Store): Promise<{ rejected: number }> {
   const deps = store.deps;
   const generation = store.s.generation;
   if (generation === null) throw new Error("This device is not the owner");
   const api = apiFor(deps, store.s);
-  const pending: Operation[][] = batches(list(store.s.pending));
-  if (pending.length === 0) pending.push([]);
   let rejected = 0;
-  for (const batch of pending) {
+  for (let first = true; ; first = false) {
+    const batch: Operation[] = batches(list(store.s.pending))[0] ?? [];
+    if (batch.length === 0 && !first) break;
     let res: OperationsResponse;
     try {
       res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
@@ -52,12 +54,24 @@ export async function flush(store: Store): Promise<{ rejected: number }> {
       rejected += batch.length;
       continue;
     }
-    await store.set({
-      pending: acknowledge(store.s.pending, res.results.map((r) => r.opId)),
-      mappings: applyResults(store.s.mappings, batch, res.results),
-    });
-    await applyRemote(store, res.catchUp?.operations ?? []);
+    let mappings = applyResults(store.s.mappings, batch, res.results);
+    let pending = acknowledge(store.s.pending, res.results.map((r) => r.opId));
+    const status = new Map(res.results.map((r) => [r.opId, r.status]));
+    const navigated = new Set<string>();
+    for (const op of batch) {
+      if (op.type !== "navigate") continue;
+      if (status.get(op.opId) === "applied") navigated.add(op.entryId);
+      // Ignored: the entry was closed elsewhere first. The local page survives as a fresh opening.
+      if (status.get(op.opId) === "ignored") {
+        const f = forkEntry(mappings, pending, op.entryId, idGen(deps), nowDate(deps));
+        if (f) ({ mappings, pending } = f);
+      }
+    }
+    await store.set({ pending, mappings });
+    await applyRemote(store, res.catchUp?.operations ?? [], navigated);
     await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), lastSync: nowIso(deps) });
+    // Safety: a server that answered without results for the batch must not loop forever.
+    if (batch.length > 0 && batch.every((op) => store.s.pending.some((p) => p.op.opId === op.opId))) break;
   }
   return { rejected };
 }

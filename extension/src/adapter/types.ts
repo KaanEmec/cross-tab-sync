@@ -30,6 +30,8 @@ export type Unsubscribe = () => void;
 
 export interface BrowserAdapter {
   storage: KeyValueStorage;
+  /** `storage.session`: cleared when the browser exits. Null where unavailable. */
+  sessionStorage: KeyValueStorage | null;
 
   queryTabs(): Promise<TabInfo[]>;
   getWindows(): Promise<WindowInfo[]>;
@@ -49,12 +51,13 @@ export interface BrowserAdapter {
   // Event subscriptions. In a service worker these must be called synchronously at top level.
   onAlarm(cb: (name: string) => void): Unsubscribe;
   onTabCreated(cb: (tab: TabInfo) => void): Unsubscribe;
-  onTabRemoved(cb: (tabId: number, windowClosing: boolean) => void): Unsubscribe;
+  onTabRemoved(cb: (tabId: number, windowClosing: boolean, windowId: number) => void): Unsubscribe;
   /** `change` carries the changed `url` and/or load `status` ("loading" | "complete"). */
   onTabUpdated(cb: (tab: TabInfo, change: { url?: string; status?: string }) => void): Unsubscribe;
   onTabActivated(cb: (tabId: number, windowId: number) => void): Unsubscribe;
   /** `null` when focus left the browser (WINDOW_ID_NONE). */
   onWindowFocusChanged(cb: (windowId: number | null) => void): Unsubscribe;
+  onWindowRemoved(cb: (windowId: number) => void): Unsubscribe;
   /** `runtime.onStartup`: a browser profile started (tab ids from before are invalid). */
   onStartup(cb: () => void): Unsubscribe;
 }

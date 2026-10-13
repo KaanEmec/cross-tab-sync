@@ -2,7 +2,8 @@
 // lifecycle actions. Written against BrowserAdapter and a client factory so it runs unchanged
 // against fakes. Hand over and Continue here reuse the v0.2 sync run (sync.ts).
 
-import { materialize } from "./apply.js";
+import { applyRemote } from "./apply.js";
+import { materialize } from "./materialize.js";
 import { ApiError, normalizeServerUrl, type Owner } from "./client.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
@@ -53,8 +54,21 @@ export async function continueHere(deps: Deps): Promise<State> {
   try {
     requirePaired(store.s);
     await store.set({ lastTakeoverAt: nowMs(deps), suppressAutoTakeover: false, freshPending: false });
-    const { generation, session } = await apiFor(deps, store.s).acquire(true);
-    // Nothing local has changed before this point, so an unreachable server leaves tabs untouched.
+    const api = apiFor(deps, store.s);
+    // Catch up first: remote navigations and closures since the last applied revision reach this
+    // device as operations (closing and navigating exactly), not only as a snapshot difference.
+    if (store.s.lastRevision > 0) {
+      try {
+        const res = await api.changes(store.s.lastRevision);
+        await applyRemote(store, res.operations);
+        await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), owner: res.owner });
+      } catch (e) {
+        // History expired: the session snapshot below is the full-resync path.
+        if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
+      }
+    }
+    const { generation, session } = await api.acquire(true);
+    // Nothing local changed before reaching the server, so an unreachable server leaves tabs untouched.
     await store.set({
       generation,
       owner: session.owner ?? {
@@ -192,6 +206,9 @@ export async function resetForBrowserStartup(deps: Deps): Promise<void> {
     staleMappings: previous.length > 0 ? staleMappings : null,
     detached,
     expected: [],
+    // Removals still held belong to the shutdown of the previous session: unmap only.
+    heldCloses: [],
+    removedWindows: {},
     receivingWindowId: null,
     runLock: null,
     startupAt: nowMs(deps),

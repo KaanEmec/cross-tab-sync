@@ -3,13 +3,21 @@
 // The active tab and the focused window never change here.
 
 import type { BrowserAdapter, TabInfo } from "../adapter/types.js";
-import type { Entry, LoggedOperation, OpResult, Operation } from "./client.js";
-import { EXPECT_TTL_MS, inStartupGrace, pruneExpected, STALE_MAPPINGS_TTL_MS, type Expectation } from "./changes.js";
+import type { LoggedOperation, OpResult, Operation } from "./client.js";
+import { expectLoads, EXPECT_TTL_MS, inStartupGrace, pruneExpected, STALE_MAPPINGS_TTL_MS, type Expectation } from "./changes.js";
 import { eligibleTabs, type EligibleTab } from "./eligibility.js";
-import { append, pendingEntryIds, type Journal } from "./journal.js";
-import { claimByUrl, reconcileMappings, remapEntry, removeMappings, setMapping, tabsForEntry, type Mappings } from "./mapping.js";
-import { plan, type OpenOp, type TabToCreate } from "./plan.js";
-import { idGen, nowMs, type Store } from "./store.js";
+import { append, pendingChanges, type Journal } from "./journal.js";
+import {
+  claimByUrl,
+  reconcileMappings,
+  remapEntry,
+  removeMappings,
+  setMapping,
+  tabsForEntry,
+  type Mappings,
+} from "./mapping.js";
+import type { TabToCreate } from "./plan.js";
+import { idGen, nowDate, nowMs, type Store } from "./store.js";
 
 export async function captureTabs(adapter: BrowserAdapter): Promise<{ all: TabInfo[]; eligible: EligibleTab[] }> {
   const [all, windows] = await Promise.all([adapter.queryTabs(), adapter.getWindows()]);
@@ -79,7 +87,41 @@ export async function resolveReceivingWindow(adapter: BrowserAdapter, persisted:
   return windows[0]?.id ?? null;
 }
 
-const expiry = (store: Store) => nowMs(store.deps) + EXPECT_TTL_MS;
+export const expiry = (store: Store) => nowMs(store.deps) + EXPECT_TTL_MS;
+
+/**
+ * Divergence: this device changed an entry (pending navigate/open) that another device navigated or
+ * closed. The local copies become a fresh entry: their pending navigate/open for the entry is
+ * replaced by one `open` of the local URL, so both pages survive. Null when there is no local copy.
+ */
+export function forkEntry(
+  mappings: Mappings,
+  pending: Journal,
+  entryId: string,
+  newId: () => string,
+  now: Date,
+): { mappings: Mappings; pending: Journal } | null {
+  const copies = tabsForEntry(mappings, entryId);
+  const first = mappings.tabs[String(copies[0])];
+  if (!first) return null;
+  const changes = new Set(pendingChanges(pending, entryId));
+  const fresh = newId();
+  return {
+    mappings: remapEntry(mappings, entryId, fresh, first.url),
+    pending: append(
+      pending.filter((p) => !changes.has(p)),
+      [{ opId: newId(), type: "open", entryId: fresh, url: first.url }],
+      now,
+    ),
+  };
+}
+
+/** The entry URL this device's pending change was based on, if it has one. */
+export function pendingBase(pending: Journal, entryId: string): string | undefined {
+  const p = pendingChanges(pending, entryId)[0];
+  if (!p) return undefined;
+  return p.op.type === "open" ? p.op.url : p.base;
+}
 
 /**
  * Create tabs in the background. Never activates a tab or focuses a window. Right before each
@@ -128,11 +170,12 @@ export async function createTabs(store: Store, items: TabToCreate[]): Promise<{ 
       await store.set({
         mappings: setMapping(store.s.mappings, tab.id, item.entryId, item.url),
         receivingWindowId: windowId,
-        expected: [...store.s.expected.filter(others), { kind: "load", tabId: tab.id, until: expiry(store) }],
+        expected: [...store.s.expected.filter(others), { kind: "load", tabId: tab.id, until: expiry(store), created: true }],
       });
       created++;
     } catch {
       failed++;
+      await store.set({ expected: store.s.expected.filter(others) });
     }
   }
   return { created, failed };
@@ -155,8 +198,14 @@ export function applyResults(mappings: Mappings, ops: Operation[], results: OpRe
  * and `ignored` results are skipped. Tabs are closed only for `close` and for navigate coalescing,
  * and never the active tab of a window: an active tab whose entry closed stays open, unmapped and
  * detached. Every change the browser will report back is recorded as an expectation first.
+ *
+ * Divergence: when this device has a pending navigate/open for the entry, a remote navigate or
+ * close never touches the local copies; they fork into a fresh entry (forkEntry) and a remote
+ * navigate's destination gets its own background tab. `sentNavigated` lists entries this device
+ * navigated in the batch whose catchUp this is: the server applied ours last, so the remote URL is
+ * kept as a fresh entry instead.
  */
-export async function applyRemote(store: Store, ops: LoggedOperation[]): Promise<void> {
+export async function applyRemote(store: Store, ops: LoggedOperation[], sentNavigated = new Set<string>()): Promise<void> {
   const foreign = ops
     .filter((l) => l.deviceId !== store.s.deviceId && l.result.status !== "ignored")
     .sort((a, b) => a.seq - b.seq);
@@ -164,8 +213,11 @@ export async function applyRemote(store: Store, ops: LoggedOperation[]): Promise
   const { adapter } = store.deps;
   const { all, eligible } = await captureTabs(adapter);
   let mappings = await currentMappings(store, all, eligible);
+  let pending = store.s.pending;
+  const newId = idGen(store.deps);
   const detached = { ...store.s.detached };
   const byId = new Map(all.map((t) => [t.id, t]));
+  const loading = (id: number) => store.s.expected.some((e) => e.kind === "load" && e.tabId === id);
   const toCreate: TabToCreate[] = [];
   const navigateTo = new Map<number, string>();
   const remove = new Set<number>();
@@ -180,6 +232,18 @@ export async function applyRemote(store: Store, ops: LoggedOperation[]): Promise
       mappings = setMapping(mappings, t.id, entryId, url);
       delete detached[String(t.id)];
     }
+  };
+  const fork = (entryId: string) => {
+    const f = forkEntry(mappings, pending, entryId, newId, nowDate(store.deps));
+    if (!f) return false;
+    ({ mappings, pending } = f);
+    return true;
+  };
+  /** A local tab for `url` belonging to `entryId`: reuse one showing it, else create one. */
+  const ensureTab = (entryId: string, url: string) => {
+    const dest = localWithUrl(url);
+    if (dest.length > 0) adopt(dest, entryId, url);
+    else if (!toCreate.some((c) => c.entryId === entryId)) toCreate.push({ entryId, url, pinned: false });
   };
   const dropTab = (id: number) => {
     const url = urlOf(id);
@@ -206,6 +270,17 @@ export async function applyRemote(store: Store, ops: LoggedOperation[]): Promise
       }
       case "navigate": {
         const copies = tabsForEntry(mappings, op.entryId).filter((id) => !remove.has(id));
+        const localUrl = mappings.tabs[String(copies[0])]?.url;
+        if (copies.length > 0 && localUrl !== op.url && sentNavigated.has(op.entryId)) {
+          const fresh = newId();
+          pending = append(pending, [{ opId: newId(), type: "open", entryId: fresh, url: op.url }], nowDate(store.deps));
+          ensureTab(fresh, op.url);
+          break;
+        }
+        if (localUrl !== op.url && pendingChanges(pending, op.entryId).length > 0 && fork(op.entryId)) {
+          ensureTab(target, op.url);
+          break;
+        }
         const planned = toCreate.find((c) => c.entryId === op.entryId);
         if (planned) Object.assign(planned, { entryId: target, url: op.url });
         const dest = localWithUrl(op.url, copies);
@@ -226,7 +301,19 @@ export async function applyRemote(store: Store, ops: LoggedOperation[]): Promise
       case "close": {
         const i = toCreate.findIndex((c) => c.entryId === op.entryId);
         if (i >= 0) toCreate.splice(i, 1);
-        for (const id of tabsForEntry(mappings, op.entryId)) dropTab(id);
+        // An unsent local change on the entry survives as a fresh opening.
+        if (pendingChanges(pending, op.entryId).length > 0 && fork(op.entryId)) break;
+        for (const id of tabsForEntry(mappings, op.entryId)) {
+          const live = byId.get(id)?.url;
+          const m = mappings.tabs[String(id)]!;
+          if (live !== undefined && live !== m.url && !loading(id)) {
+            // Navigated by the user, event not recorded yet: keep it; the event publishes it.
+            mappings = removeMappings(mappings, [id]);
+            detached[String(id)] = m.url;
+          } else {
+            dropTab(id);
+          }
+        }
         break;
       }
       case "update": {
@@ -253,11 +340,10 @@ export async function applyRemote(store: Store, ops: LoggedOperation[]): Promise
   for (const id of [...navigateTo.keys()]) if (!current.has(id) || remove.has(id)) navigateTo.delete(id);
   const until = expiry(store);
   const expected: Expectation[] = [
-    ...pruneExpected(store.s.expected, nowMs(store.deps)),
-    ...[...navigateTo.keys()].map((tabId): Expectation => ({ kind: "load", tabId, until })),
+    ...expectLoads(store.s.expected, navigateTo.keys(), nowMs(store.deps), until),
     ...[...remove].map((tabId): Expectation => ({ kind: "remove", tabId, until })),
   ];
-  await store.set({ mappings, detached, expected });
+  await store.set({ mappings, detached, expected, pending });
 
   for (const [id, url] of navigateTo) await adapter.updateTab(id, { url }).catch(() => undefined);
   for (const id of remove) await adapter.removeTab(id).catch(() => undefined);
@@ -266,58 +352,4 @@ export async function applyRemote(store: Store, ops: LoggedOperation[]): Promise
     if (t && !remove.has(id) && t.pinned !== pinned) await adapter.updateTab(id, { pinned }).catch(() => undefined);
   }
   await createTabs(store, toCreate);
-}
-
-/**
- * Bring local tabs in line with a full session (Continue here, Hand over with `entries` null, and
- * the follower full resync with `publish` false). Reuses tabs by URL, creates missing entries in the
- * background, never closes. Entries this device closed (journaled `close`) are not recreated.
- * Tabs mapped to entries that left the session, and detached tabs, are never republished: they are
- * detached. With `publish`, other unmapped tabs are journaled as `open`.
- */
-export async function materialize(
-  store: Store,
-  entries: Entry[] | null,
-  publish: boolean,
-): Promise<{ open: OpenOp[]; failed: number }> {
-  const { all, eligible } = await captureTabs(store.deps.adapter);
-  const before = await currentMappings(store, all, eligible);
-  const pendingIds = pendingEntryIds(store.s.pending);
-  const closed = pendingClosedIds(store.s.pending);
-  const sessionIds = entries ? new Set(entries.map((e) => e.id)) : null;
-  const detached = { ...store.s.detached };
-  const urlOf = new Map(eligible.map((t) => [String(t.id), t.url]));
-  const orphan = (key: string) => {
-    const m = before.tabs[key];
-    return sessionIds !== null && m !== undefined && !sessionIds.has(m.entryId) && !pendingIds.has(m.entryId);
-  };
-  const keep = (key: string) => !orphan(key) && detached[key] !== urlOf.get(key);
-
-  const p = plan({
-    entries: entries && entries.filter((e) => !closed.has(e.id)),
-    tabs: eligible,
-    mappings: before,
-    pendingEntries: pendingIds,
-    newId: idGen(store.deps),
-  });
-  let mappings = p.mappings;
-  const open: OpenOp[] = [];
-  const fresh = new Set(p.open.map((o) => o.entryId));
-  for (const key of Object.keys(mappings.tabs)) {
-    // Reused for a session entry (or joined a mapped duplicate): no longer detached.
-    if (!fresh.has(mappings.tabs[key]!.entryId)) delete detached[key];
-  }
-  for (const op of p.open) {
-    const keys = Object.keys(mappings.tabs).filter((k) => mappings.tabs[k]!.entryId === op.entryId);
-    if (publish && keys.some(keep)) {
-      open.push(op);
-      for (const k of keys) delete detached[k];
-      continue;
-    }
-    mappings = removeMappings(mappings, keys.map(Number));
-    for (const k of keys) if (orphan(k)) detached[k] = op.url;
-  }
-  await store.set({ mappings, detached, pending: append(store.s.pending, open) });
-  const { failed } = await createTabs(store, p.create);
-  return { open, failed };
 }
