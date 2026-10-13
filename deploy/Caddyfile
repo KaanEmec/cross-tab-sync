@@ -1,0 +1,7 @@
+# TLS certificates are obtained automatically for CTS_DOMAIN.
+# Access logging is deliberately not enabled: request URIs stay out of logs.
+{$CTS_DOMAIN} {
+	reverse_proxy cts:8080 {
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

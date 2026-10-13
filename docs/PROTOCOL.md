@@ -19,12 +19,12 @@ Wire contract between the extensions and the Go service. Breaking changes bump t
 - Every request except `POST /v1/pair` carries `Authorization: Bearer <token>`.
 - Tokens are random 32-byte values, base64url-encoded, prefixed `cts_`. The server stores only the SHA-256 hash.
 - A revoked device gets `401 device_revoked` and must clear local credentials.
-- HTTPS is required unless the server runs with `CTS_ALLOW_INSECURE=1` (local development only).
+- HTTPS is required unless the server runs with `CTS_ALLOW_INSECURE=1` (local development only). The service trusts `X-Forwarded-Proto: https` from the reverse proxy; plain HTTP gets `403 invalid_request`.
 
 ### Pairing
 
 1. A pairing code is created with the CLI (`cross-tab-sync pair-code`) or by an already paired device (`POST /v1/pairing-codes`). Codes are 8 characters, single use, valid 10 minutes.
-2. The new device calls `POST /v1/pair` with `{code, name, browser}` and receives `{deviceId, token}`.
+2. The new device calls `POST /v1/pair` with `{code, name, browser}` and receives `{deviceId, token}`. Codes use the alphabet `ABCDEFGHJKMNPQRSTUVWXYZ23456789`; input is case-insensitive and spaces or dashes are ignored. `name` is 1–64 characters, `browser` 1–32.
 
 ## Session model
 
@@ -46,12 +46,12 @@ All operations: `{ "opId": uuid, "type": "...", ...fields }`. Server-side semant
 
 | Type | Fields | Effect | Result `status` |
 | --- | --- | --- | --- |
-| `open` | `entryId`, `url`, `pinned?`, `position?` | If an open entry with the same `url` exists, nothing is created and the result points at it. Otherwise a new entry is created. | `applied` · `coalesced` (`entryId` = existing) |
+| `open` | `entryId`, `url`, `pinned?`, `position?` | If an open entry with the same `url` exists, nothing is created and the result points at it. Otherwise a new entry is created; a missing `position` is appended after the highest. Reopening a tombstoned `entryId` is ignored; opening an already open `entryId` coalesces to itself. | `applied` · `coalesced` (`entryId` = existing) · `ignored` |
 | `navigate` | `entryId`, `url` | Updates the entry's URL. If another open entry already has `url`, this entry is closed and the result points at the other. If the entry is closed, it is ignored. | `applied` · `coalesced` · `ignored` |
 | `close` | `entryId` | Closes the entry (tombstone). Already closed: nothing happens. | `applied` · `ignored` |
 | `update` | `entryId`, `pinned?`, `position?` | Updates metadata of an open entry. | `applied` · `ignored` |
 
-Every applied operation (not `ignored`, not a replay) increments `revision` by one. Replays (known `opId`) return the stored result with `replayed: true` and do not change state.
+Every `applied` or `coalesced` operation increments `revision` by one; `ignored` operations are stored for replay but never appear in `changes` or `catchUp`. Replays (known `opId`) return the stored result with `replayed: true` and do not change state. `opId` and `entryId` are lowercase canonical UUIDs.
 
 A batch is applied atomically in order inside one transaction. Before a batch that contains `close` or `navigate`, the server stores a recovery snapshot of the open entries.
 
@@ -70,7 +70,7 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 | `POST /v1/session/release` | device | `{generation}` | `204` · `409 stale_owner {owner}` |
 | `POST /v1/session/heartbeat` | device | `{generation}` | `204` · `409 stale_owner {owner}` |
 | `POST /v1/session/operations` | device | `{generation, baseRevision, operations:[…]}` | `200 {revision, results:[{opId,status,entryId?,replayed?}], catchUp:{operations:[…]}}` · `409 stale_owner {owner}` |
-| `GET /v1/snapshots` | device | | `200 {snapshots:[{id,revision,deviceId,reason,createdAt,entryCount}]}` |
+| `GET /v1/snapshots` | device | | `200 {snapshots:[{id,revision,deviceId,reason,createdAt,entryCount}]}`. `revision` is the revision just before the change that triggered the snapshot; `reason` is `operations` or `restore`. |
 | `POST /v1/snapshots/{id}/restore` | device | `{generation}` | `200 {revision, results}` — restoration is issued as ordinary `open` operations, never a rewind |
 
 ### Acquire rules
@@ -84,11 +84,13 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 
 - Rejected entirely with `409 stale_owner` when the caller is not the owner or `generation` is stale. Nothing is applied.
 - `baseRevision` is the last revision the client applied. The response's `catchUp` contains operations from other devices after `baseRevision` and before this batch, so the client needs no second request. It does not reject on mismatch; operations are entry-addressed, not positional.
-- Limits: 500 operations per batch, 2048-byte URLs, 64 KiB bodies.
+- Limits: 500 operations per batch (`413 payload_too_large`), 2048-byte http/https URLs and well-formed operations (`400 invalid_request` for the whole batch), 64 KiB bodies. Clients split batches by encoded size.
+- `baseRevision` is required. An empty `operations` array acts as a heartbeat plus catch-up.
+- `catchUp.operations` and `changes.operations` items are `{seq, deviceId, op, result}` where `op` is the operation as sent and `result` is `{status, entryId?}`.
 
 ## Errors
 
-`{ "error": "snake_case_code", "message": "human readable", ...details }`. Codes: `invalid_request`, `invalid_code`, `unauthorized`, `device_revoked`, `not_found`, `owner_active`, `stale_owner`, `history_expired`, `payload_too_large`, `internal`.
+`{ "error": "snake_case_code", "message": "human readable", ...details }`. Every `409` carries `owner` (possibly `null`). Timestamps are RFC 3339 UTC with milliseconds. Codes: `invalid_request`, `invalid_code`, `unauthorized`, `device_revoked`, `not_found`, `owner_active`, `stale_owner`, `history_expired`, `payload_too_large`, `internal`.
 
 ## Client behavior (v0.1 manual handover)
 

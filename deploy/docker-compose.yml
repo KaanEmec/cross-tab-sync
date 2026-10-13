@@ -1,0 +1,38 @@
+# Usage: CTS_DOMAIN=tabs.example.com docker compose up -d
+# Pair:  docker compose exec cts /cross-tab-sync pair-code
+services:
+  cts:
+    build:
+      context: ../server
+      dockerfile: ../deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      CTS_DB_PATH: /data/cts.db
+      CTS_OWNER_LIVENESS: ${CTS_OWNER_LIVENESS:-10m}
+      CTS_SNAPSHOT_RETENTION: ${CTS_SNAPSHOT_RETENTION:-20}
+    volumes:
+      - cts-data:/data
+    # Not published: only Caddy reaches it, so X-Forwarded-Proto is trustworthy.
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - cts
+    environment:
+      CTS_DOMAIN: ${CTS_DOMAIN:?set CTS_DOMAIN to the public hostname}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  cts-data:
+  caddy-data:
+  caddy-config:
