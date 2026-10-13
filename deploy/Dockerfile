@@ -1,6 +1,8 @@
 # Build context: server/ (see docker-compose.yml).
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
-ARG TARGETOS TARGETARCH
+FROM golang:1.27-alpine AS build
+# Set by BuildKit for multi-arch builds; empty (native) on the legacy builder.
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
