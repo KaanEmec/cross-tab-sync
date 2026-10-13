@@ -7,6 +7,16 @@
     remove: (keys) => chrome.storage.local.remove(keys)
   };
 
+  // src/core/client.ts
+  function originPattern(serverUrl2) {
+    try {
+      const u = new URL(serverUrl2.trim());
+      return `${u.protocol}//${u.hostname}/*`;
+    } catch {
+      return null;
+    }
+  }
+
   // src/core/mapping.ts
   function emptyMappings() {
     return { tabs: {}, urlCounts: {} };
@@ -26,7 +36,7 @@
       mappings: emptyMappings(),
       staleMappings: null,
       pending: [],
-      lastSync: null,
+      lastSuccessAt: null,
       lastError: null,
       statusText: null,
       receivingWindowId: null,
@@ -40,7 +50,14 @@
       suppressAutoTakeover: false,
       freshPending: false,
       heldCloses: [],
-      removedWindows: {}
+      removedWindows: {},
+      errorKind: null,
+      online: true,
+      pendingCount: 0,
+      nextRetryAt: null,
+      retryAttempts: 0,
+      paused: false,
+      minRevision: null
     };
   }
   var PREFIX = "cts.";
@@ -50,9 +67,15 @@
     for (const [k, v] of Object.entries(patch)) {
       if (v !== void 0) items[PREFIX + k] = v;
     }
+    if (patch.pending) items[PREFIX + "pendingCount"] = patch.pending.length;
     if (Object.keys(items).length > 0) await storage.set(items);
   }
   var RUN_LOCK_TTL_MS = 2 * 60 * 1e3;
+
+  // src/core/status.ts
+  var RETRY_MAX_MS = 5 * 6e4;
+  var APPLIED_ELSEWHERE_NOTE = "Applied on other devices: unknown. The server confirms receipt, not that other browsers opened the tabs.";
+  var RESTORE_NOTE = "Restore reopens the saved URLs as shared tabs. Unsaved form input and page state cannot be recovered.";
 
   // src/popup/popup.ts
   var $ = (id) => document.getElementById(id);
@@ -63,9 +86,14 @@
   var serverUrl = $("server-url");
   var deviceName = $("device-name");
   var pairCode = $("pair-code");
-  var buttons = Array.from(document.querySelectorAll("button"));
+  var recover = $("recover-section");
+  var devicesSection = $("devices-section");
+  var buttons = () => Array.from(document.querySelectorAll("button"));
   var busy = false;
   var reachable;
+  var last = null;
+  $("applied-note").textContent = APPLIED_ELSEWHERE_NOTE;
+  $("restore-note").textContent = RESTORE_NOTE;
   async function send(req) {
     try {
       return await chrome.runtime.sendMessage(req);
@@ -86,6 +114,7 @@
     errorEl.hidden = !message;
   }
   function render(s) {
+    last = s;
     pairView.hidden = s.paired;
     mainView.hidden = !s.paired;
     badge.hidden = !s.paired;
@@ -96,24 +125,32 @@
       return;
     }
     if (s.reachable !== void 0) reachable = s.reachable;
-    badge.textContent = reachable === false ? "Offline" : s.isOwner ? "Owner" : "Follower";
-    badge.classList.toggle("owner", s.isOwner && reachable !== false);
+    const offline = reachable === false || !s.online;
+    badge.textContent = s.paused ? "Paused" : offline ? "Offline" : s.isOwner ? "Owner" : "Follower";
+    badge.classList.toggle("owner", s.isOwner && !offline && !s.paused);
     $("role").textContent = s.isOwner ? "Owner (publishes changes)" : "Follower (applies changes)";
     const o = s.owner;
     $("owner").textContent = !o ? "No owner" : o.deviceId === s.deviceId ? `This device (gen. ${o.generation})` : `${o.name} (gen. ${o.generation})`;
-    $("last-sync").textContent = relative(s.lastSync);
-    $("pending").textContent = String(s.pendingCount);
+    $("last-sync").textContent = relative(s.lastSuccessAt);
+    $("last-sync").title = `Revision ${s.lastRevision}` + (s.minRevision !== null ? `; server history from revision ${s.minRevision}` : "");
+    $("sync-state").textContent = s.summary;
     $("status-text").textContent = s.running ? "Working\u2026" : s.statusText ?? "";
     $("identity").textContent = `${s.deviceName} \xB7 ${hostOf(s.serverUrl)}`;
     $("identity").title = s.serverUrl;
     const handOver = $("hand-over");
     const continueHere = $("continue-here");
+    const syncNow = $("sync-now");
+    const blocked = busy || s.running;
     handOver.classList.toggle("primary", s.isOwner);
     continueHere.classList.toggle("primary", !s.isOwner);
-    handOver.disabled = busy || s.running || !s.isOwner;
+    handOver.disabled = blocked || s.paused || !s.isOwner;
     handOver.title = s.isOwner ? "Publish this browser's tabs and release control" : "Only the owner can hand over";
-    continueHere.disabled = busy || s.running;
-    $("sync-now").disabled = busy || s.running;
+    continueHere.disabled = blocked || s.paused;
+    syncNow.disabled = blocked || s.paused;
+    syncNow.textContent = s.nextRetryAt !== null ? "Retry now" : "Sync now";
+    $("pause").textContent = s.paused ? "Resume sync" : "Pause sync";
+    $("pause").disabled = blocked;
+    $("grant").hidden = s.errorKind !== "permission";
     showError(s.lastError);
   }
   function hostOf(url) {
@@ -125,7 +162,7 @@
   }
   function setBusy(value) {
     busy = value;
-    for (const b of buttons) b.disabled = value;
+    for (const b of buttons()) b.disabled = value;
     if (value) $("status-text").textContent = "Working\u2026";
   }
   async function run(req) {
@@ -133,25 +170,93 @@
     const res = await send(req);
     if (res.ok && req.type !== "getStatus") reachable = true;
     busy = false;
-    for (const b of buttons) b.disabled = false;
+    for (const b of buttons()) b.disabled = false;
     if (res.status) render(res.status);
     if (!res.ok) showError(res.error);
     return res;
   }
+  function confirmTwice(btn, armedLabel, action) {
+    const label = btn.textContent ?? "";
+    let timer = null;
+    btn.addEventListener("click", () => {
+      if (timer === null) {
+        btn.textContent = armedLabel;
+        timer = setTimeout(() => {
+          timer = null;
+          btn.textContent = label;
+        }, 4e3);
+        return;
+      }
+      clearTimeout(timer);
+      timer = null;
+      btn.textContent = label;
+      action();
+    });
+  }
   async function requestOrigin(url) {
-    let pattern;
-    try {
-      const u = new URL(url.trim());
-      pattern = `${u.protocol}//${u.hostname}/*`;
-    } catch {
-      return true;
-    }
-    if (!chrome.permissions?.request) return true;
+    const pattern = originPattern(url);
+    if (!pattern || !chrome.permissions?.request) return true;
     try {
       return await chrome.permissions.request({ origins: [pattern] });
     } catch {
       return false;
     }
+  }
+  function item(text, detail, button2) {
+    const li = document.createElement("li");
+    const span = document.createElement("span");
+    span.textContent = text;
+    const small = document.createElement("small");
+    small.textContent = detail;
+    span.append(small);
+    li.append(span);
+    if (button2) li.append(button2);
+    return li;
+  }
+  function fill(list, items, empty) {
+    if (items.length === 0) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = empty;
+      items = [li];
+    }
+    list.replaceChildren(...items);
+  }
+  function button(label, armedLabel, action, danger = false) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    if (danger) b.className = "danger";
+    confirmTwice(b, armedLabel, action);
+    return b;
+  }
+  async function loadSnapshots() {
+    const [snaps, devs] = await Promise.all([send({ type: "listSnapshots" }), send({ type: "listDevices" })]);
+    if (!snaps.ok) return showError(snaps.error);
+    const names = new Map((devs.ok ? devs.devices ?? [] : []).map((d) => [d.id, d.name]));
+    const rows = (snaps.snapshots ?? []).map((s) => {
+      const who = s.deviceId === last?.deviceId ? "this device" : names.get(s.deviceId) ?? "a removed device";
+      const why = s.reason === "restore" ? "before a restore" : "before a change";
+      const restore = button("Restore", "Confirm restore", () => {
+        void run({ type: "restoreSnapshot", id: s.id }).then(async (r) => {
+          if (r.ok) await loadSnapshots();
+        });
+      });
+      return item(`${new Date(s.createdAt).toLocaleString()} \xB7 ${s.entryCount} tab(s)`, `${who}, ${why}`, restore);
+    });
+    fill($("snapshots"), rows, "No snapshots yet");
+  }
+  async function revoke(id) {
+    if ((await run({ type: "revokeDevice", id })).ok) await loadDevices();
+  }
+  async function loadDevices() {
+    const res = await send({ type: "listDevices" });
+    if (!res.ok) return showError(res.error);
+    const rows = (res.devices ?? []).map((d) => {
+      const action = d.isSelf ? void 0 : button("Revoke", "Confirm revoke", () => void revoke(d.id), true);
+      return item(d.isSelf ? `${d.name} (this device)` : d.name, `${d.browser}, last seen ${relative(d.lastSeenAt)}`, action);
+    });
+    fill($("devices"), rows, "No devices");
   }
   pairView.addEventListener("submit", (ev) => {
     ev.preventDefault();
@@ -173,6 +278,14 @@
   $("hand-over").addEventListener("click", () => void run({ type: "handOver" }));
   $("continue-here").addEventListener("click", () => void run({ type: "continueHere" }));
   $("sync-now").addEventListener("click", () => void run({ type: "syncNow" }));
+  $("pause").addEventListener("click", () => void run({ type: last?.paused ? "resume" : "pause" }));
+  $("grant").addEventListener("click", () => {
+    void requestOrigin(last?.serverUrl ?? "").then(async (ok) => {
+      if (ok) await run({ type: "syncNow" });
+    });
+  });
+  recover.addEventListener("toggle", () => void (recover.open && loadSnapshots()));
+  devicesSection.addEventListener("toggle", () => void (devicesSection.open && loadDevices()));
   $("create-code").addEventListener("click", async () => {
     const res = await run({ type: "createPairingCode" });
     const el = $("pairing-code");
@@ -185,23 +298,9 @@
       el.hidden = false;
     }
   });
-  var disconnectArmed = null;
-  $("disconnect").addEventListener("click", () => {
-    const btn = $("disconnect");
-    if (disconnectArmed === null) {
-      btn.textContent = "Click again to disconnect";
-      btn.title = "Your tabs stay open";
-      disconnectArmed = setTimeout(() => {
-        disconnectArmed = null;
-        btn.textContent = "Disconnect";
-      }, 4e3);
-      return;
-    }
-    clearTimeout(disconnectArmed);
-    disconnectArmed = null;
-    btn.textContent = "Disconnect";
-    void run({ type: "disconnect" });
-  });
+  var disconnect = $("disconnect");
+  disconnect.title = "Your tabs stay open";
+  confirmTwice(disconnect, "Click again to disconnect", () => void run({ type: "disconnect" }));
   chrome.storage.onChanged.addListener((_changes, area) => {
     if (area !== "local" || busy) return;
     void send({ type: "getStatus" }).then((res) => res.status && render(res.status));

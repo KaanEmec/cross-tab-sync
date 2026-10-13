@@ -5,7 +5,9 @@ import { createWebExtAdapter } from "../adapter/webext.js";
 import { ApiClient } from "../core/client.js";
 import { SyncEngine } from "../core/engine.js";
 import { createPairingCode, disconnect, pairFromPending, refreshOwner, type Deps } from "../core/handover.js";
+import type { Device, Snapshot } from "../core/client.js";
 import { statusView, type Request, type Response } from "../core/messages.js";
+import { listDevices, listSnapshots, revokeDevice } from "../core/recovery.js";
 import { isPaired, loadState, saveState } from "../core/state.js";
 
 /** The 5-minute cycle (named "heartbeat" since v0.1 so existing alarms keep working). */
@@ -54,8 +56,10 @@ void adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
 // that worker journaled.
 void engine.enqueue(() => saveState(adapter.storage, { runLock: null })).then(() => engine.resume());
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   void setup();
+  // Same reset as a new browser session: an update may leave state from another code version.
+  if (details.reason === "update") void engine.startup("update").catch(() => undefined);
 });
 
 // Tab, window and startup listeners, registered synchronously.
@@ -78,6 +82,8 @@ chrome.permissions?.onAdded?.addListener((perms) => {
 async function handle(req: Request): Promise<Response> {
   let pairingCode: { code: string; expiresAt: string } | undefined;
   let reachable: boolean | undefined;
+  let snapshots: Snapshot[] | undefined;
+  let devices: Device[] | undefined;
   switch (req.type) {
     case "getStatus":
       if (req.refresh && !engine.busy) reachable = await engine.enqueue(() => refreshOwner(deps));
@@ -94,6 +100,24 @@ async function handle(req: Request): Promise<Response> {
     case "syncNow":
       await engine.runNow("syncNow");
       break;
+    case "pause":
+      await engine.pause();
+      break;
+    case "resume":
+      await engine.unpause();
+      break;
+    case "listSnapshots":
+      snapshots = await listSnapshots(deps);
+      break;
+    case "restoreSnapshot":
+      await engine.restore(req.id);
+      break;
+    case "listDevices":
+      devices = await listDevices(deps);
+      break;
+    case "revokeDevice":
+      await engine.enqueue(() => revokeDevice(deps, req.id));
+      break;
     case "createPairingCode":
       pairingCode = await createPairingCode(deps);
       break;
@@ -105,7 +129,7 @@ async function handle(req: Request): Promise<Response> {
   }
   const status = statusView(await loadState(adapter.storage));
   if (reachable !== undefined) status.reachable = reachable;
-  return pairingCode ? { ok: true, status, pairingCode } : { ok: true, status };
+  return { ok: true, status, pairingCode, snapshots, devices };
 }
 
 chrome.runtime.onMessage.addListener((msg: Request, sender, sendResponse: (r: Response) => void) => {

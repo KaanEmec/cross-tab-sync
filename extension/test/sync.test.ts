@@ -236,29 +236,24 @@ describe("follower application", () => {
 });
 
 describe("stale owner", () => {
-  it("demotes and keeps the journal; the next takeover publishes it", async () => {
+  it("demotes, then submits the journal through merge as a follower without taking over", async () => {
     const mac = await owner("Mac Safari", ["https://a/"]);
     const brave = await device(server, clock, "Brave", { tabs: [{ url: "https://brave/" }] });
     await brave.engine.takeover();
     await brave.settle();
+    const acquires = mac.acquires();
 
     mac.b.userOpenTab(mac.win, "https://late/");
     await mac.settle();
-    let s = await mac.state();
+    const s = await mac.state();
     expect(s.generation).toBeNull();
     expect(s.owner?.name).toBe("Brave");
     expect(s.freshPending).toBe(true);
-    expect(list(s.pending).map((o) => o.type === "open" && o.url)).toEqual(["https://late/"]);
-    expect(server.openUrls()).not.toContain("https://late/");
-    expect(await mac.urls()).toContain("https://brave/"); // continued as a follower in the same run
-
-    clock.advance(31_000);
-    mac.b.userActivate(mac.tab("https://a/"));
-    await mac.settle();
-    s = await mac.state();
-    expect(s.generation).not.toBeNull();
     expect(s.pending).toEqual([]);
-    expect(server.openUrls()).toContain("https://late/");
+    expect(server.openUrls()).toContain("https://late/"); // merged: no ownership needed
+    expect(server.owner?.name).toBe("Brave");
+    expect(mac.acquires()).toBe(acquires);
+    expect(await mac.urls()).toContain("https://brave/"); // continued as a follower in the same run
   });
 });
 
@@ -427,10 +422,11 @@ describe("review fixes", () => {
     brave.b.userNavigate(brave.tab("https://a/"), "https://a/brave");
     await brave.settle();
 
-    await mac.engine.runNow(); // follower run sees the remote navigate of the same entry
+    await mac.engine.runNow(); // merge forks the stale navigate, then the pull brings the remote URL
     await mac.settle();
     expect(await mac.urls()).toEqual(["https://a/brave", "https://a/mac"]);
-    expect(list((await mac.state()).pending).map((o) => o.type === "open" && o.url)).toEqual(["https://a/mac"]);
+    expect((await mac.state()).pending).toEqual([]);
+    expect(server.openUrls().sort()).toEqual(["https://a/brave", "https://a/mac"]);
 
     clock.advance(61_000);
     mac.b.userActivate(mac.tab("https://a/mac"));

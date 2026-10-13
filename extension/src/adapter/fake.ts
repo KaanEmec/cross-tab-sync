@@ -49,6 +49,8 @@ export class FakeBrowser implements BrowserAdapter {
   tabs: TabInfo[] = [];
   lastFocusedWindowId: number | null = null;
   alarms = new Map<string, number>();
+  /** Host permission for the server origin (permissions.contains). */
+  hostPermission = true;
   /** When set, createTab rejects for these URLs. */
   failCreateFor = new Set<string>();
   readonly calls: { method: string; args: unknown[] }[] = [];
@@ -241,6 +243,10 @@ export class FakeBrowser implements BrowserAdapter {
     this.events.tabCreated.emit({ ...tab });
     this.events.tabUpdated.emit({ ...tab }, { status: "complete" });
     return { ...tab };
+  }
+
+  async hasHostPermission(_pattern: string): Promise<boolean> {
+    return this.hostPermission;
   }
 
   async ensureAlarm(name: string, periodInMinutes: number): Promise<void> {

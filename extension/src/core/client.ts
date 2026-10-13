@@ -19,6 +19,8 @@ export interface Entry {
 
 export interface Session {
   revision: number;
+  /** Oldest retained operation sequence number (v1.0). */
+  minRevision?: number;
   owner: Owner | null;
   entries: Entry[];
 }
@@ -29,7 +31,11 @@ export type Operation =
   | { opId: string; type: "close"; entryId: string }
   | { opId: string; type: "update"; entryId: string; pinned?: boolean; position?: number };
 
-export type OpStatus = "applied" | "coalesced" | "ignored";
+/** `forked` only in `merge` results: a navigate on a moved entry opened a fresh entry (`entryId`). */
+export type OpStatus = "applied" | "coalesced" | "ignored" | "forked";
+
+/** A journaled operation as sent to `merge`: with the revision the device had applied when recording it. */
+export type MergeOperation = Operation & { baseRevision: number };
 
 export interface OpResult {
   opId: string;
@@ -49,13 +55,33 @@ export interface LoggedOperation {
 export interface OperationsResponse {
   revision: number;
   results: OpResult[];
-  catchUp: { operations: LoggedOperation[] };
+  /** Absent when `fullResync` is set. */
+  catchUp?: { operations: LoggedOperation[] };
+  /** `baseRevision` is older than the retained history: reload `GET session`. */
+  fullResync?: boolean;
+}
+
+/** `merge` and snapshot `restore`. */
+export interface BatchResponse {
+  revision: number;
+  results: OpResult[];
 }
 
 export interface ChangesResponse {
   revision: number;
+  minRevision?: number;
   owner: Owner | null;
   operations: LoggedOperation[];
+}
+
+export interface Snapshot {
+  id: number;
+  /** Revision just before the change that triggered the snapshot. */
+  revision: number;
+  deviceId: string;
+  reason: "operations" | "restore" | (string & {});
+  createdAt: string;
+  entryCount: number;
 }
 
 export interface Device {
@@ -131,6 +157,16 @@ export function normalizeServerUrl(input: string): string {
   return (url.origin + url.pathname).replace(/\/+$/, "");
 }
 
+/** Host permission pattern for a server URL (`https://host/*`), as requested at pairing. Null if invalid. */
+export function originPattern(serverUrl: string): string | null {
+  try {
+    const u = new URL(serverUrl.trim());
+    return `${u.protocol}//${u.hostname}/*`;
+  } catch {
+    return null;
+  }
+}
+
 export class ApiClient {
   private readonly baseUrl: string;
   private readonly token: string | null;
@@ -183,6 +219,19 @@ export class ApiClient {
 
   operations(body: { generation: number; baseRevision: number; operations: Operation[] }): Promise<OperationsResponse> {
     return this.request("POST", "/v1/session/operations", body);
+  }
+
+  merge(operations: MergeOperation[]): Promise<BatchResponse> {
+    return this.request("POST", "/v1/session/merge", { operations });
+  }
+
+  async snapshots(): Promise<Snapshot[]> {
+    const res = await this.request<{ snapshots: Snapshot[] }>("GET", "/v1/snapshots");
+    return res.snapshots;
+  }
+
+  restoreSnapshot(id: number, generation: number): Promise<BatchResponse> {
+    return this.request("POST", `/v1/snapshots/${encodeURIComponent(String(id))}/restore`, { generation });
   }
 
   private async request<T>(method: string, path: string, body?: unknown, auth = true): Promise<T> {

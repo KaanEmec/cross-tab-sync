@@ -1,5 +1,6 @@
-import type { Owner } from "./client.js";
-import { isLocked, isPaired, type State } from "./state.js";
+import type { Device, Owner, Snapshot } from "./client.js";
+import { isLocked, isPaired, type ErrorKind, type State } from "./state.js";
+import { syncSummary } from "./status.js";
 
 /** Messages from the popup to the service worker. */
 export type Request =
@@ -8,8 +9,14 @@ export type Request =
   | { type: "pair" }
   | { type: "handOver" }
   | { type: "continueHere" }
-  /** Run the owner or follower sync now. */
+  /** Run the owner or follower sync now (also the manual retry). */
   | { type: "syncNow" }
+  | { type: "pause" }
+  | { type: "resume" }
+  | { type: "listSnapshots" }
+  | { type: "restoreSnapshot"; id: number }
+  | { type: "listDevices" }
+  | { type: "revokeDevice"; id: string }
   | { type: "createPairingCode" }
   | { type: "disconnect" };
 
@@ -22,9 +29,16 @@ export interface StatusView {
   isOwner: boolean;
   generation: number | null;
   lastRevision: number;
-  lastSync: string | null;
+  minRevision: number | null;
+  lastSuccessAt: string | null;
   pendingCount: number;
+  online: boolean;
+  nextRetryAt: number | null;
+  paused: boolean;
+  /** "Saved to server", "3 changes waiting (offline, retrying at 10:05)", … (status.syncSummary). */
+  summary: string;
   lastError: string | null;
+  errorKind: ErrorKind | null;
   statusText: string | null;
   running: boolean;
   /** False when the last status refresh could not reach the server. Not persisted. */
@@ -32,10 +46,17 @@ export interface StatusView {
 }
 
 export type Response =
-  | { ok: true; status: StatusView; pairingCode?: { code: string; expiresAt: string } }
+  | {
+      ok: true;
+      status: StatusView;
+      pairingCode?: { code: string; expiresAt: string };
+      snapshots?: Snapshot[];
+      devices?: Device[];
+    }
   | { ok: false; error: string; status?: StatusView };
 
 export function statusView(s: State, now = Date.now()): StatusView {
+  const pendingCount = s.pending.length;
   return {
     paired: isPaired(s),
     serverUrl: s.serverUrl,
@@ -45,9 +66,15 @@ export function statusView(s: State, now = Date.now()): StatusView {
     isOwner: s.generation !== null,
     generation: s.generation,
     lastRevision: s.lastRevision,
-    lastSync: s.lastSync,
-    pendingCount: s.pending.length,
+    minRevision: s.minRevision,
+    lastSuccessAt: s.lastSuccessAt,
+    pendingCount,
+    online: s.online,
+    nextRetryAt: s.nextRetryAt,
+    paused: s.paused,
+    summary: syncSummary({ ...s, pendingCount }),
     lastError: s.lastError,
+    errorKind: s.errorKind,
     statusText: s.statusText,
     running: isLocked(s, now),
   };

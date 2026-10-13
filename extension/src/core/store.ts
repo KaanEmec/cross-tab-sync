@@ -2,13 +2,26 @@
 // and error recording.
 
 import type { BrowserAdapter } from "../adapter/types.js";
-import { ApiError, type ApiClient, type BrowserKind, type Owner } from "./client.js";
+import { ApiError, originPattern, type ApiClient, type BrowserKind, type Owner } from "./client.js";
 import { newOpId } from "./journal.js";
 import { clearedCredentials, isPaired, loadState, saveState, type State } from "./state.js";
+import { classify, errorMessage, isRetryable, retryDelay } from "./status.js";
 
 export type Api = Pick<
   ApiClient,
-  "pair" | "createPairingCode" | "deleteDevice" | "session" | "changes" | "acquire" | "release" | "heartbeat" | "operations"
+  | "pair"
+  | "createPairingCode"
+  | "devices"
+  | "deleteDevice"
+  | "session"
+  | "changes"
+  | "acquire"
+  | "release"
+  | "heartbeat"
+  | "operations"
+  | "merge"
+  | "snapshots"
+  | "restoreSnapshot"
 >;
 
 export interface Deps {
@@ -77,21 +90,43 @@ export async function demote(store: Store, e: ApiError, sentGeneration?: number 
   return true;
 }
 
+/** Fields after any successful exchange with the server: online, backoff reset. */
+export function succeeded(deps: Deps): Partial<State> {
+  return { lastSuccessAt: nowIso(deps), online: true, nextRetryAt: null, retryAttempts: 0, errorKind: null };
+}
+
+/** Whether the extension may reach the server origin (true where the browser cannot tell). */
+async function hasPermission(deps: Deps, serverUrl: string): Promise<boolean> {
+  const pattern = originPattern(serverUrl);
+  if (!pattern || !deps.adapter.hasHostPermission) return true;
+  return deps.adapter.hasHostPermission(pattern).catch(() => true);
+}
+
 /**
- * Record an error in state: `stale_owner` demotes, `device_revoked` clears credentials. Always
- * rethrows so the caller can report it.
+ * Record an error in state: `stale_owner` demotes, `device_revoked` clears credentials, network
+ * errors and 5xx mark the device offline and schedule the next retry with bounded exponential
+ * backoff (RETRY_BASE_MS doubling to RETRY_MAX_MS). Always rethrows so the caller can report it.
  */
 export async function fail(store: Store, e: unknown, sentGeneration?: number | null): Promise<never> {
   if (isStaleOwner(e)) {
     await demote(store, e, sentGeneration);
-  } else if (e instanceof ApiError && e.code === "device_revoked") {
+    throw e;
+  }
+  const kind = classify(e, e instanceof ApiError && e.code === "network_error" ? await hasPermission(store.deps, store.s.serverUrl) : true);
+  const message = kind ? errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0) : null;
+  if (kind === "device_revoked") {
+    await store.set({ ...clearedCredentials(), statusText: "Disconnected", lastError: message, errorKind: kind });
+  } else if (isRetryable(e)) {
+    const retryAttempts = store.s.retryAttempts + 1;
     await store.set({
-      ...clearedCredentials(),
-      statusText: "Disconnected",
-      lastError: "This device was revoked on the server. Pair it again.",
+      online: false,
+      retryAttempts,
+      nextRetryAt: nowMs(store.deps) + retryDelay(retryAttempts),
+      errorKind: kind,
+      lastError: message,
     });
   } else {
-    await store.set({ lastError: e instanceof Error ? e.message : String(e) });
+    await store.set({ errorKind: kind, lastError: message ?? (e instanceof Error ? e.message : String(e)) });
   }
   throw e;
 }

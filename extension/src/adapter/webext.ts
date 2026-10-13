@@ -100,6 +100,11 @@ export function createWebExtAdapter(): BrowserAdapter {
       await chrome.tabs.remove(tabId);
     },
 
+    async hasHostPermission(pattern) {
+      if (!chrome.permissions?.contains) return true;
+      return chrome.permissions.contains({ origins: [pattern] });
+    },
+
     async ensureAlarm(name, periodInMinutes) {
       const existing = await chrome.alarms.get(name).catch(() => undefined);
       if (!existing) await chrome.alarms.create(name, { periodInMinutes });

@@ -17,8 +17,9 @@ import {
   type TabEvent,
 } from "./changes.js";
 import { isShareableUrl } from "./eligibility.js";
-import { continueHere, handOver, resetForBrowserStartup } from "./handover.js";
-import { BusyError, withRunLock } from "./lock.js";
+import { continueHere, handOver, rematchTabs, resetForBrowserStartup } from "./handover.js";
+import { withRunLock } from "./lock.js";
+import { restoreSnapshot } from "./recovery.js";
 import { isPaired, loadState, saveState, type State } from "./state.js";
 import { idGen, nowMs, type Deps } from "./store.js";
 import { syncRun } from "./sync.js";
@@ -28,6 +29,11 @@ export const SYNC_DEBOUNCE_MS = 2_000;
 
 /** Key in session storage present for the lifetime of one browser session. */
 export const SESSION_MARKER = "cts.browserSession";
+
+export const PAUSED_MESSAGE = "Sync is paused. Resume to sync again.";
+
+/** Automatic runs wait for `nextRetryAt` after a failure; the retry timer runs them. */
+const BACKED_OFF = new Set(["sync", "alarm"]);
 
 /** Schedules `fn` after `ms`; returns a cancel function. */
 export type Scheduler = (fn: () => void, ms: number) => () => void;
@@ -60,10 +66,13 @@ export class SyncEngine {
   private depth = 0;
   private cancelTimer: (() => void) | null = null;
   private cancelRelease: (() => void) | null = null;
+  private cancelRetry: (() => void) | null = null;
 
+  /** `retrySchedule` runs the backoff retries (separate so tests can fire them on their own). */
   constructor(
     readonly deps: Deps,
     private readonly schedule: Scheduler = timeoutScheduler,
+    private readonly retrySchedule: Scheduler = schedule,
   ) {}
 
   /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
@@ -113,11 +122,18 @@ export class SyncEngine {
     while (this.depth > 0) await this.chain;
   }
 
-  /** Queued run under the persisted run lock; a run that finds the lock held exits (BusyError). */
+  /**
+   * Queued run under the persisted run lock; a run that finds the lock held exits (BusyError).
+   * Afterwards the retry timer is armed for `nextRetryAt` (set by a failure) or cancelled.
+   */
   locked<T>(action: string, fn: () => Promise<T>): Promise<T> {
     return this.enqueue(async () => {
       await this.ensureSession();
-      return withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps));
+      try {
+        return await withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps));
+      } finally {
+        await this.scheduleRetry().catch(ignore);
+      }
     });
   }
 
@@ -127,22 +143,33 @@ export class SyncEngine {
    * marker in session storage (cleared when the browser exits) and runs the startup reset when it
    * is missing. Without session storage, only runtime.onStartup resets.
    */
-  private async ensureSession(force = false): Promise<void> {
+  private async ensureSession(force: boolean | "always" = false): Promise<void> {
     const marker = this.deps.adapter.sessionStorage;
     if (!marker) {
       if (force) await resetForBrowserStartup(this.deps);
       return;
     }
-    if ((await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== undefined) return;
+    if (force !== "always" && (await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== undefined) return;
     await resetForBrowserStartup(this.deps);
     await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
   }
 
-  /** Owner or follower run now (alarm, Sync now, debounced local changes). */
+  /**
+   * Owner or follower run now (alarm, Sync now, debounced local changes, retry). Paused: nothing
+   * runs (Sync now reports it). Automatic runs before `nextRetryAt` wait for the retry timer.
+   */
   runNow(action = "sync"): Promise<State> {
     this.cancelTimer?.();
     this.cancelTimer = null;
-    return this.locked(action, () => syncRun(this.deps));
+    return this.locked(action, async () => {
+      const s = await loadState(this.deps.adapter.storage);
+      if (s.paused) {
+        if (action === "syncNow") throw new Error(PAUSED_MESSAGE);
+        return s;
+      }
+      if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) return s;
+      return syncRun(this.deps);
+    });
   }
 
   /** Debounced run: the first request schedules it, later ones ride along. */
@@ -154,9 +181,17 @@ export class SyncEngine {
     }, SYNC_DEBOUNCE_MS);
   }
 
-  /** Continue here (manual or automatic). A failed attempt keeps the interaction fresh for a retry. */
+  /**
+   * Continue here (manual, and automatic `takeover`). A failed attempt keeps the interaction fresh
+   * for a retry. Paused: automatic takeover is skipped, manual Continue here is refused.
+   */
   takeover(action = "takeover"): Promise<State> {
     return this.locked(action, async () => {
+      const s = await loadState(this.deps.adapter.storage);
+      if (s.paused) {
+        if (action === "takeover") return s;
+        throw new Error(PAUSED_MESSAGE);
+      }
       try {
         return await continueHere(this.deps);
       } catch (e) {
@@ -167,23 +202,81 @@ export class SyncEngine {
   }
 
   handOver(): Promise<State> {
-    return this.locked("handOver", () => handOver(this.deps));
+    return this.locked("handOver", async () => {
+      if ((await loadState(this.deps.adapter.storage)).paused) throw new Error(PAUSED_MESSAGE);
+      return handOver(this.deps);
+    });
   }
 
-  /** Browser startup: set mappings aside (unless already done), start the grace period, catch up shortly after. */
-  async startup(): Promise<void> {
-    await this.enqueue(() => this.ensureSession(true));
+  /** Restore a server snapshot (taking over first when not owner), then materialize it. */
+  restore(snapshotId: number): Promise<State> {
+    return this.locked("restore", async () => {
+      if ((await loadState(this.deps.adapter.storage)).paused) throw new Error(PAUSED_MESSAGE);
+      return restoreSnapshot(this.deps, snapshotId);
+    });
+  }
+
+  /** Pause: no runs and no automatic takeover; local changes are still journaled. */
+  async pause(): Promise<State> {
+    this.cancelTimer?.();
+    this.cancelTimer = null;
+    this.cancelRetry?.();
+    this.cancelRetry = null;
+    return this.enqueue(async () => {
+      const storage = this.deps.adapter.storage;
+      await saveState(storage, { paused: true, statusText: "Paused. Local changes are kept and sent when you resume." });
+      return loadState(storage);
+    });
+  }
+
+  /**
+   * Resume: release held closes first (those whose windows are gone are dropped, never sent; a
+   * tab that is merely absent is only unmapped by the run), then run in the current role.
+   */
+  async unpause(): Promise<State> {
+    await this.enqueue(() => saveState(this.deps.adapter.storage, { paused: false, statusText: null }));
+    await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)));
+    return this.runNow("resume");
+  }
+
+  /**
+   * Browser startup (`browser`): set mappings aside unless already done for this session, start
+   * the grace period, catch up shortly after. Extension update (`update`): the same reset always.
+   */
+  async startup(reason: "browser" | "update" = "browser"): Promise<void> {
+    await this.enqueue(async () => {
+      await this.ensureSession(reason === "update" ? "always" : true);
+      // The tabs are already loaded after an update (no restore events): re-match them now.
+      if (reason === "update") await rematchTabs(this.deps);
+    });
     this.requestSync();
   }
 
-  /** Worker (re)start: send what an earlier worker journaled, release closes it held. */
+  /** Worker (re)start: send what an earlier worker journaled, release closes it held, rearm the retry. */
   async resume(): Promise<void> {
     const s = await this.enqueue(async () => {
       await this.ensureSession();
       return loadState(this.deps.adapter.storage);
     });
+    if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease(); // journaling continues while paused
+    if (s.paused) return;
     if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
-    if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease();
+    await this.scheduleRetry();
+  }
+
+  /** Arm the retry timer for the persisted `nextRetryAt`, or cancel it (success, paused, unpaired). */
+  private async scheduleRetry(): Promise<void> {
+    const s = await loadState(this.deps.adapter.storage);
+    this.cancelRetry?.();
+    this.cancelRetry = null;
+    if (!isPaired(s) || s.paused || s.nextRetryAt === null) return;
+    this.cancelRetry = this.retrySchedule(
+      () => {
+        this.cancelRetry = null;
+        void this.runNow("retry").catch(ignore);
+      },
+      Math.max(0, s.nextRetryAt - nowMs(this.deps)),
+    );
   }
 
   /** Release held closes once CLOSE_HOLD_MS has passed (see changes.releaseHeld). */
@@ -191,13 +284,15 @@ export class SyncEngine {
     if (this.cancelRelease) return;
     this.cancelRelease = this.schedule(() => {
       this.cancelRelease = null;
-      this.event(async (s, ctx) => {
-        const alive = new Set((await this.deps.adapter.getWindows()).map((w) => w.id));
-        const out = releaseHeld(s, alive, ctx);
-        if (out.waiting) this.scheduleRelease();
-        return outcome(out);
-      });
+      this.event((s, ctx) => this.release(s, ctx));
     }, CLOSE_HOLD_MS);
+  }
+
+  private async release(s: State, ctx: Ctx): Promise<Step> {
+    const alive = new Set((await this.deps.adapter.getWindows()).map((w) => w.id));
+    const out = releaseHeld(s, alive, ctx);
+    if (out.waiting) this.scheduleRelease();
+    return outcome(out);
   }
 
   private event(step: (s: State, ctx: Ctx) => Promise<Step>): void {
@@ -213,9 +308,11 @@ export class SyncEngine {
     const now = nowMs(this.deps);
     const out = await step(s, { now, newId: idGen(this.deps) });
     const isOwner = s.generation !== null;
-    const decision = out.activity ? onActivity(s, { now, isOwner }) : null;
+    // Paused: journal only; activity neither takes over nor triggers a run.
+    const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner }) : null;
     await saveState(storage, { ...out.patch, ...decision?.patch });
     if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
+    if (s.paused) return;
     if (decision?.takeover) void this.takeover().catch(ignore);
     else if (isOwner && (out.ops > 0 || decision?.fresh)) this.requestSync();
   }

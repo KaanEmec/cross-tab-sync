@@ -32,14 +32,26 @@
         <dt>Role</dt><dd id="role"></dd>
         <dt>Owner</dt><dd id="owner"></dd>
         <dt>Last sync</dt><dd id="last-sync"></dd>
-        <dt>Pending changes</dt><dd id="pending"></dd>
+        <dt>Local changes</dt><dd id="sync-state"></dd>
       </dl>
+      <p id="applied-note" class="hint"></p>
       <p id="status-text" class="status"></p>
       <div class="actions">
         <button id="hand-over" type="button">Hand over</button>
         <button id="continue-here" type="button">Continue here</button>
-        <button id="sync-now" type="button" class="wide" title="Owner: publish pending changes. Follower: fetch the latest changes.">Sync now</button>
+        <button id="sync-now" type="button" title="Owner: publish pending changes. Follower: send local changes and fetch the latest.">Sync now</button>
+        <button id="pause" type="button" title="Stop syncing on this browser. Local changes are kept.">Pause sync</button>
+        <button id="grant" type="button" class="wide primary" hidden>Grant access to the server</button>
       </div>
+      <details id="recover-section">
+        <summary>Recover</summary>
+        <p id="restore-note" class="hint"></p>
+        <ul id="snapshots" class="list"></ul>
+      </details>
+      <details id="devices-section">
+        <summary>Devices</summary>
+        <ul id="devices" class="list"></ul>
+      </details>
       <div class="pairing">
         <button id="create-code" type="button" class="link">Create pairing code</button>
         <p id="pairing-code" class="code" hidden></p>

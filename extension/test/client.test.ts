@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApiClient, ApiError, normalizeServerUrl, type FetchLike } from "../src/core/client.js";
+import { ApiClient, ApiError, normalizeServerUrl, originPattern, type FetchLike } from "../src/core/client.js";
 
 function mockFetch(status: number, body?: unknown, raw?: string) {
   return vi.fn<FetchLike>(async () =>
@@ -38,8 +38,11 @@ describe("ApiClient", () => {
     ["acquire", (c: ApiClient) => c.acquire(true), "POST", "/v1/session/acquire"],
     ["pairingCodes", (c: ApiClient) => c.createPairingCode(), "POST", "/v1/pairing-codes"],
     ["devices", (c: ApiClient) => c.devices(), "GET", "/v1/devices"],
+    ["merge", (c: ApiClient) => c.merge([]), "POST", "/v1/session/merge"],
+    ["snapshots", (c: ApiClient) => c.snapshots(), "GET", "/v1/snapshots"],
+    ["restore", (c: ApiClient) => c.restoreSnapshot(4, 2), "POST", "/v1/snapshots/4/restore"],
   ])("%s hits the right endpoint", async (_name, call, method, path) => {
-    const f = mockFetch(200, { devices: [] });
+    const f = mockFetch(200, { devices: [], snapshots: [], revision: 1, results: [] });
     await call(client(f));
     expect(f.mock.calls[0]![0]).toBe("https://sync.example" + path);
     expect(f.mock.calls[0]![1]?.method).toBe(method);
@@ -88,6 +91,20 @@ describe("ApiClient", () => {
 });
 
 describe("normalizeServerUrl", () => {
+  it("sends each merge operation with its own baseRevision and restore with the generation", async () => {
+    const f = mockFetch(200, { revision: 2, results: [] });
+    const op = { opId: "o", type: "close" as const, entryId: "e", baseRevision: 5 };
+    await client(f).merge([op]);
+    expect(JSON.parse(f.mock.calls[0]![1]?.body as string)).toEqual({ operations: [op] });
+    await client(f).restoreSnapshot(9, 3);
+    expect(JSON.parse(f.mock.calls[1]![1]?.body as string)).toEqual({ generation: 3 });
+  });
+
+  it("derives the host permission pattern from the server URL", () => {
+    expect(originPattern("https://sync.example:8443/cts")).toBe("https://sync.example/*");
+    expect(originPattern("nope")).toBeNull();
+  });
+
   it.each([
     ["https://sync.example/", "https://sync.example"],
     ["  https://sync.example/cts/ ", "https://sync.example/cts"],

@@ -42,6 +42,8 @@ export interface Dev {
   deps: Deps;
   engine: SyncEngine;
   timers: ManualTimers;
+  /** Backoff retry timers; `settle` never fires them. */
+  retries: ManualTimers;
   /** The normal window created for the device (unless `noWindow`). */
   win: number;
   id: string;
@@ -53,8 +55,10 @@ export interface Dev {
   /** Mark recent activity so the next signal is not a fresh interaction. */
   quiet(): Promise<void>;
   acquires(): number;
-  /** Operations this device sent, in order. */
+  /** Operations this device sent through `operations`, in order. */
   sent(): Operation[];
+  /** Operations this device sent through `merge`, in order (with their baseRevision). */
+  merged(): (Operation & { baseRevision: number })[];
   tab(url: string): number;
 }
 
@@ -77,13 +81,15 @@ export async function device(
   // The browser session is already running (a restart() clears this marker).
   await b.sessionStorage?.set({ [SESSION_MARKER]: clock.t });
   const timers = new ManualTimers(clock);
-  const engine = new SyncEngine(deps, timers.schedule);
+  const retries = new ManualTimers(clock);
+  const engine = new SyncEngine(deps, timers.schedule, retries.schedule);
   engine.attach();
   return {
     b,
     deps,
     engine,
     timers,
+    retries,
     win,
     id,
     state: () => loadState(b.storage),
@@ -108,6 +114,10 @@ export async function device(
       server.requests
         .filter((r) => r.path === "operations" && r.device === id)
         .flatMap((r) => (r.body as { operations: Operation[] }).operations),
+    merged: () =>
+      server.requests
+        .filter((r) => r.path === "merge" && r.device === id)
+        .flatMap((r) => (r.body as { operations: (Operation & { baseRevision: number })[] }).operations),
     tab(url: string) {
       const t = b.tabs.find((x) => x.url === url);
       if (!t) throw new Error(`no tab ${url}`);

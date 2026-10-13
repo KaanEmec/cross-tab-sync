@@ -53,6 +53,8 @@ export interface LocalState {
   heldCloses: HeldClose[];
   /** windows.onRemoved seen recently: window id -> epoch ms. */
   removedWindows: Record<string, number>;
+  /** Read only: the causal base recorded with each journaled operation. */
+  lastRevision?: number;
 }
 
 /** A tab as seen in an event. `eligible`: shareable URL in a normal, non-private window. */
@@ -149,7 +151,10 @@ class Draft {
   }
 
   done(activity: boolean): Outcome {
-    if (this.ops.length > 0) this.set("pending", append(this.s.pending, this.ops, new Date(this.ctx.now), this.bases));
+    if (this.ops.length > 0) {
+      const meta = { bases: this.bases, baseRevision: this.s.lastRevision ?? 0 };
+      this.set("pending", append(this.s.pending, this.ops, new Date(this.ctx.now), meta));
+    }
     const patch: Partial<LocalState> = {};
     for (const k of this.changed) (patch as Record<string, unknown>)[k] = this.s[k];
     return { patch, ops: this.ops, activity };

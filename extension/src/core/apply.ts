@@ -100,6 +100,7 @@ export function forkEntry(
   entryId: string,
   newId: () => string,
   now: Date,
+  baseRevision = 0,
 ): { mappings: Mappings; pending: Journal } | null {
   const copies = tabsForEntry(mappings, entryId);
   const first = mappings.tabs[String(copies[0])];
@@ -112,6 +113,7 @@ export function forkEntry(
       pending.filter((p) => !changes.has(p)),
       [{ opId: newId(), type: "open", entryId: fresh, url: first.url }],
       now,
+      { baseRevision },
     ),
   };
 }
@@ -181,13 +183,13 @@ export async function createTabs(store: Store, items: TabToCreate[]): Promise<{ 
   return { created, failed };
 }
 
-/** Follow coalesced opens/navigates to the surviving entry. */
+/** Follow coalesced opens/navigates (and, from `merge`, forked navigates) to the surviving entry. */
 export function applyResults(mappings: Mappings, ops: Operation[], results: OpResult[]): Mappings {
   const byId = new Map(ops.map((op) => [op.opId, op]));
   let m = mappings;
   for (const r of results) {
     const op = byId.get(r.opId);
-    if (!op || r.status !== "coalesced" || !r.entryId || r.entryId === op.entryId) continue;
+    if (!op || (r.status !== "coalesced" && r.status !== "forked") || !r.entryId || r.entryId === op.entryId) continue;
     m = remapEntry(m, op.entryId, r.entryId);
   }
   return m;
@@ -203,9 +205,15 @@ export function applyResults(mappings: Mappings, ops: Operation[], results: OpRe
  * close never touches the local copies; they fork into a fresh entry (forkEntry) and a remote
  * navigate's destination gets its own background tab. `sentNavigated` lists entries this device
  * navigated in the batch whose catchUp this is: the server applied ours last, so the remote URL is
- * kept as a fresh entry instead.
+ * kept as a fresh entry instead. `revive` lists entries whose local copies `merge` moved away
+ * (forked navigate, ignored close): a remote navigate of such an entry gets a background tab.
  */
-export async function applyRemote(store: Store, ops: LoggedOperation[], sentNavigated = new Set<string>()): Promise<void> {
+export async function applyRemote(
+  store: Store,
+  ops: LoggedOperation[],
+  sentNavigated = new Set<string>(),
+  revive = new Set<string>(),
+): Promise<void> {
   const foreign = ops
     .filter((l) => l.deviceId !== store.s.deviceId && l.result.status !== "ignored")
     .sort((a, b) => a.seq - b.seq);
@@ -215,6 +223,7 @@ export async function applyRemote(store: Store, ops: LoggedOperation[], sentNavi
   let mappings = await currentMappings(store, all, eligible);
   let pending = store.s.pending;
   const newId = idGen(store.deps);
+  const base = store.s.lastRevision;
   const detached = { ...store.s.detached };
   const byId = new Map(all.map((t) => [t.id, t]));
   const loading = (id: number) => store.s.expected.some((e) => e.kind === "load" && e.tabId === id);
@@ -234,7 +243,7 @@ export async function applyRemote(store: Store, ops: LoggedOperation[], sentNavi
     }
   };
   const fork = (entryId: string) => {
-    const f = forkEntry(mappings, pending, entryId, newId, nowDate(store.deps));
+    const f = forkEntry(mappings, pending, entryId, newId, nowDate(store.deps), base);
     if (!f) return false;
     ({ mappings, pending } = f);
     return true;
@@ -271,9 +280,13 @@ export async function applyRemote(store: Store, ops: LoggedOperation[], sentNavi
       case "navigate": {
         const copies = tabsForEntry(mappings, op.entryId).filter((id) => !remove.has(id));
         const localUrl = mappings.tabs[String(copies[0])]?.url;
+        if (copies.length === 0 && revive.has(op.entryId) && !toCreate.some((c) => c.entryId === op.entryId)) {
+          ensureTab(target, op.url);
+          break;
+        }
         if (copies.length > 0 && localUrl !== op.url && sentNavigated.has(op.entryId)) {
           const fresh = newId();
-          pending = append(pending, [{ opId: newId(), type: "open", entryId: fresh, url: op.url }], nowDate(store.deps));
+          pending = append(pending, [{ opId: newId(), type: "open", entryId: fresh, url: op.url }], nowDate(store.deps), { baseRevision: base });
           ensureTab(fresh, op.url);
           break;
         }

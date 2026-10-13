@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { FakeBrowser } from "../../src/adapter/fake.js";
 import { ApiClient, type BrowserKind, type ChangesResponse, type Session } from "../../src/core/client.js";
+import { SyncEngine } from "../../src/core/engine.js";
 import { continueHere, handOver, pair, type Deps } from "../../src/core/handover.js";
 import { loadState } from "../../src/core/state.js";
 
@@ -216,5 +217,37 @@ describe.skipIf(!hasGo)("real server + real client", () => {
       expect(d.createdAt).toMatch(/\d{3}Z$/);
       expect(d.lastSeenAt).toMatch(/\d{3}Z$/);
     }
+  });
+
+  it("E: a follower's journal merges without ownership and a divergent navigate forks", async () => {
+    await startServer();
+    const safari = await device("Safari", "safari", ["https://a.example/"]);
+    const brave = await device("Brave", "brave", []);
+    await continueHere(safari.deps);
+    const engine = new SyncEngine(brave.deps, () => () => undefined);
+    engine.attach();
+    await engine.runNow("syncNow"); // first follower run: full resync creates the tab
+    const tab = brave.b.tabs.find((t) => t.url === "https://a.example/")!;
+    brave.deps.now = () => new Date(Date.now() + 60_000); // past the post-load grace
+    brave.b.userNavigate(tab.id, "https://a.example/brave");
+    await engine.idle();
+    expect((await brave.state()).pending.map((p) => p.op.type)).toEqual(["navigate"]);
+
+    const s = await safari.state();
+    const entry = (await (await api(safari)).session()).entries[0]!;
+    await (await api(safari)).operations({
+      generation: s.generation,
+      baseRevision: s.lastRevision,
+      operations: [{ opId: crypto.randomUUID(), type: "navigate", entryId: entry.id, url: "https://a.example/safari" }],
+    });
+
+    const after = await engine.runNow("syncNow");
+    expect(after.lastError).toBeNull();
+    expect(after.pending).toEqual([]);
+    expect(after.generation).toBeNull();
+    const session = await (await api(brave)).session();
+    expect(entryUrls(session)).toEqual(["https://a.example/brave", "https://a.example/safari"]);
+    expect(session.owner?.name).toBe("Safari");
+    expect(urlsOf(brave.b)).toEqual(["https://a.example/brave", "https://a.example/safari"]);
   });
 });

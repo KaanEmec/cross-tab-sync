@@ -82,6 +82,10 @@
       async removeTab(tabId) {
         await chrome.tabs.remove(tabId);
       },
+      async hasHostPermission(pattern) {
+        if (!chrome.permissions?.contains) return true;
+        return chrome.permissions.contains({ origins: [pattern] });
+      },
       async ensureAlarm(name, periodInMinutes) {
         const existing = await chrome.alarms.get(name).catch(() => void 0);
         if (!existing) await chrome.alarms.create(name, { periodInMinutes });
@@ -141,6 +145,14 @@
     if (url.search || url.hash) throw new Error("Server URL must not contain a query or fragment");
     return (url.origin + url.pathname).replace(/\/+$/, "");
   }
+  function originPattern(serverUrl2) {
+    try {
+      const u = new URL(serverUrl2.trim());
+      return `${u.protocol}//${u.hostname}/*`;
+    } catch {
+      return null;
+    }
+  }
   var ApiClient = class {
     baseUrl;
     token;
@@ -182,6 +194,16 @@
     }
     operations(body) {
       return this.request("POST", "/v1/session/operations", body);
+    }
+    merge(operations) {
+      return this.request("POST", "/v1/session/merge", { operations });
+    }
+    async snapshots() {
+      const res = await this.request("GET", "/v1/snapshots");
+      return res.snapshots;
+    }
+    restoreSnapshot(id, generation) {
+      return this.request("POST", `/v1/snapshots/${encodeURIComponent(String(id))}/restore`, { generation });
     }
     async request(method, path, body, auth = true) {
       const headers = { Accept: "application/json" };
@@ -254,9 +276,15 @@
   function newOpId() {
     return crypto.randomUUID();
   }
-  function append(journal, ops, now = /* @__PURE__ */ new Date(), bases = {}) {
+  function append(journal, ops, now = /* @__PURE__ */ new Date(), meta = {}) {
     const known = new Set(journal.map((p) => p.op.opId));
-    const added = ops.filter((op) => !known.has(op.opId)).map((op) => bases[op.opId] ? { op, queuedAt: now.toISOString(), base: bases[op.opId] } : { op, queuedAt: now.toISOString() });
+    const added = ops.filter((op) => !known.has(op.opId)).map((op) => {
+      const p = { op, queuedAt: now.toISOString() };
+      const base = meta.bases?.[op.opId];
+      if (base) p.base = base;
+      if (meta.baseRevision !== void 0) p.baseRevision = meta.baseRevision;
+      return p;
+    });
     return [...journal, ...added];
   }
   function pendingChanges(journal, entryId) {
@@ -268,6 +296,13 @@
   }
   function list(journal) {
     return journal.map((p) => p.op);
+  }
+  function toMerge(journal) {
+    return journal.map((p) => ({ ...p.op, baseRevision: p.baseRevision ?? 0 }));
+  }
+  function redirect(journal, from, to) {
+    if (from === to || !journal.some((p) => p.op.entryId === from)) return journal;
+    return journal.map((p) => p.op.entryId === from ? { ...p, op: { ...p.op, entryId: to } } : p);
   }
   function pendingEntryIds(journal) {
     return new Set(journal.filter((p) => p.op.type === "open").map((p) => p.op.entryId));
@@ -413,7 +448,10 @@
       this.set("expected", [...this.s.expected, e]);
     }
     done(activity) {
-      if (this.ops.length > 0) this.set("pending", append(this.s.pending, this.ops, new Date(this.ctx.now), this.bases));
+      if (this.ops.length > 0) {
+        const meta = { bases: this.bases, baseRevision: this.s.lastRevision ?? 0 };
+        this.set("pending", append(this.s.pending, this.ops, new Date(this.ctx.now), meta));
+      }
       const patch = {};
       for (const k of this.changed) patch[k] = this.s[k];
       return { patch, ops: this.ops, activity };
@@ -589,7 +627,7 @@
       mappings: emptyMappings(),
       staleMappings: null,
       pending: [],
-      lastSync: null,
+      lastSuccessAt: null,
       lastError: null,
       statusText: null,
       receivingWindowId: null,
@@ -603,7 +641,14 @@
       suppressAutoTakeover: false,
       freshPending: false,
       heldCloses: [],
-      removedWindows: {}
+      removedWindows: {},
+      errorKind: null,
+      online: true,
+      pendingCount: 0,
+      nextRetryAt: null,
+      retryAttempts: 0,
+      paused: false,
+      minRevision: null
     };
   }
   var PREFIX = "cts.";
@@ -622,6 +667,7 @@
     for (const [k, v] of Object.entries(patch)) {
       if (v !== void 0) items[PREFIX + k] = v;
     }
+    if (patch.pending) items[PREFIX + "pendingCount"] = patch.pending.length;
     if (Object.keys(items).length > 0) await storage.set(items);
   }
   function isPaired(s) {
@@ -643,12 +689,71 @@
       suppressAutoTakeover: false,
       freshPending: false,
       heldCloses: [],
-      removedWindows: {}
+      removedWindows: {},
+      online: true,
+      nextRetryAt: null,
+      retryAttempts: 0,
+      paused: false,
+      minRevision: null,
+      errorKind: null
     };
   }
   var RUN_LOCK_TTL_MS = 2 * 60 * 1e3;
   function isLocked(s, now) {
     return s.runLock !== null && now - s.runLock.startedAt < RUN_LOCK_TTL_MS;
+  }
+
+  // src/core/status.ts
+  var RETRY_BASE_MS = 3e4;
+  var RETRY_MAX_MS = 5 * 6e4;
+  function retryDelay(attempt) {
+    return Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1), RETRY_MAX_MS);
+  }
+  function isRetryable(e) {
+    return e instanceof ApiError && (e.code === "network_error" || e.status >= 500);
+  }
+  function classify(e, hasPermission2) {
+    if (!(e instanceof ApiError)) return null;
+    if (e.code === "device_revoked") return "device_revoked";
+    if (e.code === "unauthorized" && e.status === 401) return "unauthorized";
+    if (e.code === "network_error") return hasPermission2 ? "unreachable" : "permission";
+    if (e.status >= 500) return "server";
+    return null;
+  }
+  function hostOf(serverUrl2) {
+    try {
+      return new URL(serverUrl2).origin;
+    } catch {
+      return serverUrl2;
+    }
+  }
+  function errorMessage(kind, serverUrl2, status = 0) {
+    switch (kind) {
+      case "device_revoked":
+        return "This device was revoked on the server. Pair it again.";
+      case "unauthorized":
+        return "The server does not accept this device's credentials. Disconnect, then pair again with a new code.";
+      case "permission":
+        return `Grant access to ${hostOf(serverUrl2)} in the extension's site permissions.`;
+      case "unreachable":
+        return `Cannot reach ${hostOf(serverUrl2)}. Check the connection or the server; changes are kept and retried.`;
+      case "server":
+        return `The server failed${status ? ` (HTTP ${status})` : ""}. Changes are kept and retried.`;
+    }
+  }
+  function clock(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  }
+  function syncSummary(f) {
+    const n = f.pendingCount;
+    const waiting = `${n} change${n === 1 ? "" : "s"} waiting`;
+    if (f.paused) return n > 0 ? `Paused, ${waiting}` : "Paused";
+    const retry = f.nextRetryAt !== null ? `retrying at ${clock(f.nextRetryAt)}` : null;
+    const why = [f.online ? null : "offline", retry].filter(Boolean).join(", ");
+    if (n > 0) return why ? `${waiting} (${why})` : waiting;
+    if (!f.online) return retry ? `Offline (${retry})` : "Offline";
+    return f.lastSuccessAt ? "Saved to server" : "Not synced yet";
   }
 
   // src/core/store.ts
@@ -697,17 +802,34 @@
     });
     return true;
   }
+  function succeeded(deps2) {
+    return { lastSuccessAt: nowIso(deps2), online: true, nextRetryAt: null, retryAttempts: 0, errorKind: null };
+  }
+  async function hasPermission(deps2, serverUrl2) {
+    const pattern = originPattern(serverUrl2);
+    if (!pattern || !deps2.adapter.hasHostPermission) return true;
+    return deps2.adapter.hasHostPermission(pattern).catch(() => true);
+  }
   async function fail(store, e, sentGeneration) {
     if (isStaleOwner(e)) {
       await demote(store, e, sentGeneration);
-    } else if (e instanceof ApiError && e.code === "device_revoked") {
+      throw e;
+    }
+    const kind = classify(e, e instanceof ApiError && e.code === "network_error" ? await hasPermission(store.deps, store.s.serverUrl) : true);
+    const message = kind ? errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0) : null;
+    if (kind === "device_revoked") {
+      await store.set({ ...clearedCredentials(), statusText: "Disconnected", lastError: message, errorKind: kind });
+    } else if (isRetryable(e)) {
+      const retryAttempts = store.s.retryAttempts + 1;
       await store.set({
-        ...clearedCredentials(),
-        statusText: "Disconnected",
-        lastError: "This device was revoked on the server. Pair it again."
+        online: false,
+        retryAttempts,
+        nextRetryAt: nowMs(store.deps) + retryDelay(retryAttempts),
+        errorKind: kind,
+        lastError: message
       });
     } else {
-      await store.set({ lastError: e instanceof Error ? e.message : String(e) });
+      await store.set({ errorKind: kind, lastError: message ?? (e instanceof Error ? e.message : String(e)) });
     }
     throw e;
   }
@@ -757,7 +879,7 @@
     return windows[0]?.id ?? null;
   }
   var expiry = (store) => nowMs(store.deps) + EXPECT_TTL_MS;
-  function forkEntry(mappings, pending, entryId, newId, now) {
+  function forkEntry(mappings, pending, entryId, newId, now, baseRevision = 0) {
     const copies = tabsForEntry(mappings, entryId);
     const first = mappings.tabs[String(copies[0])];
     if (!first) return null;
@@ -768,7 +890,8 @@
       pending: append(
         pending.filter((p) => !changes.has(p)),
         [{ opId: newId(), type: "open", entryId: fresh, url: first.url }],
-        now
+        now,
+        { baseRevision }
       )
     };
   }
@@ -833,12 +956,12 @@
     let m = mappings;
     for (const r of results) {
       const op = byId.get(r.opId);
-      if (!op || r.status !== "coalesced" || !r.entryId || r.entryId === op.entryId) continue;
+      if (!op || r.status !== "coalesced" && r.status !== "forked" || !r.entryId || r.entryId === op.entryId) continue;
       m = remapEntry(m, op.entryId, r.entryId);
     }
     return m;
   }
-  async function applyRemote(store, ops, sentNavigated = /* @__PURE__ */ new Set()) {
+  async function applyRemote(store, ops, sentNavigated = /* @__PURE__ */ new Set(), revive = /* @__PURE__ */ new Set()) {
     const foreign = ops.filter((l) => l.deviceId !== store.s.deviceId && l.result.status !== "ignored").sort((a, b) => a.seq - b.seq);
     if (foreign.length === 0) return;
     const { adapter: adapter2 } = store.deps;
@@ -846,6 +969,7 @@
     let mappings = await currentMappings(store, all, eligible);
     let pending = store.s.pending;
     const newId = idGen(store.deps);
+    const base = store.s.lastRevision;
     const detached = { ...store.s.detached };
     const byId = new Map(all.map((t) => [t.id, t]));
     const loading = (id) => store.s.expected.some((e) => e.kind === "load" && e.tabId === id);
@@ -863,7 +987,7 @@
       }
     };
     const fork = (entryId) => {
-      const f = forkEntry(mappings, pending, entryId, newId, nowDate(store.deps));
+      const f = forkEntry(mappings, pending, entryId, newId, nowDate(store.deps), base);
       if (!f) return false;
       ({ mappings, pending } = f);
       return true;
@@ -897,9 +1021,13 @@
         case "navigate": {
           const copies = tabsForEntry(mappings, op.entryId).filter((id) => !remove.has(id));
           const localUrl = mappings.tabs[String(copies[0])]?.url;
+          if (copies.length === 0 && revive.has(op.entryId) && !toCreate.some((c) => c.entryId === op.entryId)) {
+            ensureTab(target, op.url);
+            break;
+          }
           if (copies.length > 0 && localUrl !== op.url && sentNavigated.has(op.entryId)) {
             const fresh = newId();
-            pending = append(pending, [{ opId: newId(), type: "open", entryId: fresh, url: op.url }], nowDate(store.deps));
+            pending = append(pending, [{ opId: newId(), type: "open", entryId: fresh, url: op.url }], nowDate(store.deps), { baseRevision: base });
             ensureTab(fresh, op.url);
             break;
           }
@@ -1029,11 +1157,12 @@
     let pending = store.s.pending;
     const newId = idGen(store.deps);
     const now = nowDate(store.deps);
+    const baseRevision = store.s.lastRevision;
     const sessionIds = entries ? new Set(entries.map((e) => e.id)) : null;
     if (sessionIds) {
       for (const entryId of new Set(Object.values(before.tabs).map((m) => m.entryId))) {
         if (sessionIds.has(entryId) || !pendingChanges(pending, entryId).some((p2) => p2.op.type === "navigate")) continue;
-        const f = forkEntry(before, pending, entryId, newId, now);
+        const f = forkEntry(before, pending, entryId, newId, now, baseRevision);
         if (f) ({ mappings: before, pending } = f);
       }
     }
@@ -1069,7 +1198,7 @@
       mappings = removeMappings(mappings, keys.map(Number));
       for (const k of keys) if (orphan(k)) detached[k] = op.url;
     }
-    pending = append(pending, open, now);
+    pending = append(pending, open, now, { baseRevision });
     const create = [...p.create];
     const navigateTo = /* @__PURE__ */ new Map();
     for (const entry of entries ?? []) {
@@ -1083,7 +1212,7 @@
       }
       const base = pendingBase(pending, entry.id);
       if (base === void 0 || base === entry.url) continue;
-      const f = forkEntry(mappings, pending, entry.id, newId, now);
+      const f = forkEntry(mappings, pending, entry.id, newId, now, baseRevision);
       if (!f) continue;
       ({ mappings, pending } = f);
       const local = eligible.find((t) => t.url === entry.url && !mappings.tabs[String(t.id)]);
@@ -1102,6 +1231,61 @@
     return { open, failed };
   }
 
+  // src/core/merge.ts
+  function isMalformed(e) {
+    return e instanceof ApiError && (e.code === "invalid_request" || e.code === "payload_too_large");
+  }
+  async function dropBatch(store, batch) {
+    const entryIds = new Set(batch.map((op) => op.entryId));
+    const tabIds = Object.entries(store.s.mappings.tabs).filter(([, m]) => entryIds.has(m.entryId)).map(([k]) => Number(k));
+    await store.set({
+      pending: acknowledge(store.s.pending, batch.map((op) => op.opId)),
+      mappings: removeMappings(store.s.mappings, tabIds)
+    });
+    return batch.length;
+  }
+  async function applyMergeResults(store, batch, results, revive) {
+    const deps2 = store.deps;
+    let mappings = applyResults(store.s.mappings, batch, results);
+    let pending = acknowledge(store.s.pending, results.map((r) => r.opId));
+    const byId = new Map(batch.map((op) => [op.opId, op]));
+    for (const r of results) {
+      const op = byId.get(r.opId);
+      if (!op) continue;
+      if (r.entryId && r.entryId !== op.entryId) {
+        pending = redirect(pending, op.entryId, r.entryId);
+        if (op.type === "navigate") revive.add(op.entryId);
+      }
+      if (r.status !== "ignored") continue;
+      if (op.type === "close") revive.add(op.entryId);
+      if (op.type === "navigate") {
+        const f = forkEntry(mappings, pending, op.entryId, idGen(deps2), nowDate(deps2), store.s.lastRevision);
+        if (f) ({ mappings, pending } = f);
+      }
+    }
+    await store.set({ pending, mappings });
+  }
+  async function submitJournal(store) {
+    const api = apiFor(store.deps, store.s);
+    const revive = /* @__PURE__ */ new Set();
+    let rejected = 0;
+    for (; ; ) {
+      const batch = batches(toMerge(store.s.pending))[0];
+      if (!batch) break;
+      let res;
+      try {
+        res = await api.merge(batch);
+      } catch (e) {
+        if (!isMalformed(e)) throw e;
+        rejected += await dropBatch(store, batch);
+        continue;
+      }
+      await applyMergeResults(store, batch, res.results, revive);
+      if (batch.every((op) => store.s.pending.some((p) => p.op.opId === op.opId))) break;
+    }
+    return { rejected, revive };
+  }
+
   // src/core/sync.ts
   function rejectedMessage(rejected) {
     return rejected > 0 ? `${rejected} change(s) were rejected by the server and dropped` : null;
@@ -1109,6 +1293,7 @@
   function createFailedMessage(failed) {
     return failed > 0 ? `${failed} tab(s) could not be created` : null;
   }
+  var joined = (...msgs) => msgs.filter(Boolean).join("; ") || null;
   function followingText(owner, deviceId, revision) {
     const who = !owner ? "no owner" : owner.deviceId === deviceId ? "this device" : owner.name;
     return `Following ${who}, revision ${revision}`;
@@ -1119,6 +1304,7 @@
     if (generation === null) throw new Error("This device is not the owner");
     const api = apiFor(deps2, store.s);
     let rejected = 0;
+    let failed = 0;
     for (let first = true; ; first = false) {
       const batch = batches(list(store.s.pending))[0] ?? [];
       if (batch.length === 0 && !first) break;
@@ -1126,14 +1312,8 @@
       try {
         res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
       } catch (e) {
-        if (!(e instanceof ApiError && (e.code === "invalid_request" || e.code === "payload_too_large"))) throw e;
-        const entryIds = new Set(batch.map((op) => op.entryId));
-        const tabIds = Object.entries(store.s.mappings.tabs).filter(([, m]) => entryIds.has(m.entryId)).map(([k]) => Number(k));
-        await store.set({
-          pending: acknowledge(store.s.pending, batch.map((op) => op.opId)),
-          mappings: removeMappings(store.s.mappings, tabIds)
-        });
-        rejected += batch.length;
+        if (!isMalformed(e)) throw e;
+        rejected += await dropBatch(store, batch);
         continue;
       }
       let mappings = applyResults(store.s.mappings, batch, res.results);
@@ -1144,53 +1324,70 @@
         if (op.type !== "navigate") continue;
         if (status.get(op.opId) === "applied") navigated.add(op.entryId);
         if (status.get(op.opId) === "ignored") {
-          const f = forkEntry(mappings, pending, op.entryId, idGen(deps2), nowDate(deps2));
+          const f = forkEntry(mappings, pending, op.entryId, idGen(deps2), nowDate(deps2), store.s.lastRevision);
           if (f) ({ mappings, pending } = f);
         }
       }
       await store.set({ pending, mappings });
+      if (res.fullResync) {
+        failed += await resync(store);
+        rejected += (await submitJournal(store)).rejected;
+        break;
+      }
       await applyRemote(store, res.catchUp?.operations ?? [], navigated);
-      await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), lastSync: nowIso(deps2) });
+      await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), ...succeeded(deps2) });
       if (batch.length > 0 && batch.every((op) => store.s.pending.some((p) => p.op.opId === op.opId))) break;
     }
-    return { rejected };
+    return { rejected, failed };
   }
-  async function fullResync(store) {
+  async function resync(store) {
     const session = await apiFor(store.deps, store.s).session();
     const { failed } = await materialize(store, session.entries, false);
     await store.set({
       lastRevision: session.revision,
+      minRevision: session.minRevision ?? store.s.minRevision,
       owner: session.owner,
-      lastSync: nowIso(store.deps),
-      lastError: createFailedMessage(failed),
-      statusText: followingText(session.owner, store.s.deviceId, session.revision)
+      ...succeeded(store.deps)
     });
+    return failed;
   }
   async function followerRun(store) {
-    if (store.s.lastRevision === 0) return fullResync(store);
-    let res;
-    try {
-      res = await apiFor(store.deps, store.s).changes(store.s.lastRevision);
-    } catch (e) {
-      if (e instanceof ApiError && e.code === "history_expired") return fullResync(store);
-      throw e;
+    const sent = await submitJournal(store);
+    let failed = 0;
+    if (store.s.lastRevision === 0) {
+      failed = await resync(store);
+    } else {
+      let res;
+      try {
+        res = await apiFor(store.deps, store.s).changes(store.s.lastRevision);
+      } catch (e) {
+        if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
+      }
+      if (res) {
+        await applyRemote(store, res.operations, /* @__PURE__ */ new Set(), sent.revive);
+        await store.set({
+          lastRevision: Math.max(store.s.lastRevision, res.revision),
+          minRevision: res.minRevision ?? store.s.minRevision,
+          owner: res.owner
+        });
+      } else {
+        failed = await resync(store);
+      }
     }
-    await applyRemote(store, res.operations);
-    const revision = Math.max(store.s.lastRevision, res.revision);
+    const again = store.s.pending.length > 0 ? await submitJournal(store) : { rejected: 0 };
     await store.set({
-      lastRevision: revision,
-      owner: res.owner,
-      lastSync: nowIso(store.deps),
-      lastError: null,
-      statusText: followingText(res.owner, store.s.deviceId, revision)
+      ...succeeded(store.deps),
+      lastError: joined(createFailedMessage(failed), rejectedMessage(sent.rejected + again.rejected)),
+      statusText: followingText(store.s.owner, store.s.deviceId, store.s.lastRevision)
     });
   }
   async function ownerRun(store) {
     const generation = store.s.generation;
     try {
-      const { rejected } = await flush(store);
+      const { rejected, failed } = await flush(store);
       await store.set({
-        lastError: rejectedMessage(rejected),
+        ...succeeded(store.deps),
+        lastError: joined(createFailedMessage(failed), rejectedMessage(rejected)),
         statusText: `Owner, generation ${generation}, revision ${store.s.lastRevision}`
       });
     } catch (e) {
@@ -1219,13 +1416,13 @@
       const generation = store.s.generation;
       if (generation === null) throw new Error("This device is not the owner. Use Continue here to take control first.");
       await materialize(store, null, true);
-      const { rejected } = await flush(store);
+      const { rejected, failed } = await flush(store);
       await apiFor(deps2, store.s).release(generation);
       await store.set({
         generation: null,
         owner: null,
-        lastSync: nowIso(deps2),
-        lastError: rejectedMessage(rejected),
+        ...succeeded(deps2),
+        lastError: [createFailedMessage(failed), rejectedMessage(rejected)].filter(Boolean).join("; ") || null,
         statusText: `Handed over at revision ${store.s.lastRevision}`,
         suppressAutoTakeover: true,
         lastActivityAt: nowMs(deps2),
@@ -1246,7 +1443,11 @@
         try {
           const res = await api.changes(store.s.lastRevision);
           await applyRemote(store, res.operations);
-          await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), owner: res.owner });
+          await store.set({
+            lastRevision: Math.max(store.s.lastRevision, res.revision),
+            minRevision: res.minRevision ?? store.s.minRevision,
+            owner: res.owner
+          });
         } catch (e) {
           if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
         }
@@ -1261,13 +1462,13 @@
           lastSeenAt: nowIso(deps2)
         },
         lastRevision: session.revision,
-        lastSync: nowIso(deps2)
+        minRevision: session.minRevision ?? store.s.minRevision
       });
       const { failed } = await materialize(store, session.entries, true);
-      const { rejected } = await flush(store);
-      const errors = [failed > 0 ? `${failed} tab(s) could not be created` : null, rejectedMessage(rejected)];
+      const flushed = await flush(store);
+      const errors = [createFailedMessage(failed + flushed.failed), rejectedMessage(flushed.rejected)];
       await store.set({
-        lastSync: nowIso(deps2),
+        ...succeeded(deps2),
         lastError: errors.filter(Boolean).join("; ") || null,
         statusText: `Owner, generation ${generation}, revision ${store.s.lastRevision}`
       });
@@ -1293,7 +1494,7 @@
         deviceId: res.deviceId,
         token: res.token,
         mappings: emptyMappings(),
-        lastSync: nowIso(deps2),
+        ...succeeded(deps2),
         lastError: null,
         statusText: "Paired. This browser follows the shared tabs and takes over when you use it."
       });
@@ -1326,7 +1527,7 @@
       if (store.s.generation !== null) await api.release(store.s.generation).catch(() => void 0);
       if (store.s.deviceId) await api.deleteDevice(store.s.deviceId).catch(() => void 0);
     }
-    await store.set({ ...clearedCredentials(), lastError: null, lastSync: null, statusText: "Disconnected" });
+    await store.set({ ...clearedCredentials(), lastError: null, lastSuccessAt: null, statusText: "Disconnected" });
     return store.s;
   }
   async function refreshOwner(deps2) {
@@ -1334,20 +1535,22 @@
     if (!isPaired(store.s)) return false;
     const api = apiFor(deps2, store.s);
     let owner;
+    let minRevision;
     try {
       try {
-        owner = (await api.changes(store.s.lastRevision)).owner;
+        ({ owner, minRevision } = await api.changes(store.s.lastRevision));
       } catch (e) {
         if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
-        owner = (await api.session()).owner;
+        ({ owner, minRevision } = await api.session());
       }
     } catch (e) {
       if (e instanceof ApiError && e.code === "device_revoked") await fail(store, e).catch(() => void 0);
       return false;
     }
     const lostOwnership = store.s.generation !== null && (!owner || owner.deviceId !== store.s.deviceId || owner.generation !== store.s.generation);
+    const known = { owner, minRevision: minRevision ?? store.s.minRevision };
     await store.set(
-      lostOwnership ? { owner, generation: null, freshPending: true, statusText: `Not the owner: ${ownerLabel(owner)} took over.` } : { owner }
+      lostOwnership ? { ...known, generation: null, freshPending: true, statusText: `Not the owner: ${ownerLabel(owner)} took over.` } : known
     );
     return true;
   }
@@ -1372,6 +1575,12 @@
       startupAt: nowMs(deps2)
     });
   }
+  async function rematchTabs(deps2) {
+    const store = await Store.open(deps2);
+    if (!isPaired(store.s)) return;
+    const { all, eligible } = await captureTabs(deps2.adapter);
+    await currentMappings(store, all, eligible);
+  }
 
   // src/core/lock.ts
   var BusyError = class extends Error {
@@ -1391,9 +1600,67 @@
     }
   }
 
+  // src/core/recovery.ts
+  async function read(deps2, fn) {
+    const store = await Store.open(deps2);
+    requirePaired(store.s);
+    try {
+      return await fn(store);
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "device_revoked") return fail(store, e);
+      const kind = classify(e, true);
+      throw kind ? new Error(errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0)) : e;
+    }
+  }
+  function listSnapshots(deps2) {
+    return read(deps2, (store) => apiFor(deps2, store.s).snapshots());
+  }
+  function listDevices(deps2) {
+    return read(deps2, (store) => apiFor(deps2, store.s).devices());
+  }
+  async function revokeDevice(deps2, deviceId) {
+    const store = await Store.open(deps2);
+    requirePaired(store.s);
+    if (deviceId === store.s.deviceId) throw new Error("Use Disconnect to remove this device");
+    try {
+      await apiFor(deps2, store.s).deleteDevice(deviceId);
+      if (store.s.owner?.deviceId === deviceId) await store.set({ owner: null });
+      return store.s;
+    } catch (e) {
+      return fail(store, e);
+    }
+  }
+  async function restoreSnapshot(deps2, snapshotId) {
+    let store = await Store.open(deps2);
+    requirePaired(store.s);
+    const tookOver = store.s.generation === null;
+    if (tookOver) {
+      await continueHere(deps2);
+      store = await Store.open(deps2);
+    }
+    const generation = store.s.generation;
+    let flushed = { rejected: 0, failed: 0 };
+    try {
+      if (generation === null || !isPaired(store.s)) throw new Error("This device is not the owner");
+      if (!tookOver) flushed = await flush(store);
+      const res = await apiFor(deps2, store.s).restoreSnapshot(snapshotId, generation);
+      const failed = await resync(store);
+      const reopened = res.results.filter((r) => r.status === "applied").length;
+      await store.set({
+        lastError: [createFailedMessage(failed + flushed.failed), rejectedMessage(flushed.rejected)].filter(Boolean).join("; ") || null,
+        statusText: `Restored ${reopened} tab(s). Owner, generation ${generation}, revision ${store.s.lastRevision}`
+      });
+      return store.s;
+    } catch (e) {
+      return fail(store, e, generation);
+    }
+  }
+
   // src/core/engine.ts
   var SYNC_DEBOUNCE_MS = 2e3;
   var SESSION_MARKER = "cts.browserSession";
+  var PAUSED_MESSAGE = "Sync is paused. Resume to sync again.";
+  var BACKED_OFF = /* @__PURE__ */ new Set(["sync", "alarm"]);
   var timeoutScheduler = (fn, ms) => {
     const h = setTimeout(fn, ms);
     return () => clearTimeout(h);
@@ -1406,16 +1673,20 @@
     return { patch: o.patch, ops: o.ops.length, activity: o.activity };
   }
   var SyncEngine = class {
-    constructor(deps2, schedule = timeoutScheduler) {
+    /** `retrySchedule` runs the backoff retries (separate so tests can fire them on their own). */
+    constructor(deps2, schedule = timeoutScheduler, retrySchedule = schedule) {
       this.deps = deps2;
       this.schedule = schedule;
+      this.retrySchedule = retrySchedule;
     }
     deps;
     schedule;
+    retrySchedule;
     chain = Promise.resolve();
     depth = 0;
     cancelTimer = null;
     cancelRelease = null;
+    cancelRetry = null;
     /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
     attach() {
       const a = this.deps.adapter;
@@ -1458,11 +1729,18 @@
     async idle() {
       while (this.depth > 0) await this.chain;
     }
-    /** Queued run under the persisted run lock; a run that finds the lock held exits (BusyError). */
+    /**
+     * Queued run under the persisted run lock; a run that finds the lock held exits (BusyError).
+     * Afterwards the retry timer is armed for `nextRetryAt` (set by a failure) or cancelled.
+     */
     locked(action, fn) {
       return this.enqueue(async () => {
         await this.ensureSession();
-        return withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps));
+        try {
+          return await withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps));
+        } finally {
+          await this.scheduleRetry().catch(ignore);
+        }
       });
     }
     /**
@@ -1477,15 +1755,26 @@
         if (force) await resetForBrowserStartup(this.deps);
         return;
       }
-      if ((await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== void 0) return;
+      if (force !== "always" && (await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== void 0) return;
       await resetForBrowserStartup(this.deps);
       await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
     }
-    /** Owner or follower run now (alarm, Sync now, debounced local changes). */
+    /**
+     * Owner or follower run now (alarm, Sync now, debounced local changes, retry). Paused: nothing
+     * runs (Sync now reports it). Automatic runs before `nextRetryAt` wait for the retry timer.
+     */
     runNow(action = "sync") {
       this.cancelTimer?.();
       this.cancelTimer = null;
-      return this.locked(action, () => syncRun(this.deps));
+      return this.locked(action, async () => {
+        const s = await loadState(this.deps.adapter.storage);
+        if (s.paused) {
+          if (action === "syncNow") throw new Error(PAUSED_MESSAGE);
+          return s;
+        }
+        if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) return s;
+        return syncRun(this.deps);
+      });
     }
     /** Debounced run: the first request schedules it, later ones ride along. */
     requestSync() {
@@ -1495,9 +1784,17 @@
         void this.runNow().catch(ignore);
       }, SYNC_DEBOUNCE_MS);
     }
-    /** Continue here (manual or automatic). A failed attempt keeps the interaction fresh for a retry. */
+    /**
+     * Continue here (manual, and automatic `takeover`). A failed attempt keeps the interaction fresh
+     * for a retry. Paused: automatic takeover is skipped, manual Continue here is refused.
+     */
     takeover(action = "takeover") {
       return this.locked(action, async () => {
+        const s = await loadState(this.deps.adapter.storage);
+        if (s.paused) {
+          if (action === "takeover") return s;
+          throw new Error(PAUSED_MESSAGE);
+        }
         try {
           return await continueHere(this.deps);
         } catch (e) {
@@ -1507,34 +1804,88 @@
       });
     }
     handOver() {
-      return this.locked("handOver", () => handOver(this.deps));
+      return this.locked("handOver", async () => {
+        if ((await loadState(this.deps.adapter.storage)).paused) throw new Error(PAUSED_MESSAGE);
+        return handOver(this.deps);
+      });
     }
-    /** Browser startup: set mappings aside (unless already done), start the grace period, catch up shortly after. */
-    async startup() {
-      await this.enqueue(() => this.ensureSession(true));
+    /** Restore a server snapshot (taking over first when not owner), then materialize it. */
+    restore(snapshotId) {
+      return this.locked("restore", async () => {
+        if ((await loadState(this.deps.adapter.storage)).paused) throw new Error(PAUSED_MESSAGE);
+        return restoreSnapshot(this.deps, snapshotId);
+      });
+    }
+    /** Pause: no runs and no automatic takeover; local changes are still journaled. */
+    async pause() {
+      this.cancelTimer?.();
+      this.cancelTimer = null;
+      this.cancelRetry?.();
+      this.cancelRetry = null;
+      return this.enqueue(async () => {
+        const storage = this.deps.adapter.storage;
+        await saveState(storage, { paused: true, statusText: "Paused. Local changes are kept and sent when you resume." });
+        return loadState(storage);
+      });
+    }
+    /**
+     * Resume: release held closes first (those whose windows are gone are dropped, never sent; a
+     * tab that is merely absent is only unmapped by the run), then run in the current role.
+     */
+    async unpause() {
+      await this.enqueue(() => saveState(this.deps.adapter.storage, { paused: false, statusText: null }));
+      await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)));
+      return this.runNow("resume");
+    }
+    /**
+     * Browser startup (`browser`): set mappings aside unless already done for this session, start
+     * the grace period, catch up shortly after. Extension update (`update`): the same reset always.
+     */
+    async startup(reason = "browser") {
+      await this.enqueue(async () => {
+        await this.ensureSession(reason === "update" ? "always" : true);
+        if (reason === "update") await rematchTabs(this.deps);
+      });
       this.requestSync();
     }
-    /** Worker (re)start: send what an earlier worker journaled, release closes it held. */
+    /** Worker (re)start: send what an earlier worker journaled, release closes it held, rearm the retry. */
     async resume() {
       const s = await this.enqueue(async () => {
         await this.ensureSession();
         return loadState(this.deps.adapter.storage);
       });
-      if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
       if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease();
+      if (s.paused) return;
+      if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
+      await this.scheduleRetry();
+    }
+    /** Arm the retry timer for the persisted `nextRetryAt`, or cancel it (success, paused, unpaired). */
+    async scheduleRetry() {
+      const s = await loadState(this.deps.adapter.storage);
+      this.cancelRetry?.();
+      this.cancelRetry = null;
+      if (!isPaired(s) || s.paused || s.nextRetryAt === null) return;
+      this.cancelRetry = this.retrySchedule(
+        () => {
+          this.cancelRetry = null;
+          void this.runNow("retry").catch(ignore);
+        },
+        Math.max(0, s.nextRetryAt - nowMs(this.deps))
+      );
     }
     /** Release held closes once CLOSE_HOLD_MS has passed (see changes.releaseHeld). */
     scheduleRelease() {
       if (this.cancelRelease) return;
       this.cancelRelease = this.schedule(() => {
         this.cancelRelease = null;
-        this.event(async (s, ctx) => {
-          const alive = new Set((await this.deps.adapter.getWindows()).map((w) => w.id));
-          const out = releaseHeld(s, alive, ctx);
-          if (out.waiting) this.scheduleRelease();
-          return outcome(out);
-        });
+        this.event((s, ctx) => this.release(s, ctx));
       }, CLOSE_HOLD_MS);
+    }
+    async release(s, ctx) {
+      const alive = new Set((await this.deps.adapter.getWindows()).map((w) => w.id));
+      const out = releaseHeld(s, alive, ctx);
+      if (out.waiting) this.scheduleRelease();
+      return outcome(out);
     }
     event(step) {
       void this.enqueue(() => this.process(step)).catch(ignore);
@@ -1548,9 +1899,10 @@
       const now = nowMs(this.deps);
       const out = await step(s, { now, newId: idGen(this.deps) });
       const isOwner = s.generation !== null;
-      const decision = out.activity ? onActivity(s, { now, isOwner }) : null;
+      const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner }) : null;
       await saveState(storage, { ...out.patch, ...decision?.patch });
       if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
+      if (s.paused) return;
       if (decision?.takeover) void this.takeover().catch(ignore);
       else if (isOwner && (out.ops > 0 || decision?.fresh)) this.requestSync();
     }
@@ -1572,6 +1924,7 @@
 
   // src/core/messages.ts
   function statusView(s, now = Date.now()) {
+    const pendingCount = s.pending.length;
     return {
       paired: isPaired(s),
       serverUrl: s.serverUrl,
@@ -1581,9 +1934,15 @@
       isOwner: s.generation !== null,
       generation: s.generation,
       lastRevision: s.lastRevision,
-      lastSync: s.lastSync,
-      pendingCount: s.pending.length,
+      minRevision: s.minRevision,
+      lastSuccessAt: s.lastSuccessAt,
+      pendingCount,
+      online: s.online,
+      nextRetryAt: s.nextRetryAt,
+      paused: s.paused,
+      summary: syncSummary({ ...s, pendingCount }),
       lastError: s.lastError,
+      errorKind: s.errorKind,
       statusText: s.statusText,
       running: isLocked(s, now)
     };
@@ -1620,8 +1979,9 @@
   }
   void adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
   void engine.enqueue(() => saveState(adapter.storage, { runLock: null })).then(() => engine.resume());
-  chrome.runtime.onInstalled.addListener(() => {
+  chrome.runtime.onInstalled.addListener((details) => {
     void setup();
+    if (details.reason === "update") void engine.startup("update").catch(() => void 0);
   });
   engine.attach();
   adapter.onStartup(() => void setup());
@@ -1636,6 +1996,8 @@
   async function handle(req) {
     let pairingCode;
     let reachable;
+    let snapshots;
+    let devices;
     switch (req.type) {
       case "getStatus":
         if (req.refresh && !engine.busy) reachable = await engine.enqueue(() => refreshOwner(deps));
@@ -1652,6 +2014,24 @@
       case "syncNow":
         await engine.runNow("syncNow");
         break;
+      case "pause":
+        await engine.pause();
+        break;
+      case "resume":
+        await engine.unpause();
+        break;
+      case "listSnapshots":
+        snapshots = await listSnapshots(deps);
+        break;
+      case "restoreSnapshot":
+        await engine.restore(req.id);
+        break;
+      case "listDevices":
+        devices = await listDevices(deps);
+        break;
+      case "revokeDevice":
+        await engine.enqueue(() => revokeDevice(deps, req.id));
+        break;
       case "createPairingCode":
         pairingCode = await createPairingCode(deps);
         break;
@@ -1663,7 +2043,7 @@
     }
     const status = statusView(await loadState(adapter.storage));
     if (reachable !== void 0) status.reachable = reachable;
-    return pairingCode ? { ok: true, status, pairingCode } : { ok: true, status };
+    return { ok: true, status, pairingCode, snapshots, devices };
   }
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (sender.id !== chrome.runtime.id) return false;

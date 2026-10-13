@@ -149,7 +149,8 @@ describe("Continue here", () => {
     await expect(continueHere(mac.deps)).rejects.toMatchObject({ code: "network_error" });
 
     const after = await mac.state();
-    expect(after.lastError).toBe("Server is unreachable");
+    expect(after.lastError).toMatch(/^Cannot reach https:\/\/sync\.example\./);
+    expect(after).toMatchObject({ online: false, errorKind: "unreachable", retryAttempts: 1 });
     expect(after.generation).toBeNull();
     expect(after.mappings).toEqual(before.mappings);
     expect(after.pending).toEqual([]);

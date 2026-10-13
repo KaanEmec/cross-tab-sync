@@ -24,8 +24,10 @@ export interface State {
   staleMappings: Mappings | null;
   pending: Journal;
   /** ISO timestamp of the last successful exchange with the server. */
-  lastSync: string | null;
+  lastSuccessAt: string | null;
   lastError: string | null;
+  /** Class of the last error, for actionable status (null after a success). */
+  errorKind: ErrorKind | null;
   /** Human-readable outcome of the last action, e.g. "Handed over at revision 12". */
   statusText: string | null;
   /** Normal window that receives tabs created by Continue here. */
@@ -62,7 +64,24 @@ export interface State {
   heldCloses: HeldClose[];
   /** Recently removed windows (windows.onRemoved), window id -> epoch ms. */
   removedWindows: Record<string, number>;
+
+  // v1.0 offline work, status and controls.
+  /** False after a network error or 5xx until the next successful exchange. */
+  online: boolean;
+  /** `pending.length`, written with every journal change (saveState) for status readers. */
+  pendingCount: number;
+  /** Epoch ms of the next automatic retry after a failure (bounded exponential backoff). */
+  nextRetryAt: number | null;
+  /** Consecutive failed attempts behind `nextRetryAt`. */
+  retryAttempts: number;
+  /** No runs and no automatic takeover; local changes are still journaled. */
+  paused: boolean;
+  /** Oldest revision the server still has history for (from `GET session` / `changes`). */
+  minRevision: number | null;
 }
+
+/** Error classes the popup explains with an action (see status.ts). */
+export type ErrorKind = "unauthorized" | "device_revoked" | "permission" | "unreachable" | "server";
 
 export interface PendingPair {
   serverUrl: string;
@@ -86,7 +105,7 @@ export function defaultState(): State {
     mappings: emptyMappings(),
     staleMappings: null,
     pending: [],
-    lastSync: null,
+    lastSuccessAt: null,
     lastError: null,
     statusText: null,
     receivingWindowId: null,
@@ -101,6 +120,13 @@ export function defaultState(): State {
     freshPending: false,
     heldCloses: [],
     removedWindows: {},
+    errorKind: null,
+    online: true,
+    pendingCount: 0,
+    nextRetryAt: null,
+    retryAttempts: 0,
+    paused: false,
+    minRevision: null,
   };
 }
 
@@ -122,6 +148,7 @@ export async function saveState(storage: KeyValueStorage, patch: Partial<State>)
   for (const [k, v] of Object.entries(patch)) {
     if (v !== undefined) items[PREFIX + k] = v;
   }
+  if (patch.pending) items[PREFIX + "pendingCount"] = patch.pending.length;
   if (Object.keys(items).length > 0) await storage.set(items);
 }
 
@@ -147,6 +174,12 @@ export function clearedCredentials(): Partial<State> {
     freshPending: false,
     heldCloses: [],
     removedWindows: {},
+    online: true,
+    nextRetryAt: null,
+    retryAttempts: 0,
+    paused: false,
+    minRevision: null,
+    errorKind: null,
   };
 }
 

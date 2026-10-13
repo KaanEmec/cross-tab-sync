@@ -2,13 +2,13 @@
 // lifecycle actions. Written against BrowserAdapter and a client factory so it runs unchanged
 // against fakes. Hand over and Continue here reuse the v0.2 sync run (sync.ts).
 
-import { applyRemote } from "./apply.js";
+import { applyRemote, captureTabs, currentMappings } from "./apply.js";
 import { materialize } from "./materialize.js";
 import { ApiError, normalizeServerUrl, type Owner } from "./client.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
-import { apiFor, fail, nowIso, nowMs, ownerLabel, requirePaired, Store, type Deps } from "./store.js";
-import { flush, rejectedMessage } from "./sync.js";
+import { apiFor, fail, nowIso, nowMs, ownerLabel, requirePaired, Store, succeeded, type Deps } from "./store.js";
+import { createFailedMessage, flush, rejectedMessage } from "./sync.js";
 
 export type { Api, Deps } from "./store.js";
 export { applyResults, resolveReceivingWindow } from "./apply.js";
@@ -26,14 +26,14 @@ export async function handOver(deps: Deps): Promise<State> {
 
     // Journal before sending: a crash or network error leaves ops to be replayed with the same ids.
     await materialize(store, null, true);
-    const { rejected } = await flush(store);
+    const { rejected, failed } = await flush(store);
 
     await apiFor(deps, store.s).release(generation);
     await store.set({
       generation: null,
       owner: null,
-      lastSync: nowIso(deps),
-      lastError: rejectedMessage(rejected),
+      ...succeeded(deps),
+      lastError: [createFailedMessage(failed), rejectedMessage(rejected)].filter(Boolean).join("; ") || null,
       statusText: `Handed over at revision ${store.s.lastRevision}`,
       suppressAutoTakeover: true,
       lastActivityAt: nowMs(deps),
@@ -61,7 +61,11 @@ export async function continueHere(deps: Deps): Promise<State> {
       try {
         const res = await api.changes(store.s.lastRevision);
         await applyRemote(store, res.operations);
-        await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), owner: res.owner });
+        await store.set({
+          lastRevision: Math.max(store.s.lastRevision, res.revision),
+          minRevision: res.minRevision ?? store.s.minRevision,
+          owner: res.owner,
+        });
       } catch (e) {
         // History expired: the session snapshot below is the full-resync path.
         if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
@@ -78,15 +82,15 @@ export async function continueHere(deps: Deps): Promise<State> {
         lastSeenAt: nowIso(deps),
       },
       lastRevision: session.revision,
-      lastSync: nowIso(deps),
+      minRevision: session.minRevision ?? store.s.minRevision,
     });
 
     const { failed } = await materialize(store, session.entries, true);
-    const { rejected } = await flush(store);
+    const flushed = await flush(store);
 
-    const errors = [failed > 0 ? `${failed} tab(s) could not be created` : null, rejectedMessage(rejected)];
+    const errors = [createFailedMessage(failed + flushed.failed), rejectedMessage(flushed.rejected)];
     await store.set({
-      lastSync: nowIso(deps),
+      ...succeeded(deps),
       lastError: errors.filter(Boolean).join("; ") || null,
       statusText: `Owner, generation ${generation}, revision ${store.s.lastRevision}`,
     });
@@ -116,7 +120,7 @@ export async function pair(
       deviceId: res.deviceId,
       token: res.token,
       mappings: emptyMappings(),
-      lastSync: nowIso(deps),
+      ...succeeded(deps),
       lastError: null,
       statusText: "Paired. This browser follows the shared tabs and takes over when you use it.",
     });
@@ -157,7 +161,7 @@ export async function disconnect(deps: Deps): Promise<State> {
     if (store.s.generation !== null) await api.release(store.s.generation).catch(() => undefined);
     if (store.s.deviceId) await api.deleteDevice(store.s.deviceId).catch(() => undefined);
   }
-  await store.set({ ...clearedCredentials(), lastError: null, lastSync: null, statusText: "Disconnected" });
+  await store.set({ ...clearedCredentials(), lastError: null, lastSuccessAt: null, statusText: "Disconnected" });
   return store.s;
 }
 
@@ -167,12 +171,13 @@ export async function refreshOwner(deps: Deps): Promise<boolean> {
   if (!isPaired(store.s)) return false;
   const api = apiFor(deps, store.s);
   let owner: Owner | null;
+  let minRevision: number | undefined;
   try {
     try {
-      owner = (await api.changes(store.s.lastRevision)).owner;
+      ({ owner, minRevision } = await api.changes(store.s.lastRevision));
     } catch (e) {
       if (!(e instanceof ApiError && e.code === "history_expired")) throw e;
-      owner = (await api.session()).owner;
+      ({ owner, minRevision } = await api.session());
     }
   } catch (e) {
     if (e instanceof ApiError && e.code === "device_revoked") await fail(store, e).catch(() => undefined);
@@ -180,10 +185,11 @@ export async function refreshOwner(deps: Deps): Promise<boolean> {
   }
   const lostOwnership =
     store.s.generation !== null && (!owner || owner.deviceId !== store.s.deviceId || owner.generation !== store.s.generation);
+  const known = { owner, minRevision: minRevision ?? store.s.minRevision };
   await store.set(
     lostOwnership
-      ? { owner, generation: null, freshPending: true, statusText: `Not the owner: ${ownerLabel(owner)} took over.` }
-      : { owner },
+      ? { ...known, generation: null, freshPending: true, statusText: `Not the owner: ${ownerLabel(owner)} took over.` }
+      : known,
   );
   return true;
 }
@@ -213,4 +219,12 @@ export async function resetForBrowserStartup(deps: Deps): Promise<void> {
     runLock: null,
     startupAt: nowMs(deps),
   });
+}
+
+/** Re-match mappings set aside by the startup reset to the current tabs by URL. */
+export async function rematchTabs(deps: Deps): Promise<void> {
+  const store = await Store.open(deps);
+  if (!isPaired(store.s)) return;
+  const { all, eligible } = await captureTabs(deps.adapter);
+  await currentMappings(store, all, eligible);
 }

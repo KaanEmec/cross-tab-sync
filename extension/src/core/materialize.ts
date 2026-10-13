@@ -28,13 +28,14 @@ export async function materialize(
   let pending = store.s.pending;
   const newId = idGen(store.deps);
   const now = nowDate(store.deps);
+  const baseRevision = store.s.lastRevision;
   const sessionIds = entries ? new Set(entries.map((e) => e.id)) : null;
 
   // Entries closed elsewhere while this device navigated them: keep the local page as an opening.
   if (sessionIds) {
     for (const entryId of new Set(Object.values(before.tabs).map((m) => m.entryId))) {
       if (sessionIds.has(entryId) || !pendingChanges(pending, entryId).some((p) => p.op.type === "navigate")) continue;
-      const f = forkEntry(before, pending, entryId, newId, now);
+      const f = forkEntry(before, pending, entryId, newId, now, baseRevision);
       if (f) ({ mappings: before, pending } = f);
     }
   }
@@ -73,7 +74,7 @@ export async function materialize(
     mappings = removeMappings(mappings, keys.map(Number));
     for (const k of keys) if (orphan(k)) detached[k] = op.url;
   }
-  pending = append(pending, open, now);
+  pending = append(pending, open, now, { baseRevision });
 
   // Mapped copies whose entry URL differs from what this device last agreed with the server.
   const create = [...p.create];
@@ -89,7 +90,7 @@ export async function materialize(
     }
     const base = pendingBase(pending, entry.id);
     if (base === undefined || base === entry.url) continue; // our own unsent change: the flush applies it
-    const f = forkEntry(mappings, pending, entry.id, newId, now);
+    const f = forkEntry(mappings, pending, entry.id, newId, now, baseRevision);
     if (!f) continue;
     ({ mappings, pending } = f);
     const local = eligible.find((t) => t.url === entry.url && !mappings.tabs[String(t.id)]);

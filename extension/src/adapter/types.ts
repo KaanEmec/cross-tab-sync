@@ -44,6 +44,8 @@ export interface BrowserAdapter {
   /** Never activates the tab. */
   updateTab(tabId: number, props: { url?: string; pinned?: boolean }): Promise<void>;
   removeTab(tabId: number): Promise<void>;
+  /** Whether the extension holds host permission for `pattern` (`https://host/*`). Optional. */
+  hasHostPermission?(pattern: string): Promise<boolean>;
 
   /** Create the periodic alarm unless it already exists (Safari does not persist alarms). */
   ensureAlarm(name: string, periodInMinutes: number): Promise<void>;

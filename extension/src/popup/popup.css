@@ -112,3 +112,13 @@ footer {
 
 .error { margin: 10px 0 0; color: var(--danger); }
 [hidden] { display: none !important; }
+
+details { margin-bottom: 12px; border-top: 1px solid var(--line); padding-top: 8px; }
+summary { cursor: pointer; font-weight: 600; }
+.list { list-style: none; margin: 6px 0 0; padding: 0; }
+.list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; }
+.list li span { overflow-wrap: anywhere; }
+.list li small { color: var(--muted); display: block; }
+.list button { padding: 3px 8px; font-size: 12px; flex-shrink: 0; }
+.list .empty { color: var(--muted); }
+button.danger:not(.link) { color: var(--danger); }

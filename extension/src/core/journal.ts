@@ -1,4 +1,4 @@
-import type { Operation } from "./client.js";
+import type { MergeOperation, Operation } from "./client.js";
 
 /**
  * Pending operation journal. Operations are written here before they are sent and removed only
@@ -10,6 +10,11 @@ export interface PendingOp {
   queuedAt: string;
   /** For `navigate`: the entry's server URL before this change (detects divergent remote navigation). */
   base?: string;
+  /**
+   * The device's `lastRevision` when the change was recorded: the causal base `merge` checks it
+   * against. Missing in journals written before v1.0 (sent as 0: treated conservatively).
+   */
+  baseRevision?: number;
 }
 
 export type Journal = PendingOp[];
@@ -22,12 +27,18 @@ export function append(
   journal: Journal,
   ops: Operation[],
   now: Date = new Date(),
-  bases: Record<string, string> = {},
+  meta: { bases?: Record<string, string>; baseRevision?: number } = {},
 ): Journal {
   const known = new Set(journal.map((p) => p.op.opId));
   const added = ops
     .filter((op) => !known.has(op.opId))
-    .map((op): PendingOp => (bases[op.opId] ? { op, queuedAt: now.toISOString(), base: bases[op.opId] } : { op, queuedAt: now.toISOString() }));
+    .map((op): PendingOp => {
+      const p: PendingOp = { op, queuedAt: now.toISOString() };
+      const base = meta.bases?.[op.opId];
+      if (base) p.base = base;
+      if (meta.baseRevision !== undefined) p.baseRevision = meta.baseRevision;
+      return p;
+    });
   return [...journal, ...added];
 }
 
@@ -45,6 +56,20 @@ export function list(journal: Journal): Operation[] {
   return journal.map((p) => p.op);
 }
 
+/** The journal as `merge` operations, each with its own causal base. */
+export function toMerge(journal: Journal): MergeOperation[] {
+  return journal.map((p) => ({ ...p.op, baseRevision: p.baseRevision ?? 0 }));
+}
+
+/**
+ * Point pending operations for entry `from` at `to` (the server forked or coalesced it). The
+ * server redirects within one batch only; later batches carry the new id from the journal.
+ */
+export function redirect(journal: Journal, from: string, to: string): Journal {
+  if (from === to || !journal.some((p) => p.op.entryId === from)) return journal;
+  return journal.map((p) => (p.op.entryId === from ? { ...p, op: { ...p.op, entryId: to } } : p));
+}
+
 /** Entry ids that have a pending `open` (the entry may not exist on the server yet). */
 export function pendingEntryIds(journal: Journal): Set<string> {
   return new Set(journal.filter((p) => p.op.type === "open").map((p) => p.op.entryId));
@@ -57,9 +82,9 @@ export const MAX_BATCH_BYTES = 60 * 1024;
 const encoder = new TextEncoder();
 
 /** Split operations into batches within the server limits, preserving order. */
-export function batches(ops: Operation[], maxOps = MAX_BATCH_OPS, maxBytes = MAX_BATCH_BYTES): Operation[][] {
-  const out: Operation[][] = [];
-  let current: Operation[] = [];
+export function batches<T extends Operation>(ops: T[], maxOps = MAX_BATCH_OPS, maxBytes = MAX_BATCH_BYTES): T[][] {
+  const out: T[][] = [];
+  let current: T[] = [];
   let bytes = 0;
   for (const op of ops) {
     const size = encoder.encode(JSON.stringify(op)).length + 1;
