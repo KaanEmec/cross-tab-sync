@@ -113,7 +113,7 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 
 ### Roles and cadence
 
-- A 5-minute `alarms` cycle runs on every device, plus an immediate run after takeover, manual actions, and local changes (debounced by about 2 s).
+- A 5-minute `alarms` cycle runs on every device, plus an immediate run after takeover and manual actions. The owner also runs about 2 s after a local change; followers only journal.
 - **Owner run**: flush the journal with `POST operations` (empty batch if nothing pending), apply `catchUp`, advance `lastRevision`. `409 stale_owner` drops owner state, keeps the journal, and the device continues as a follower.
 - **Follower run**: `GET changes?since=lastRevision`, apply, advance. `410 history_expired` triggers a full resync from `GET session` (reconcile mappings by URL, create missing tabs, never close).
 - A persisted run lock makes runs exclusive; a run that finds the lock held exits.
@@ -139,7 +139,14 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 - **Activity signals**: `tabs.onActivated`, `windows.onFocusChanged` to a real window, user-created tabs, and user navigation. Signals in the first 10 s after startup and signals caused by remote application are not activity. Heartbeats are never activity.
 - **Fresh interaction**: a signal after at least 60 s without signals, or the first signal after this device lost ownership. A browser that merely stays focused produces none.
 - **Takeover**: on a fresh interaction while not owner, run Continue here (`acquire {force:true}`, reconcile, flush the journal). At most one attempt per 30 s.
-- **Manual Hand over** suppresses automatic takeover until the next fresh interaction.
+- **Manual Hand over** counts as the latest interaction and suppresses the "ownership lost" rule; only 60 s of quiet followed by a signal takes over again.
+- A fresh interaction inside the 30 s rate limit, or a failed takeover, stays pending and fires on the next signal after the limit.
+- Navigation counts as activity only in the active tab; every user-created tab counts.
+- A freshly paired device (revision 0) rebuilds from the full session instead of replaying history.
+- Changes to a tab in the 30 s after the extension created or navigated it, until its load completes, are treated as the extension's own (redirects); user navigation in that window is not published.
+- Tabs mapped to entries that are no longer in the session are detached, not republished. Continue here never recreates entries this device has a pending `close` for.
+- Previous-session mappings and the detached set survive a restart for 60 s so late-restored tabs still match.
+- Local pin changes are not published in v0.2.
 - The superseded owner learns of the change from `409 stale_owner` on its next run, keeps its journal, and follows. Its pending work is published when it next takes over. The cadence bounds the window in which the prior owner's unpublished changes are invisible to the new owner.
 
 ## Privacy
