@@ -142,7 +142,7 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 
 - A 5-minute `alarms` cycle runs on every device, plus an immediate run after takeover and manual actions. The owner also runs about 2 s after a local change; followers only journal.
 - **Owner run**: flush the journal with `POST operations` (empty batch if nothing pending), apply `catchUp`, advance `lastRevision`. `409 stale_owner` drops owner state, keeps the journal, and the device continues as a follower.
-- **Follower run**: submit the pending journal through `merge` (v1.0; in v0.2 followers hold it), then `GET changes?since=lastRevision`, apply, advance. `410 history_expired` triggers a full resync from `GET session` (reconcile mappings by URL, create missing tabs, never close).
+- **Follower run**: submit the pending journal through `merge` (v1.0), then `GET changes?since=lastRevision`, apply, advance, and merge again anything the pull produced. Followers never acquire. `410 history_expired` triggers a full resync from `GET session` (reconcile mappings by URL, create missing tabs, never close).
 - A persisted run lock makes runs exclusive; a run that finds the lock held exits.
 
 ### Recording local changes (both roles, always journaled)
@@ -151,7 +151,7 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 - **Closure**: `tabs.onRemoved` with `isWindowClosing: false` on a mapped tab. Count −1; if it was the last local copy, `close`. Window closure, shutdown, crash, and absence from a capture only unmap. Removals during the first 10 s after startup are treated as unmap only.
 - **Navigation**: `tabs.onUpdated` with a new committed URL (status `complete`) on a mapped tab, not caused by remote application. Single local copy: `navigate {entryId, url}`. One of several copies: the tab detaches from its entry (count −1) and is recorded as a fresh `open` for the new URL. Navigating to a URL that is already mapped locally coalesces (the tab joins that entry; the old entry gets `close` if this was its last copy).
 - **Echo suppression**: the extension records what it is about to create, navigate, or remove (`expected` set keyed by tab id and URL, with a timeout) and ignores the matching events.
-- The journal is sent immediately when owner; followers hold it until they become owner.
+- The journal is sent immediately when owner; followers send it on their next run through `merge`.
 
 ### Applying remote operations
 
@@ -178,7 +178,18 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 - Tabs mapped to entries that are no longer in the session are detached, not republished. Continue here never recreates entries this device has a pending `close` for.
 - Previous-session mappings and the detached set survive a restart for 60 s so late-restored tabs still match.
 - Local pin changes are not published in v0.2.
-- The superseded owner learns of the change from `409 stale_owner` on its next run, keeps its journal, and follows. Its pending work is published when it next takes over. The cadence bounds the window in which the prior owner's unpublished changes are invisible to the new owner.
+- The superseded owner learns of the change from `409 stale_owner` on its next run, keeps its journal, and follows; its pending work goes through `merge` on that run. The cadence bounds the window in which the prior owner's unpublished changes are invisible to the new owner.
+
+## Client behavior (v1.0 offline merging, recovery, controls)
+
+- Every journaled operation stores its own `baseRevision`. `forked` and `coalesced` results move the local tabs to the result entry and rewrite remaining pending operations for the old entry. `ignored` navigates are re-recorded as a fresh `open` of the local URL so a following remote `close` cannot shut the user's page; other `ignored` results are dropped.
+- Network errors and 5xx responses set `online: false` and schedule a retry with exponential backoff (30 s doubling to a 5-minute cap, reset on success). Alarm and debounced runs wait for the retry time; Sync now, Resume and automatic takeover do not.
+- `fullResync` on `operations` and `410` on `changes`: reload `GET session`, re-match mappings by URL, unlink tabs of vanished entries (never close), keep the journal, send the remainder through `merge`. Journals written before v1.0 carry `baseRevision: 0`.
+- The popup distinguishes "Saved to server" (acknowledged) from application on other devices, shows pending counts and the retry time while offline, and gives one actionable message per error class: unauthorized, revoked, missing site permission (with a Grant access button), unreachable, server error.
+- **Pause** stops runs and automatic takeover; journaling continues; manual actions are refused. **Resume** releases held closes (dropped if their window is gone), then runs.
+- **Restore**: take over if not owner (catch up if owner), `POST /v1/snapshots/{id}/restore` with the current generation, then rebuild from `GET session` so restored tabs open in the background. Restore reopens URLs only.
+- **Devices**: the popup lists devices and can revoke another device; the local device uses Disconnect.
+- `onInstalled` with reason `update` runs the browser-startup reset and immediately re-matches open tabs by URL.
 
 ## Privacy
 
