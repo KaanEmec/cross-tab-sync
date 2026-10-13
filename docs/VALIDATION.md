@@ -1,0 +1,50 @@
+# Real-browser validation
+
+Everything in this repository is verified by unit tests, an integration test against the real server, and code review. The checks below need the real browsers: Safari on macOS and Brave on Windows, both paired to one server. Record the result of each line (pass, fail, notes) plus browser and OS versions. They cover the roadmap jobs `v0.1.0/01-session-contract/02`, `v0.2.0/03-reconciliation/02` and `v1.0.0/03-release/02`.
+
+Setup: follow [INSTALL.md](INSTALL.md). Run the server with `CTS_ALLOW_INSECURE=1` on a LAN address only for a first smoke test; use HTTPS for everything else.
+
+## Capability checks (answers the open questions in [COMPATIBILITY.md](COMPATIBILITY.md))
+
+- [ ] Safari: pairing from the popup shows the host-permission prompt, `permissions.onAdded` completes pairing when the popup closes.
+- [ ] Safari: the popup lists tab URLs only after *All Websites* access is granted; before that, the status shows nothing eligible.
+- [ ] Both: a received tab opens in the background; the active tab and focused window do not change. A new window created when none is suitable stays unfocused.
+- [ ] Both: `runtime.onStartup` fires on launch (log line "startup reset"), and restored tabs are matched to their previous entries, not republished.
+- [ ] Both: closing a window, quitting, and crash recovery do not produce `close` operations (check the other device keeps its tabs).
+- [ ] Safari: the 5-minute alarm fires while Safari is open; after relaunch the first run happens within a minute.
+- [ ] Both: the server receives requests without CORS errors once the origin is granted (check the worker console).
+
+## Manual handover (v0.1.0)
+
+- [ ] Safari → Brave: Hand over on Safari, Continue here on Brave: missing tabs appear in the background, existing tabs are reused, duplicates are not created, pinned state follows where supported.
+- [ ] Brave → Safari: same in reverse.
+- [ ] Continue here with the server unreachable shows an error and changes nothing.
+- [ ] A stale device (handed over earlier, then tries Hand over again) is refused and nothing changes.
+
+## Automatic sync (v0.2.0)
+
+- [ ] Use Safari, then switch to Brave and click something: Brave takes over within a few seconds; Safari's popup shows "follower" after its next run.
+- [ ] Leave both browsers open and idle: ownership does not flip.
+- [ ] Open a tab on the owner: it appears on the follower within 5 minutes (or after Sync now).
+- [ ] Navigate a tab on the owner: the follower's copy follows; no extra tab is created when the destination is already open.
+- [ ] Close a tab on the owner: the follower's background copy closes; if it is the follower's active tab it stays open.
+- [ ] Open the same URL twice on one device: one shared entry; closing one copy changes nothing remotely; closing the last copy closes remotely.
+- [ ] Manual Hand over, then touch the same browser within a minute: no automatic takeover until a fresh interaction after 60 s idle.
+- [ ] Sleep the laptop for 10 minutes, wake: no spurious closures; the next run reconciles.
+
+## Offline merging and recovery (v1.0.0)
+
+- [ ] Disconnect one device from the network, open and close tabs, navigate, reconnect: additions and closures merge, no duplicate URLs, the popup shows "N changes waiting" while offline.
+- [ ] Navigate the same shared tab to different URLs on both devices while one is offline: after reconnect both URLs exist on both devices.
+- [ ] Close a tab on one device while the other, offline, navigated it: the navigated page survives as a new entry.
+- [ ] Keep a device offline for longer than the retention setting (set `CTS_HISTORY_RETENTION=1h` to test): on reconnect it full-resyncs, keeps its pending work, and does not resurrect closed tabs.
+- [ ] Revoke a device from the other device: it is logged out on its next run and cannot pair again without a new code.
+- [ ] Restore a snapshot: the listed tabs reopen in the background; a pre-restore snapshot appears in the list.
+- [ ] Pause on one device, close tabs there, resume: nothing is deleted remotely.
+
+## Release
+
+- [ ] Fresh install of the server on the VPS from the published image; backup and restore work as documented.
+- [ ] Fresh Brave install from the release zip; fresh Safari build from `safari/` in Xcode.
+- [ ] Server upgrade (new image) applies migrations and keeps the session.
+- [ ] Server logs contain no URLs, tokens or pairing codes.
