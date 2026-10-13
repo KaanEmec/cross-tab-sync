@@ -99,6 +99,12 @@ Local persisted state: credentials, server URL, device name, `lastRevision`, `ge
 - **Hand over**: capture eligible tabs → create `open` ops for tabs not mapped to an entry → `POST operations` → apply `catchUp` locally → `release` → status "handed over at revision R".
 - **Continue here**: `acquire {force:true}` → for each session entry: reuse an existing eligible local tab with the same URL (map it) or create the tab in the background in the designated window → publish `open` ops for local eligible tabs that are still unmapped → status "owner, generation G, revision R".
 - Both actions preserve the active tab and window. Received tabs never steal focus.
+- **Hand over** is refused when the device is not the owner. With nothing to publish it only catches up via `changes`.
+- All local tabs with the same URL map to one entry; one `open` per distinct URL. A mapped tab keeps its mapping when its URL changes (navigation sync arrives in v0.2). Mappings are cleared on browser startup because tab ids are not stable across restarts.
+- Applying `catchUp`: `open` reuses or creates a background tab, `navigate` updates mapped tabs, `close` only unmaps (no local closure in v0.1), `update` applies pinned state. Own operations and `ignored` results are skipped.
+- While owner, the worker heartbeats every 5 minutes; `stale_owner` drops owner state but keeps the pending journal.
+- **Disconnect** releases ownership if owner, revokes the device itself, then clears credentials.
+- Pairing requests the backend origin with `permissions.request` from the popup (user gesture) before calling `/v1/pair`; the form is persisted first because the prompt may close the popup.
 - Eligible tabs: `http`/`https` URLs in normal (non-private) windows. Browser pages, private windows and discarded placeholder entries without a URL are excluded.
 
 ## Privacy

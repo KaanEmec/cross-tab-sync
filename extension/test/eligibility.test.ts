@@ -1,0 +1,54 @@
+import { describe, expect, it } from "vitest";
+import type { TabInfo, WindowInfo } from "../src/adapter/types.js";
+import { eligibleTabs, isShareableUrl, MAX_URL_BYTES } from "../src/core/eligibility.js";
+
+const win = (id: number, over: Partial<WindowInfo> = {}): WindowInfo => ({ id, type: "normal", incognito: false, focused: false, ...over });
+let next = 100;
+const tab = (windowId: number, url: string | undefined, over: Partial<TabInfo> = {}): TabInfo => ({
+  id: next++, windowId, url, pinned: false, incognito: false, index: 0, active: false, ...over,
+});
+
+describe("isShareableUrl", () => {
+  it.each([
+    ["https://example.com/a?q=1#frag", true],
+    ["http://localhost:8080/", true],
+    ["chrome://newtab/", false],
+    ["about:blank", false],
+    ["file:///etc/hosts", false],
+    ["safari-web-extension://abc/popup.html", false],
+    ["", false],
+    [undefined, false],
+    ["https://", false],
+  ])("%s -> %s", (url, expected) => {
+    expect(isShareableUrl(url)).toBe(expected);
+  });
+
+  it("rejects URLs over the server byte limit", () => {
+    const base = "https://example.com/";
+    expect(isShareableUrl(base + "a".repeat(MAX_URL_BYTES - base.length))).toBe(true);
+    expect(isShareableUrl(base + "a".repeat(MAX_URL_BYTES - base.length + 1))).toBe(false);
+  });
+});
+
+describe("eligibleTabs", () => {
+  it("keeps http(s) tabs in normal non-private windows only", () => {
+    const windows = [win(1), win(2, { incognito: true }), win(3, { type: "popup" })];
+    const keep = tab(1, "https://a.example/");
+    const tabs = [
+      keep,
+      tab(1, "chrome://settings/"),
+      tab(1, ""), // Safari: no site access -> empty URL
+      tab(1, undefined), // discarded placeholder without URL
+      tab(2, "https://private.example/", { incognito: true }),
+      tab(3, "https://popup.example/"),
+      tab(9, "https://unknown-window.example/"),
+      tab(1, "https://flagged.example/", { incognito: true }),
+    ];
+    expect(eligibleTabs(tabs, windows).map((t) => t.id)).toEqual([keep.id]);
+  });
+
+  it("orders by window then index", () => {
+    const tabs = [tab(2, "https://c/", { index: 0 }), tab(1, "https://b/", { index: 1 }), tab(1, "https://a/", { index: 0 })];
+    expect(eligibleTabs(tabs, [win(1), win(2)]).map((t) => t.url)).toEqual(["https://a/", "https://b/", "https://c/"]);
+  });
+});
