@@ -78,11 +78,14 @@ A minimal Swift macOS app whose only job is to host the extension. Produced from
 
 | Milestone | Epic | Status |
 | --- | --- | --- |
-| v0.1.0 | 01 Session contract | done (protocol + compatibility research; real-browser checks pending) |
-| v0.1.0 | 02 Backend | done (reviewed, tested; deploy files in `deploy/`) |
-| v0.1.0 | 03 Extensions | done in code (reviewed, unit tested, Safari wrapper builds); real-browser validation pending |
-| v0.2.0 | Automatic ownership, tab changes, reconciliation | done in code (reviewed, 148 unit tests, integration test against the real server); real-browser validation pending |
-| v1.0.0 | Offline merging | server done (merge endpoint, retention); extension in progress |
-| v1.0.0 | Recovery, release | release workflow and install guide done; recovery UI in progress; release validation needs real browsers |
+| v0.1.0 | 01 Session contract | done; real-browser capability checks pending ([VALIDATION.md](VALIDATION.md)) |
+| v0.1.0 | 02 Backend | done |
+| v0.1.0 | 03 Extensions | done; Safari wrapper builds unsigned |
+| v0.2.0 | 01–03 Automatic ownership, tab changes, reconciliation | done in code; online validation simulated, real browsers pending |
+| v1.0.0 | 01 Offline merging | done in code (server merge + retention, client journal/backoff/resync) |
+| v1.0.0 | 02 Recovery | done in code (snapshot restore, status, pause/resume, devices) |
+| v1.0.0 | 03 Release | packaging and install guide done; first-release validation pending on real browsers |
+
+Every "done in code" item is unit tested, integration tested against the real server where applicable, and independently reviewed with findings fixed.
 
 See [ROADMAP.md](../ROADMAP.md) for completion criteria and `versions/` for the job files.
