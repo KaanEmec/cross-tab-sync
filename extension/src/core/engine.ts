@@ -22,6 +22,7 @@ import { withRunLock } from "./lock.js";
 import { restoreSnapshot } from "./recovery.js";
 import { isPaired, loadState, saveState, type State } from "./state.js";
 import { idGen, nowMs, type Deps } from "./store.js";
+import { isRetryableKind } from "./status.js";
 import { syncRun } from "./sync.js";
 
 /** Local changes are sent about this long after the first one. */
@@ -270,6 +271,8 @@ export class SyncEngine {
     this.cancelRetry?.();
     this.cancelRetry = null;
     if (!isPaired(s) || s.paused || s.nextRetryAt === null) return;
+    // A due retry is only armed while the last failure is one a retry can fix.
+    if (s.nextRetryAt <= nowMs(this.deps) && !isRetryableKind(s.errorKind)) return;
     this.cancelRetry = this.retrySchedule(
       () => {
         this.cancelRetry = null;

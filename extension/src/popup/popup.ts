@@ -124,8 +124,11 @@ async function run(req: Request): Promise<Response> {
 function confirmTwice(btn: HTMLButtonElement, armedLabel: string, action: () => void): void {
   const label = btn.textContent ?? "";
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let armedAt = 0;
   btn.addEventListener("click", () => {
+    if (timer !== null && Date.now() - armedAt < 400) return; // a double click is not a confirmation
     if (timer === null) {
+      armedAt = Date.now();
       btn.textContent = armedLabel;
       timer = setTimeout(() => {
         timer = null;

@@ -709,6 +709,9 @@
   function retryDelay(attempt) {
     return Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1), RETRY_MAX_MS);
   }
+  function isRetryableKind(kind) {
+    return kind === "unreachable" || kind === "server" || kind === "permission";
+  }
   function isRetryable(e) {
     return e instanceof ApiError && (e.code === "network_error" || e.status >= 500);
   }
@@ -828,8 +831,10 @@
         errorKind: kind,
         lastError: message
       });
+    } else if (e instanceof ApiError && e.status > 0) {
+      await store.set({ online: true, nextRetryAt: null, retryAttempts: 0, errorKind: kind, lastError: message ?? e.message });
     } else {
-      await store.set({ errorKind: kind, lastError: message ?? (e instanceof Error ? e.message : String(e)) });
+      await store.set({ lastError: message ?? (e instanceof Error ? e.message : String(e)) });
     }
     throw e;
   }
@@ -1233,7 +1238,7 @@
 
   // src/core/merge.ts
   function isMalformed(e) {
-    return e instanceof ApiError && (e.code === "invalid_request" || e.code === "payload_too_large");
+    return e instanceof ApiError && (e.status === 400 && e.code === "invalid_request" || e.status === 413 && e.code === "payload_too_large");
   }
   async function dropBatch(store, batch) {
     const entryIds = new Set(batch.map((op) => op.entryId));
@@ -1335,7 +1340,7 @@
         break;
       }
       await applyRemote(store, res.catchUp?.operations ?? [], navigated);
-      await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), ...succeeded(deps2) });
+      await store.set({ lastRevision: res.revision, ...succeeded(deps2) });
       if (batch.length > 0 && batch.every((op) => store.s.pending.some((p) => p.op.opId === op.opId))) break;
     }
     return { rejected, failed };
@@ -1439,10 +1444,11 @@
       requirePaired(store.s);
       await store.set({ lastTakeoverAt: nowMs(deps2), suppressAutoTakeover: false, freshPending: false });
       const api = apiFor(deps2, store.s);
+      const merged = await submitJournal(store);
       if (store.s.lastRevision > 0) {
         try {
           const res = await api.changes(store.s.lastRevision);
-          await applyRemote(store, res.operations);
+          await applyRemote(store, res.operations, /* @__PURE__ */ new Set(), merged.revive);
           await store.set({
             lastRevision: Math.max(store.s.lastRevision, res.revision),
             minRevision: res.minRevision ?? store.s.minRevision,
@@ -1466,7 +1472,7 @@
       });
       const { failed } = await materialize(store, session.entries, true);
       const flushed = await flush(store);
-      const errors = [createFailedMessage(failed + flushed.failed), rejectedMessage(flushed.rejected)];
+      const errors = [createFailedMessage(failed + flushed.failed), rejectedMessage(merged.rejected + flushed.rejected)];
       await store.set({
         ...succeeded(deps2),
         lastError: errors.filter(Boolean).join("; ") || null,
@@ -1548,7 +1554,7 @@
       return false;
     }
     const lostOwnership = store.s.generation !== null && (!owner || owner.deviceId !== store.s.deviceId || owner.generation !== store.s.generation);
-    const known = { owner, minRevision: minRevision ?? store.s.minRevision };
+    const known = { owner, minRevision: minRevision ?? store.s.minRevision, ...succeeded(deps2) };
     await store.set(
       lostOwnership ? { ...known, generation: null, freshPending: true, statusText: `Not the owner: ${ownerLabel(owner)} took over.` } : known
     );
@@ -1605,7 +1611,9 @@
     const store = await Store.open(deps2);
     requirePaired(store.s);
     try {
-      return await fn(store);
+      const result = await fn(store);
+      await store.set(succeeded(deps2));
+      return result;
     } catch (e) {
       if (e instanceof ApiError && e.code === "device_revoked") return fail(store, e);
       const kind = classify(e, true);
@@ -1865,6 +1873,7 @@
       this.cancelRetry?.();
       this.cancelRetry = null;
       if (!isPaired(s) || s.paused || s.nextRetryAt === null) return;
+      if (s.nextRetryAt <= nowMs(this.deps) && !isRetryableKind(s.errorKind)) return;
       this.cancelRetry = this.retrySchedule(
         () => {
           this.cancelRetry = null;

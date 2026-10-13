@@ -5,7 +5,7 @@ import { ApiError, type Device, type Snapshot } from "./client.js";
 import { continueHere } from "./handover.js";
 import { isPaired, type State } from "./state.js";
 import { classify, errorMessage } from "./status.js";
-import { apiFor, fail, requirePaired, Store, type Deps } from "./store.js";
+import { apiFor, fail, requirePaired, Store, succeeded, type Deps } from "./store.js";
 import { createFailedMessage, flush, rejectedMessage, resync } from "./sync.js";
 
 /** Read-only popup requests: a revoked device is cleared, other errors are explained, no backoff. */
@@ -13,7 +13,9 @@ async function read<T>(deps: Deps, fn: (store: Store) => Promise<T>): Promise<T>
   const store = await Store.open(deps);
   requirePaired(store.s);
   try {
-    return await fn(store);
+    const result = await fn(store);
+    await store.set(succeeded(deps));
+    return result;
   } catch (e) {
     if (e instanceof ApiError && e.code === "device_revoked") return fail(store, e);
     const kind = classify(e, true);

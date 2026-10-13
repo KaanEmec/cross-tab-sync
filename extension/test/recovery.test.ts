@@ -117,8 +117,9 @@ describe("status", () => {
     s = await mac.state();
     expect(s.errorKind).toBe("unauthorized");
     expect(s.lastError).toBe("The server does not accept this device's credentials. Disconnect, then pair again with a new code.");
-    expect(s.nextRetryAt).not.toBeNull(); // unchanged by a non-retryable error
-    expect(s.retryAttempts).toBe(3);
+    // The server answered: no retry can fix this, so none stays scheduled.
+    expect(s).toMatchObject({ online: true, nextRetryAt: null, retryAttempts: 0 });
+    expect(mac.retries.size).toBe(0);
   });
 
   it("summarizes saved, waiting, offline and paused work", () => {

@@ -22,13 +22,26 @@ export function serverAcceptsUrl(url: string): boolean {
   return Boolean(m && m[2] && m[2].replace(/^.*@/, "").replace(/:\d*$/, ""));
 }
 
+/** UUIDv5 (SHA-1) of `name` in the namespace `ns`, as the server derives forked entry ids. */
+export async function uuidv5(ns: string, name: string): Promise<string> {
+  const nsBytes = Uint8Array.from(ns.replace(/-/g, "").match(/../g)!.map((h) => parseInt(h, 16)));
+  const nameBytes = encoder.encode(name);
+  const data = new Uint8Array(nsBytes.length + nameBytes.length);
+  data.set(nsBytes);
+  data.set(nameBytes, nsBytes.length);
+  const b = new Uint8Array(await crypto.subtle.digest("SHA-1", data)).slice(0, 16);
+  b[6] = (b[6]! & 0x0f) | 0x50;
+  b[8] = (b[8]! & 0x3f) | 0x80;
+  const hex = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function validateBatch(body: { baseRevision: number; operations: Operation[] }): void {
   const bad = (msg: string) => new ApiError(400, "invalid_request", msg, { error: "invalid_request" });
-  if (encoder.encode(JSON.stringify(body)).length > 64 * 1024) {
-    throw new ApiError(413, "payload_too_large", "body too large", { error: "payload_too_large" });
-  }
+  const tooLarge = (msg: string) => new ApiError(413, "payload_too_large", msg, { error: "payload_too_large" });
+  if (encoder.encode(JSON.stringify(body)).length > 64 * 1024) throw tooLarge("body too large");
   if (!Number.isInteger(body.baseRevision) || body.baseRevision < 0) throw bad("baseRevision required");
-  if (body.operations.length > 500) throw bad("too many operations");
+  if (body.operations.length > 500) throw tooLarge("at most 500 operations per batch");
   for (const op of body.operations) {
     if (!UUID.test(op.opId) || !UUID.test(op.entryId)) throw bad("ids must be lowercase UUIDs");
     if ((op.type === "open" || op.type === "navigate") && !serverAcceptsUrl(op.url)) throw bad("invalid url");
@@ -61,8 +74,8 @@ export class FakeServer {
   historyStart = 0;
   /** Test hook to delay an operations request between authentication and the ownership check. */
   beforeOperations?: () => Promise<void>;
-  /** Answer the next N authenticated requests with this HTTP status (5xx simulation). */
-  failNext: { status: number; count: number } | null = null;
+  /** Answer the next N authenticated requests with this HTTP status and error code (default `internal`). */
+  failNext: { status: number; count: number; code?: string } | null = null;
   snapshots: (Snapshot & { entries: Entry[] })[] = [];
   /** Restore ids per (snapshot, generation, index): a retry in the same generation replays. */
   private restoreIds = new Map<string, { opId: string; entryId: string }>();
@@ -72,9 +85,9 @@ export class FakeServer {
     return this.historyStart + 1;
   }
 
-  /** Base outside the retained history (a base at the current revision is never expired). */
+  /** Base outside the retained history (`base < minRevision - 1`), as the server checks it. */
   private expired(base: number): boolean {
-    return base > this.revision || (base < this.historyStart && base < this.revision);
+    return base < this.historyStart;
   }
 
   private snapshot(deviceId: string, reason: string): void {
@@ -121,34 +134,53 @@ export class FakeServer {
 
   /**
    * Merge rules: an entry moved (URL changed by another device after `baseRevision`, or the base is
-   * expired) forks a navigate into an open of a fresh entry and ignores close/update. Later ops of
-   * the batch on a forked entry are redirected to the fork.
+   * expired or ahead of the session) forks a navigate into an open of a fresh entry (UUIDv5 of the
+   * opId and "forked") and ignores close/update. Entries whose URL this batch itself set are never
+   * moved. Later ops of the batch on a forked entry are redirected to the fork.
    */
-  private merge(deviceId: string, ops: MergeOperation[]): OpResult[] {
+  private async merge(deviceId: string, ops: MergeOperation[]): Promise<OpResult[]> {
     const forks = new Map<string, string>();
-    return ops.map(({ baseRevision, ...plain }) => {
+    const own = new Set<string>();
+    const out: OpResult[] = [];
+    for (const { baseRevision, ...plain } of ops) {
       const op = { ...plain, entryId: forks.get(plain.entryId) ?? plain.entryId } as Operation;
       const known = this.results.get(op.opId);
-      if (known) return { ...known, replayed: true };
+      if (known) {
+        out.push({ ...known, replayed: true });
+        continue;
+      }
       const e = this.entries.find((x) => x.id === op.entryId);
+      const expired = this.expired(baseRevision) || baseRevision > this.revision;
       const moved =
         op.type !== "open" &&
         e?.open === true &&
-        (this.expired(baseRevision) || (e.urlRevision > baseRevision && e.urlDevice !== deviceId));
-      if (!moved) return this.apply(deviceId, op);
+        !own.has(e.id) &&
+        (expired || (e.urlRevision > baseRevision && e.urlDevice !== deviceId));
+      if (!moved) {
+        const r = this.apply(deviceId, op);
+        if (r.status === "applied" && (op.type === "open" || op.type === "navigate")) own.add(op.entryId);
+        out.push(r);
+        continue;
+      }
       if (op.type !== "navigate") {
         const result: OpResult = { opId: op.opId, status: "ignored" };
         this.results.set(op.opId, result);
-        return result;
+        out.push(result);
+        continue;
       }
-      const fork: Operation = { opId: op.opId, type: "open", entryId: crypto.randomUUID(), url: op.url, pinned: e!.pinned };
-      const r = this.apply(deviceId, fork);
-      if (r.status !== "applied") return r;
-      forks.set(plain.entryId, fork.entryId);
+      const forkId = await uuidv5(op.opId, "forked");
+      const r = this.apply(deviceId, { opId: op.opId, type: "open", entryId: forkId, url: op.url, pinned: e!.pinned });
+      if (r.status !== "applied") {
+        out.push(r);
+        continue;
+      }
+      forks.set(plain.entryId, forkId);
+      own.add(forkId);
       const forked: OpResult = { ...r, status: "forked" };
       this.results.set(op.opId, forked);
-      return forked;
-    });
+      out.push(forked);
+    }
+    return out;
   }
 
   private apply(deviceId: string, op: Operation): OpResult {
@@ -225,7 +257,8 @@ export class FakeServer {
     if (this.unreachable) throw new ApiError(0, "network_error", "Server is unreachable");
     if (this.failNext && this.failNext.count > 0) {
       this.failNext.count--;
-      throw new ApiError(this.failNext.status, "internal", "internal error", { error: "internal" });
+      const code = this.failNext.code ?? "internal";
+      throw new ApiError(this.failNext.status, code, `${code} (${this.failNext.status})`, { error: code });
     }
     const d = this.devices.find((x) => x.token === token);
     if (!d) throw new ApiError(401, "unauthorized", "unknown token");
@@ -268,7 +301,7 @@ export class FakeServer {
     deleteDevice: async (id) => {
       this.auth(cfg.token);
       const d = this.devices.find((x) => x.id === id);
-      if (!d) throw new ApiError(404, "not_found", "not found");
+      if (!d || d.revoked) throw new ApiError(404, "not_found", "not found");
       d.revoked = true;
       if (this.owner?.deviceId === id) this.owner = null;
     },
@@ -280,7 +313,9 @@ export class FakeServer {
     changes: async (since) => {
       const d = this.auth(cfg.token);
       this.requests.push({ path: "changes", body: { since }, device: d.id });
-      if (since < this.historyStart) throw new ApiError(410, "history_expired", "history expired", { error: "history_expired" });
+      if (since < 0 || since > this.revision || this.expired(since)) {
+        throw new ApiError(410, "history_expired", "history expired", { error: "history_expired" });
+      }
       const operations = this.log.filter((l) => l.seq > since);
       return { revision: this.revision, minRevision: this.minRevision, owner: this.owner, operations };
     },
@@ -305,9 +340,9 @@ export class FakeServer {
     operations: async ({ generation, baseRevision, operations }) => {
       const d = this.auth(cfg.token);
       this.requests.push({ path: "operations", body: { generation, baseRevision, operations }, device: d.id });
+      validateBatch({ baseRevision, operations }); // 400/413 before 409, as the server
       await this.beforeOperations?.();
       this.checkOwner(d, generation);
-      validateBatch({ baseRevision, operations });
       const fullResync = this.expired(baseRevision);
       const catchUp = this.log.filter((l) => l.seq > baseRevision && l.deviceId !== d.id);
       this.snapshotIfNeeded(d.id, operations);
@@ -321,7 +356,7 @@ export class FakeServer {
       this.requests.push({ path: "merge", body: { operations }, device: d.id });
       validateBatch({ baseRevision: 0, operations });
       this.snapshotIfNeeded(d.id, operations);
-      const results = this.merge(d.id, operations);
+      const results = await this.merge(d.id, operations);
       this.dropResponse();
       return { revision: this.revision, results };
     },

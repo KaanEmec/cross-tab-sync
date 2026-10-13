@@ -125,8 +125,12 @@ export async function fail(store: Store, e: unknown, sentGeneration?: number | n
       errorKind: kind,
       lastError: message,
     });
+  } else if (e instanceof ApiError && e.status > 0) {
+    // The server answered: reachable, and retrying the same request would fail the same way.
+    await store.set({ online: true, nextRetryAt: null, retryAttempts: 0, errorKind: kind, lastError: message ?? e.message });
   } else {
-    await store.set({ errorKind: kind, lastError: message ?? (e instanceof Error ? e.message : String(e)) });
+    // A local precondition (e.g. not the owner): the backoff state is left as it is.
+    await store.set({ lastError: message ?? (e instanceof Error ? e.message : String(e)) });
   }
   throw e;
 }

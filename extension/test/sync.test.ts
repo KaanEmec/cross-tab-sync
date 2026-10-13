@@ -218,7 +218,7 @@ describe("follower application", () => {
     await mac.settle();
     expect(list((await mac.state()).pending).map((o) => o.type)).toEqual(["open"]); // held while following
 
-    server.historyStart = server.revision + 1;
+    server.historyStart = server.revision;
     await mac.engine.runNow();
     await mac.settle();
     expect(server.requests.filter((r) => r.device === mac.id).map((r) => r.path)).toContain("session");
@@ -404,7 +404,7 @@ describe("review fixes", () => {
     const mac = await follower("Mac Safari");
     brave.b.userNavigate(brave.tab("https://a/"), "https://a2/");
     await brave.settle();
-    server.historyStart = server.revision + 1;
+    server.historyStart = server.revision;
     await mac.engine.runNow();
     await mac.settle();
     expect(await mac.urls()).toEqual(["https://a2/", "https://b/"]);
@@ -448,7 +448,7 @@ describe("review fixes", () => {
     brave.b.userNavigate(brave.tab("https://a/"), "https://a/brave");
     await brave.settle();
     await mac.settle();
-    server.historyStart = server.revision + 1;
+    server.historyStart = server.revision;
 
     clock.advance(61_000);
     mac.b.userActivate(mac.tab("https://a/mac"));

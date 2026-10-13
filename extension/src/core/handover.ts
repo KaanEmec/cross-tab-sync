@@ -8,6 +8,7 @@ import { ApiError, normalizeServerUrl, type Owner } from "./client.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
 import { apiFor, fail, nowIso, nowMs, ownerLabel, requirePaired, Store, succeeded, type Deps } from "./store.js";
+import { submitJournal } from "./merge.js";
 import { createFailedMessage, flush, rejectedMessage } from "./sync.js";
 
 export type { Api, Deps } from "./store.js";
@@ -55,12 +56,14 @@ export async function continueHere(deps: Deps): Promise<State> {
     requirePaired(store.s);
     await store.set({ lastTakeoverAt: nowMs(deps), suppressAutoTakeover: false, freshPending: false });
     const api = apiFor(deps, store.s);
+    // Changes journaled while following go through merge (causal checks), never `operations`.
+    const merged = await submitJournal(store);
     // Catch up first: remote navigations and closures since the last applied revision reach this
     // device as operations (closing and navigating exactly), not only as a snapshot difference.
     if (store.s.lastRevision > 0) {
       try {
         const res = await api.changes(store.s.lastRevision);
-        await applyRemote(store, res.operations);
+        await applyRemote(store, res.operations, new Set(), merged.revive);
         await store.set({
           lastRevision: Math.max(store.s.lastRevision, res.revision),
           minRevision: res.minRevision ?? store.s.minRevision,
@@ -88,7 +91,7 @@ export async function continueHere(deps: Deps): Promise<State> {
     const { failed } = await materialize(store, session.entries, true);
     const flushed = await flush(store);
 
-    const errors = [createFailedMessage(failed + flushed.failed), rejectedMessage(flushed.rejected)];
+    const errors = [createFailedMessage(failed + flushed.failed), rejectedMessage(merged.rejected + flushed.rejected)];
     await store.set({
       ...succeeded(deps),
       lastError: errors.filter(Boolean).join("; ") || null,
@@ -185,7 +188,8 @@ export async function refreshOwner(deps: Deps): Promise<boolean> {
   }
   const lostOwnership =
     store.s.generation !== null && (!owner || owner.deviceId !== store.s.deviceId || owner.generation !== store.s.generation);
-  const known = { owner, minRevision: minRevision ?? store.s.minRevision };
+  // Reachable again: clears the offline state; an armed retry timer still sends pending work.
+  const known = { owner, minRevision: minRevision ?? store.s.minRevision, ...succeeded(deps) };
   await store.set(
     lostOwnership
       ? { ...known, generation: null, freshPending: true, statusText: `Not the owner: ${ownerLabel(owner)} took over.` }

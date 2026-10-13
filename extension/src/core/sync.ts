@@ -70,7 +70,8 @@ export async function flush(store: Store): Promise<{ rejected: number; failed: n
       break;
     }
     await applyRemote(store, res.catchUp?.operations ?? [], navigated);
-    await store.set({ lastRevision: Math.max(store.s.lastRevision, res.revision), ...succeeded(deps) });
+    // The server's revision, never a local one ahead of it (e.g. after a server restore from backup).
+    await store.set({ lastRevision: res.revision, ...succeeded(deps) });
     // Safety: a server that answered without results for the batch must not loop forever.
     if (batch.length > 0 && batch.every((op) => store.s.pending.some((p) => p.op.opId === op.opId))) break;
   }

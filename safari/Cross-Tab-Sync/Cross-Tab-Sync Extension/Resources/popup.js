@@ -178,8 +178,11 @@
   function confirmTwice(btn, armedLabel, action) {
     const label = btn.textContent ?? "";
     let timer = null;
+    let armedAt = 0;
     btn.addEventListener("click", () => {
+      if (timer !== null && Date.now() - armedAt < 400) return;
       if (timer === null) {
+        armedAt = Date.now();
         btn.textContent = armedLabel;
         timer = setTimeout(() => {
           timer = null;

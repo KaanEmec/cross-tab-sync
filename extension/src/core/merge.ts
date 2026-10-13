@@ -8,9 +8,16 @@ import { acknowledge, batches, redirect, toMerge } from "./journal.js";
 import { removeMappings } from "./mapping.js";
 import { apiFor, idGen, nowDate, type Store } from "./store.js";
 
-/** A batch the server refuses as malformed would be refused forever. */
+/**
+ * A batch the server refuses as malformed would be refused forever. Only the batch-level refusals
+ * count (400 invalid_request, 413 payload_too_large): a 403 invalid_request (HTTPS required) says
+ * nothing about the batch and must not drop the journal.
+ */
 export function isMalformed(e: unknown): boolean {
-  return e instanceof ApiError && (e.code === "invalid_request" || e.code === "payload_too_large");
+  return (
+    e instanceof ApiError &&
+    ((e.status === 400 && e.code === "invalid_request") || (e.status === 413 && e.code === "payload_too_large"))
+  );
 }
 
 /** Drop a refused batch from the journal and unmap its tabs so the rest proceeds. Nothing in it was applied. */

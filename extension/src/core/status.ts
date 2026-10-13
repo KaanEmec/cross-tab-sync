@@ -13,6 +13,11 @@ export function retryDelay(attempt: number): number {
   return Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1), RETRY_MAX_MS);
 }
 
+/** Error classes left by a retryable failure (network error, 5xx). */
+export function isRetryableKind(kind: ErrorKind | null): boolean {
+  return kind === "unreachable" || kind === "server" || kind === "permission";
+}
+
 /** Network errors and 5xx are retried with backoff; everything else needs a change first. */
 export function isRetryable(e: unknown): boolean {
   return e instanceof ApiError && (e.code === "network_error" || e.status >= 500);
