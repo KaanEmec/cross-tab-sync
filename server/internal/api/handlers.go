@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,12 +28,14 @@ type entryJSON struct {
 type sessionJSON struct {
 	Revision    int64        `json:"revision"`
 	MinRevision int64        `json:"minRevision"`
+	KeyCheck    *string      `json:"keyCheck"`
 	Owner       *store.Owner `json:"owner"`
 	Entries     []entryJSON  `json:"entries"`
 }
 
 func toSessionJSON(s store.Session) sessionJSON {
-	out := sessionJSON{Revision: s.Revision, MinRevision: s.MinRevision, Owner: s.Owner, Entries: make([]entryJSON, len(s.Entries))}
+	out := sessionJSON{Revision: s.Revision, MinRevision: s.MinRevision, KeyCheck: s.KeyCheck, Owner: s.Owner,
+		Entries: make([]entryJSON, len(s.Entries))}
 	for i, e := range s.Entries {
 		out.Entries[i] = entryJSON{ID: e.ID, URLKey: e.URLKey, URLEnc: e.URLEnc, Pinned: e.Pinned, Position: e.Position, UpdatedRevision: e.UpdatedRevision}
 	}
@@ -207,6 +211,26 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toSessionJSON(sess))
 }
 
+// setKeyCheck stores the session's key check once; a different stored value
+// is 409 key_set.
+func (s *Server) setKeyCheck(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		KeyCheck string `json:"keyCheck"`
+	}
+	if !decode(w, r, &req, false) {
+		return
+	}
+	if !session.IsKey(req.KeyCheck) {
+		invalid(w, fmt.Sprintf("keyCheck must be %d base64url characters", session.URLKeyLength))
+		return
+	}
+	if err := s.store.SetKeyCheck(r.Context(), device(r).ID, req.KeyCheck); err != nil {
+		s.storeError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) changes(w http.ResponseWriter, r *http.Request) {
 	since, err := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
 	if err != nil {
@@ -280,9 +304,9 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) operations(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Generation   *int64       `json:"generation"`
-		BaseRevision *int64       `json:"baseRevision"`
-		Operations   []session.Op `json:"operations"`
+		Generation   *int64            `json:"generation"`
+		BaseRevision *int64            `json:"baseRevision"`
+		Operations   []json.RawMessage `json:"operations"`
 	}
 	if !decode(w, r, &req, false) {
 		return
@@ -297,15 +321,19 @@ func (s *Server) operations(w http.ResponseWriter, r *http.Request) {
 	case !batchSizeOK(w, len(req.Operations)):
 		return
 	}
+	ops, ok := decodeOps[session.Op](w, req.Operations)
+	if !ok {
+		return
+	}
 	// Validate everything before touching state: a bad op rejects the batch.
-	for i, op := range req.Operations {
+	for i, op := range ops {
 		if err := session.Validate(op); err != nil {
 			invalid(w, fmt.Sprintf("operations[%d]: %v", i, err))
 			return
 		}
 	}
 	res, err := s.store.ApplyOperations(r.Context(), device(r).ID, *req.Generation, *req.BaseRevision,
-		req.Operations, s.now(), s.cfg.SnapshotRetention)
+		ops, s.now(), s.cfg.SnapshotRetention)
 	if err != nil {
 		s.storeError(w, r, err)
 		return
@@ -317,6 +345,22 @@ func (s *Server) operations(w http.ResponseWriter, r *http.Request) {
 		body["catchUp"] = map[string]any{"operations": res.CatchUp}
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+// decodeOps decodes each operation strictly: an unknown field (such as a
+// plaintext url) is 400 invalid_request for the whole batch. Unknown
+// top-level fields stay ignored.
+func decodeOps[T any](w http.ResponseWriter, raw []json.RawMessage) ([]T, bool) {
+	out := make([]T, len(raw))
+	for i, m := range raw {
+		dec := json.NewDecoder(bytes.NewReader(m))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&out[i]); err != nil {
+			invalid(w, fmt.Sprintf("operations[%d]: must be an operation object without unknown fields", i))
+			return nil, false
+		}
+	}
+	return out, true
 }
 
 // batchSizeOK writes 413 and returns false when a batch has too many operations.
@@ -331,12 +375,16 @@ func batchSizeOK(w http.ResponseWriter, n int) bool {
 
 func (s *Server) merge(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Operations []session.MergeOp `json:"operations"`
+		Operations []json.RawMessage `json:"operations"`
 	}
 	if !decode(w, r, &req, false) || !batchSizeOK(w, len(req.Operations)) {
 		return
 	}
-	for i, op := range req.Operations {
+	ops, ok := decodeOps[session.MergeOp](w, req.Operations)
+	if !ok {
+		return
+	}
+	for i, op := range ops {
 		if op.BaseRevision == nil || *op.BaseRevision < 0 {
 			invalid(w, fmt.Sprintf("operations[%d]: baseRevision must be a non-negative integer", i))
 			return
@@ -346,7 +394,7 @@ func (s *Server) merge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	res, err := s.store.Merge(r.Context(), device(r).ID, req.Operations, s.now(), s.cfg.SnapshotRetention)
+	res, err := s.store.Merge(r.Context(), device(r).ID, ops, s.now(), s.cfg.SnapshotRetention)
 	if err != nil {
 		s.storeError(w, r, err)
 		return

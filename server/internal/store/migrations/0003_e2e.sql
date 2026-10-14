@@ -6,8 +6,13 @@ DELETE FROM operations;
 DELETE FROM entries;
 DELETE FROM snapshots;
 
+-- Key check of the shared encryption key (base64url HMAC), set once by the
+-- first browser through PUT /v2/session/key.
+ALTER TABLE session ADD COLUMN key_check TEXT;
+
 -- The generation is kept: it only ever increases.
-UPDATE session SET revision = 0, min_revision = 1, owner_device_id = NULL, owner_last_seen_at = NULL;
+UPDATE session SET revision = 0, min_revision = 1, owner_device_id = NULL, owner_last_seen_at = NULL,
+    key_check = NULL;
 
 -- Times are Unix milliseconds (UTC).
 UPDATE devices SET revoked_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE revoked_at IS NULL;

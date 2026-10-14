@@ -203,6 +203,7 @@ func TestMergeValidation(t *testing.T) {
 		{"missing baseRevision", map[string]any{"operations": []op{good(), openOp(uid(), "https://b.example/")}}, http.StatusBadRequest, "invalid_request"},
 		{"negative baseRevision", map[string]any{"operations": []op{good(), at(-1, closeOp(uid()))}}, http.StatusBadRequest, "invalid_request"},
 		{"plaintext url", map[string]any{"operations": []op{good(), at(0, op{"opId": uid(), "type": "open", "entryId": uid(), "url": "https://b.example/"})}}, http.StatusBadRequest, "invalid_request"},
+		{"sealed plus url", map[string]any{"operations": []op{good(), func() op { o := at(0, openOp(uid(), "https://b.example/")); o["url"] = "https://b.example/"; return o }()}}, http.StatusBadRequest, "invalid_request"},
 		{"bad urlKey", map[string]any{"operations": []op{good(), at(0, op{"opId": uid(), "type": "navigate", "entryId": uid(), "urlKey": "short", "urlEnc": "AAAA"})}}, http.StatusBadRequest, "invalid_request"},
 		{"not an object", []byte(`[1]`), http.StatusBadRequest, "invalid_request"},
 		{"too many", map[string]any{"operations": tooMany}, http.StatusRequestEntityTooLarge, "payload_too_large"},

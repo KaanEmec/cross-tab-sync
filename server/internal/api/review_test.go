@@ -18,6 +18,7 @@ func TestRoutesRequireToken(t *testing.T) {
 		{"PATCH", "/v2/devices/00000000-0000-4000-8000-000000000001"},
 		{"DELETE", "/v2/devices/00000000-0000-4000-8000-000000000001"},
 		{"GET", "/v2/session"},
+		{"PUT", "/v2/session/key"},
 		{"GET", "/v2/session/changes?since=0"},
 		{"POST", "/v2/session/acquire"},
 		{"POST", "/v2/session/release"},

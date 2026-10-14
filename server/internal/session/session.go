@@ -117,7 +117,7 @@ func Validate(op Op) error {
 // URLKeyLength and urlEnc 1..MaxURLEncLen base64url characters. Neither is
 // decoded; the server does no cryptography.
 func ValidateURLFields(key, enc string) error {
-	if len(key) != URLKeyLength || !isBase64URL(key) {
+	if !IsKey(key) {
 		return fmt.Errorf("%w: urlKey must be %d base64url characters", ErrInvalid, URLKeyLength)
 	}
 	if enc == "" || len(enc) > MaxURLEncLen || !isBase64URL(enc) {
@@ -125,6 +125,10 @@ func ValidateURLFields(key, enc string) error {
 	}
 	return nil
 }
+
+// IsKey reports whether s is URLKeyLength base64url characters: the shape
+// of urlKey and of the session's keyCheck (both unpadded HMAC-SHA256).
+func IsKey(s string) bool { return len(s) == URLKeyLength && isBase64URL(s) }
 
 // isBase64URL reports whether s uses only the unpadded base64url alphabet.
 func isBase64URL(s string) bool {

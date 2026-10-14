@@ -31,6 +31,7 @@ type Owner struct {
 type Session struct {
 	Revision    int64
 	MinRevision int64 // oldest retained operation sequence number
+	KeyCheck    *string
 	Owner       *Owner
 	Entries     []session.Entry
 }
@@ -81,6 +82,7 @@ type sessionRow struct {
 	revision    int64
 	minRevision int64
 	generation  int64
+	keyCheck    *string
 	owner       *Owner
 }
 
@@ -94,12 +96,16 @@ func loadSession(ctx context.Context, tx *sql.Tx) (sessionRow, error) {
 		ownerID  sql.NullString
 		lastSeen sql.NullInt64
 		name     sql.NullString
+		keyCheck sql.NullString
 	)
-	err := tx.QueryRowContext(ctx, `SELECT s.revision, s.min_revision, s.generation, s.owner_device_id, s.owner_last_seen_at, d.name
-		FROM session s LEFT JOIN devices d ON d.id = s.owner_device_id WHERE s.id = 1`).
-		Scan(&r.revision, &r.minRevision, &r.generation, &ownerID, &lastSeen, &name)
+	err := tx.QueryRowContext(ctx, `SELECT s.revision, s.min_revision, s.generation, s.owner_device_id, s.owner_last_seen_at, d.name,
+		s.key_check FROM session s LEFT JOIN devices d ON d.id = s.owner_device_id WHERE s.id = 1`).
+		Scan(&r.revision, &r.minRevision, &r.generation, &ownerID, &lastSeen, &name, &keyCheck)
 	if err != nil {
 		return r, fmt.Errorf("loading session: %w", err)
+	}
+	if keyCheck.Valid {
+		r.keyCheck = &keyCheck.String
 	}
 	if ownerID.Valid {
 		r.owner = &Owner{DeviceID: ownerID.String, Name: name.String, Generation: r.generation, LastSeenAt: Timestamp{fromMS(lastSeen.Int64)}}
@@ -185,10 +191,33 @@ func (s *Store) GetSession(ctx context.Context) (Session, error) {
 		if err != nil {
 			return err
 		}
-		out = Session{Revision: r.revision, MinRevision: r.minRevision, Owner: r.owner, Entries: es}
+		out = Session{Revision: r.revision, MinRevision: r.minRevision, KeyCheck: r.keyCheck, Owner: r.owner, Entries: es}
 		return nil
 	})
 	return out, err
+}
+
+// SetKeyCheck stores the session's key check unless a different one is
+// already set (ErrKeySet). Setting the stored value again succeeds.
+func (s *Store) SetKeyCheck(ctx context.Context, deviceID, keyCheck string) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, deviceID); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE session SET key_check = ? WHERE id = 1 AND (key_check IS NULL OR key_check = ?)`, keyCheck, keyCheck)
+		if err != nil {
+			return fmt.Errorf("setting key check: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("setting key check: %w", err)
+		}
+		if n == 0 {
+			return ErrKeySet
+		}
+		return nil
+	})
 }
 
 // Acquire makes deviceID the owner following the acquire rules: an existing
@@ -230,7 +259,7 @@ func (s *Store) Acquire(ctx context.Context, deviceID string, force bool, now ti
 			return err
 		}
 		gen = r.generation
-		out = Session{Revision: r.revision, MinRevision: r.minRevision, Owner: r.owner, Entries: es}
+		out = Session{Revision: r.revision, MinRevision: r.minRevision, KeyCheck: r.keyCheck, Owner: r.owner, Entries: es}
 		return nil
 	})
 	return gen, out, err

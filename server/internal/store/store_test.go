@@ -192,7 +192,7 @@ func TestMigration0003E2E(t *testing.T) {
 			before-1000, time.Now().UnixMilli()): 1,
 		`SELECT COUNT(*) FROM devices WHERE id = 'b' AND revoked_at = 5`: 1,
 		`SELECT COUNT(*) FROM session WHERE revision = 0 AND min_revision = 1 AND generation = 4
-			AND owner_device_id IS NULL AND owner_last_seen_at IS NULL`: 1,
+			AND owner_device_id IS NULL AND owner_last_seen_at IS NULL AND key_check IS NULL`: 1,
 	} {
 		if n := f.count(query); n != want {
 			t.Errorf("%s = %d, want %d", query, n, want)
@@ -209,9 +209,15 @@ func TestMigration0003E2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gen, _, err := st.Acquire(ctx, dev.ID, false, now, time.Minute)
-	if err != nil || gen != 5 {
-		t.Fatalf("acquire after upgrade: generation %d %v", gen, err)
+	if err := st.SetKeyCheck(ctx, dev.ID, key("k")); err != nil {
+		t.Fatalf("key check after upgrade: %v", err)
+	}
+	if err := st.SetKeyCheck(ctx, dev.ID, key("other")); !errors.Is(err, ErrKeySet) {
+		t.Fatalf("second key check: %v", err)
+	}
+	gen, sess, err := st.Acquire(ctx, dev.ID, false, now, time.Minute)
+	if err != nil || gen != 5 || sess.KeyCheck == nil || *sess.KeyCheck != key("k") {
+		t.Fatalf("acquire after upgrade: generation %d %+v %v", gen, sess, err)
 	}
 	k := key("https://a.example/")
 	ops := []session.Op{
@@ -223,7 +229,7 @@ func TestMigration0003E2E(t *testing.T) {
 		res.Results[1].Status != session.StatusCoalesced || res.Results[1].EntryID != ops[0].EntryID {
 		t.Fatalf("opens after upgrade: %+v %v", res, err)
 	}
-	sess, err := st.GetSession(ctx)
+	sess, err = st.GetSession(ctx)
 	if err != nil || len(sess.Entries) != 1 || sess.Entries[0].URLKey != k || sess.Entries[0].URLEnc != "AAAA" {
 		t.Fatalf("session after upgrade: %+v %v", sess, err)
 	}

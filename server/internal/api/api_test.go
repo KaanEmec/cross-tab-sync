@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -537,6 +538,9 @@ func TestLimitsAndValidation(t *testing.T) {
 		"bad op id":       {"opId": "nope", "type": "close", "entryId": uid()},
 		"bad type":        {"opId": uid(), "type": "rewind", "entryId": uid()},
 		"plaintext url":   {"opId": uid(), "type": "open", "entryId": uid(), "url": "https://a.example/"},
+		"sealed plus url": {"opId": uid(), "type": "open", "entryId": uid(), "urlKey": k, "urlEnc": enc, "url": "https://a.example/"},
+		"unknown field":   {"opId": uid(), "type": "close", "entryId": uid(), "baseRevision": 0},
+		"not an object":   nil,
 		"short urlKey":    {"opId": uid(), "type": "open", "entryId": uid(), "urlKey": k[1:], "urlEnc": enc},
 		"urlKey alphabet": {"opId": uid(), "type": "navigate", "entryId": uid(), "urlKey": k[1:] + "+", "urlEnc": enc},
 		"empty urlEnc":    {"opId": uid(), "type": "open", "entryId": uid(), "urlKey": k, "urlEnc": ""},
@@ -660,4 +664,85 @@ func TestSealedURLsOnTheWire(t *testing.T) {
 	if !strings.Contains(changes, `"urlKey":"`+k+`"`) || !strings.Contains(changes, `"urlEnc":"`+enc+`"`) || strings.Contains(changes, `"url"`) {
 		t.Fatalf("changes %s", changes)
 	}
+}
+
+func TestKeyCheck(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, nil)
+	a, b := e.pair("A"), e.pair("B")
+	k1, k2 := urlKey("key one"), urlKey("key two")
+	keyCheck := func(path string) any {
+		t.Helper()
+		var m map[string]any
+		e.expect(http.StatusOK, "GET", path, a.Token, nil, &m)
+		v, ok := m["keyCheck"]
+		if !ok {
+			t.Fatalf("%s lacks keyCheck: %v", path, m)
+		}
+		return v
+	}
+	if v := keyCheck("/v2/session"); v != nil {
+		t.Fatalf("initial keyCheck %v, want null", v)
+	}
+
+	var er errorJSON
+	for _, bad := range []any{map[string]any{}, map[string]string{"keyCheck": k1[1:]}, map[string]string{"keyCheck": k1[1:] + "="}} {
+		e.expect(http.StatusBadRequest, "PUT", "/v2/session/key", a.Token, bad, &er)
+	}
+	e.expect(http.StatusNoContent, "PUT", "/v2/session/key", a.Token, map[string]string{"keyCheck": k1}, nil)
+	e.expect(http.StatusNoContent, "PUT", "/v2/session/key", b.Token, map[string]string{"keyCheck": k1}, nil) // equal: idempotent
+	var body map[string]any
+	e.expect(http.StatusConflict, "PUT", "/v2/session/key", b.Token, map[string]string{"keyCheck": k2}, &body)
+	if len(body) != 2 || body["error"] != "key_set" || body["message"] == nil {
+		t.Fatalf("key_set body %v", body)
+	}
+	if v := keyCheck("/v2/session"); v != k1 {
+		t.Fatalf("keyCheck %v, want %s", v, k1)
+	}
+	var acq struct {
+		Session map[string]any `json:"session"`
+	}
+	e.expect(http.StatusOK, "POST", "/v2/session/acquire", a.Token, nil, &acq)
+	if acq.Session["keyCheck"] != k1 {
+		t.Fatalf("acquire session keyCheck %v", acq.Session["keyCheck"])
+	}
+
+	e.expect(http.StatusNoContent, "DELETE", "/v2/devices/"+b.ID, a.Token, nil, nil)
+	e.expect(http.StatusUnauthorized, "PUT", "/v2/session/key", b.Token, map[string]string{"keyCheck": k1}, &er)
+	if er.Error != "device_revoked" {
+		t.Fatalf("revoked device: %+v", er)
+	}
+}
+
+// Two first browsers race to store different key checks: exactly one wins.
+func TestKeyCheckRace(t *testing.T) {
+	t.Parallel()
+	for range 5 {
+		e := newEnv(t, nil)
+		devs := []testDevice{e.pair("A"), e.pair("B")}
+		statuses := make([]int, len(devs))
+		var wg sync.WaitGroup
+		for i, d := range devs {
+			wg.Go(func() {
+				statuses[i] = e.call("PUT", "/v2/session/key", d.Token, map[string]string{"keyCheck": urlKey(d.ID)}, nil)
+			})
+		}
+		wg.Wait()
+		slices.Sort(statuses)
+		if !slices.Equal(statuses, []int{http.StatusNoContent, http.StatusConflict}) {
+			t.Fatalf("statuses %v, want one 204 and one 409", statuses)
+		}
+	}
+}
+
+// Unknown top-level fields stay ignored; only operation objects are strict.
+func TestUnknownTopLevelFieldsIgnored(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, nil)
+	a := e.pair("A")
+	gen := e.acquire(a, false)
+	e.expect(http.StatusOK, "POST", "/v2/session/operations", a.Token,
+		map[string]any{"generation": gen, "baseRevision": 0, "operations": []op{openOp(uid(), "https://a.example/")}, "extra": 1}, nil)
+	e.expect(http.StatusOK, "POST", "/v2/session/merge", a.Token,
+		map[string]any{"operations": []op{at(1, openOp(uid(), "https://b.example/"))}, "extra": 1}, nil)
 }

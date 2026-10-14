@@ -30,6 +30,7 @@ var (
 	ErrRevoked        = errors.New("device revoked")
 	ErrNotFound       = errors.New("not found")
 	ErrHistoryExpired = errors.New("history expired")
+	ErrKeySet         = errors.New("a different key check is already set")
 )
 
 // Conflict codes carried by ConflictError.

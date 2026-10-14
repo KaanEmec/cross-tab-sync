@@ -2,9 +2,9 @@
 
 Go service implementing [docs/PROTOCOL.md](../docs/PROTOCOL.md) v2 (routes under `/v2`). Stdlib `net/http`, SQLite via `modernc.org/sqlite` (no CGO), embedded migrations applied at startup.
 
-URLs are end-to-end encrypted: the server stores and returns each tab's `urlKey` (keyed hash, used to coalesce duplicates) and `urlEnc` (ciphertext) verbatim. It only checks their length and base64url alphabet and never decodes `urlEnc`; it holds no key.
+URLs are end-to-end encrypted: the server stores and returns each tab's `urlKey` (keyed hash, used to coalesce duplicates) and `urlEnc` (ciphertext) verbatim. It only checks their length and base64url alphabet and never decodes `urlEnc`; it holds no key. Operation objects with unknown fields (such as a plaintext `url`) are rejected with `400 invalid_request`. The session also holds a `keyCheck` (an HMAC derived from the shared key, `null` until set) that browsers compare with their own to detect a wrong key: `PUT /v2/session/key` stores it once (`204` when unset or equal, `409 key_set` when a different value is stored).
 
-**Upgrading from v1**: the first start of a v2 server deletes all entries, operations and snapshots, resets the revision to 0 and revokes every device. `/v1` routes answer `404 not_found`. Pair the first browser with a `pair-code` link (it then generates the encryption key) and invite the others from its popup.
+**Upgrading from v1**: the first start of a v2 server deletes all entries, operations and snapshots, resets the revision to 0, clears the key check and revokes every device. `/v1` routes answer `404 not_found`. Pair the first browser with a `pair-code` link (it then generates the encryption key) and invite the others from its popup.
 
 ## Build and test
 
@@ -52,6 +52,7 @@ curl -s -X POST $S/v2/session/operations -H "Authorization: Bearer $T" -d '{
                   "entryId":"8a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
                   "urlKey":"DxFdsGK3wN0DCxaHjJnepcNUtJ3DezjriEYXnHeD6dc",
                   "urlEnc":"AQAAAAAAAAAAAAAAAHBsYWNlaG9sZGVy"}]}'
+curl -s -X PUT $S/v2/session/key -H "Authorization: Bearer $T" -d '{"keyCheck":"Q2hlY2tDaGVja0NoZWNrQ2hlY2tDaGVja0NoZWNrQ2h"}'   # first browser only
 curl -s "$S/v2/session/changes?since=0" -H "Authorization: Bearer $T"
 # Offline journal from any device (no ownership); each op carries its own baseRevision.
 curl -s -X POST $S/v2/session/merge -H "Authorization: Bearer $T" -d '{

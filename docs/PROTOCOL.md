@@ -122,7 +122,7 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 
 ## Errors
 
-`{ "error": "snake_case_code", "message": "human readable", ...details }`. Every `409` carries `owner` (possibly `null`). Timestamps are RFC 3339 UTC with milliseconds. Codes: `invalid_request`, `invalid_code`, `unauthorized`, `device_revoked`, `forbidden`, `not_found`, `owner_active`, `stale_owner`, `history_expired`, `payload_too_large`, `key_set`, `internal`.
+`{ "error": "snake_case_code", "message": "human readable", ...details }`. Every ownership `409` (`owner_active`, `stale_owner`) carries `owner` (possibly `null`); `409 key_set` carries only `error` and `message`. Timestamps are RFC 3339 UTC with milliseconds. Codes: `invalid_request`, `invalid_code`, `unauthorized`, `device_revoked`, `forbidden`, `not_found`, `owner_active`, `stale_owner`, `history_expired`, `payload_too_large`, `key_set`, `internal`.
 
 ## Client behavior (v0.1 manual handover)
 

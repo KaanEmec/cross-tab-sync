@@ -39,6 +39,7 @@ func New(st *store.Store, cfg config.Config, log *slog.Logger, now func() time.T
 	mux.Handle("PATCH /v2/devices/{id}", s.auth(s.renameDevice))
 	mux.Handle("DELETE /v2/devices/{id}", s.auth(s.revokeDevice))
 	mux.Handle("GET /v2/session", s.auth(s.getSession))
+	mux.Handle("PUT /v2/session/key", s.auth(s.setKeyCheck))
 	mux.Handle("GET /v2/session/changes", s.auth(s.changes))
 	mux.Handle("POST /v2/session/acquire", s.auth(s.acquire))
 	mux.Handle("POST /v2/session/release", s.auth(s.release))
@@ -224,6 +225,8 @@ func (s *Server) storeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusUnauthorized, "device_revoked", "this device has been revoked; pair again", nil)
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "not found", nil)
+	case errors.Is(err, store.ErrKeySet):
+		writeError(w, http.StatusConflict, "key_set", "a different key check is already set", nil)
 	case errors.Is(err, store.ErrHistoryExpired):
 		writeError(w, http.StatusGone, "history_expired", "history is not available; fetch the full session", nil)
 	default:
