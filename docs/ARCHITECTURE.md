@@ -80,7 +80,7 @@ URLs are end-to-end encrypted ([PROTOCOL.md](PROTOCOL.md#encryption)); the serve
 
 - **The server learns:** the number of open tabs, when they change and which device changed them, device names, pinned state and order, and whether two URLs are equal.
 - **It cannot:** read or forge a URL, or move a ciphertext to another URL (the URL hash is the authenticated data).
-- **It can still:** withhold or delay changes, replay an older ciphertext of the same entry, and inject `close` operations. Operations are not signed.
+- **It can still:** withhold or delay changes, replay any `(urlKey, urlEnc)` pair it has ever seen as an `open` or `navigate` of any entry, and inject `close` operations. Operations are not signed. A server-held key check keeps a browser with a different key from ever sending or applying anything.
 
 ## Roadmap status
 
