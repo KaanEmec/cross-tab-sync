@@ -40,5 +40,5 @@ Upload: `cross-tab-sync-brave-<version>.zip` from the GitHub release, or `pnpm b
 2. **Items › New item**, upload the zip.
 3. Fill **Store listing** and **Privacy practices** as above.
 4. **Distribution:** Free, all regions, visibility **Unlisted**.
-5. **Submit for review.** After approval, copy the item id from the dashboard into the store link in `docs/INSTALL.md` and `README.md` (`https://chromewebstore.google.com/detail/cross-tab-sync/<id>`).
+5. **Submit for review.** After approval, copy the item id from the dashboard into the store link in `docs/INSTALL.md` and `README.md` (`https://chromewebstore.google.com/detail/cross-tab-sync/doimphmglhmgenljfmaopbphbhmpcfdk`).
 6. Updates: bump `version` in `extension/package.json` (the store rejects an equal or lower version), tag, upload the new release zip under **Package**, submit.

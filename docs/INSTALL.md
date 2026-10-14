@@ -6,7 +6,7 @@ By default the extension uses the hosted server `https://cts.kexperiments.com`. 
 
 ## 1. Brave
 
-1. Open the [Cross-Tab-Sync page in the Chrome Web Store](https://chromewebstore.google.com/detail/cross-tab-sync/<id>) in Brave and click **Add to Brave**, then **Add extension**. *(The store link is filled in after the first store review.)*
+1. Open the [Cross-Tab-Sync page in the Chrome Web Store](https://chromewebstore.google.com/detail/cross-tab-sync/doimphmglhmgenljfmaopbphbhmpcfdk) in Brave and click **Add to Brave**, then **Add extension**.
 2. Click the puzzle icon in the toolbar and pin Cross-Tab-Sync, then click its icon.
 3. If this is your first browser: check the device name and click **Start syncing**. Brave asks to let the extension reach the sync server; click **Allow**. If the popup closes, click the icon again.
 4. The popup now shows an invite link and "Install the extension in your other browser and paste this link there." Click **Copy** and get the link to your other computer privately (for example a note to yourself). It works once, for 10 minutes.

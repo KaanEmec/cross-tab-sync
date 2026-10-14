@@ -4,7 +4,7 @@ Cross-Tab-Sync preserves your browsing context when switching between Safari on 
 
 ## Install
 
-1. **Brave:** add Cross-Tab-Sync from the [Chrome Web Store](https://chromewebstore.google.com/detail/cross-tab-sync/<id>) and click **Start syncing**.
+1. **Brave:** add Cross-Tab-Sync from the [Chrome Web Store](https://chromewebstore.google.com/detail/cross-tab-sync/doimphmglhmgenljfmaopbphbhmpcfdk) and click **Start syncing**.
 2. **Safari 18.4+:** download `Cross-Tab-Sync-<version>.dmg` from the [latest release](https://github.com/KaanEmec/cross-tab-sync/releases/latest), open the app once, enable it in Safari › Settings › Extensions with access to **All Websites**.
 3. Paste the invite link from the first browser into the extension in the second.
 
