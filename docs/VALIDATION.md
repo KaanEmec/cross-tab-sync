@@ -46,6 +46,18 @@ Setup: follow [INSTALL.md](INSTALL.md). Run the server with `CTS_ALLOW_INSECURE=
 - [ ] Restore a snapshot: the listed tabs reopen in the background; a pre-restore snapshot appears in the list.
 - [ ] Pause on one device, close tabs there, resume: nothing is deleted remotely.
 
+## End-to-end encryption (v2.0.0)
+
+- [ ] Pair the first browser from the CLI link; it generates the key (status shows paired, no key prompt).
+- [ ] Invite a second browser from the first popup, open the invite link there: it pairs and receives the tabs.
+- [ ] Sync both ways: open, navigate, close and restore a snapshot on each side; the other side follows and URLs match exactly.
+- [ ] Blindness: `sqlite3 data/cts.db "select url_key, url_enc from entries"` shows only hashes and ciphertext; `grep -c http` over dumps of `entries`, `operations` and `snapshots` returns 0 for each.
+- [ ] `GET /v2/session` (and `changes`) contain only `urlKey` and `urlEnc`, no readable URL.
+- [ ] A third browser pairing with a keyless link (CLI code or bare code) while the session has tabs is refused with a clear message and revokes itself; the other two are unaffected.
+- [ ] A browser holding a different key reports `key_mismatch` and changes no local tabs.
+- [ ] Upgrade a v1 database to v2: entries, operations and snapshots are gone, the revision is 0, every device is revoked and must pair again.
+- [ ] Cost: fill the "Measured cost" table in `versions/v2.0.0/01-end-to-end-encryption/01-encrypt-urls.md` (bytes on the wire and container CPU for a 200-tab sync, v1 versus v2).
+
 ## Release
 
 - [ ] Fresh install of the server on the VPS from the published image; backup and restore work as documented.
