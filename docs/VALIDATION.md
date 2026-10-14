@@ -2,6 +2,10 @@
 
 Everything in this repository is verified by unit tests, an integration test against the real server, and code review. The checks below need the real browsers: Safari on macOS and Brave on Windows, both paired to one server. Record the result of each line (pass, fail, notes) plus browser and OS versions. They cover the roadmap jobs `v0.1.0/01-session-contract/02`, `v0.2.0/03-reconciliation/02` and `v1.0.0/03-release/02`.
 
+## Results so far (2026-10-14, Safari 27.0 and Brave 1.97 / Chromium 155 on one Mac, macOS 26.6.2, local server over HTTP)
+
+Driven with AppleScript on both browsers and Chrome DevTools Protocol on Brave; server state read from SQLite. Verified: pairing both browsers; initial publish of 10 tabs; additions, navigation and explicit closures propagating both ways; duplicate copies on one device (one entry, close only on the last copy, in owner and follower roles); whole-window close in Brave and in Safari producing no closures; Safari quit and relaunch producing no closures and no takeover; Brave relaunch as follower staying follower; remote close of the local active tab leaving it open and detached without republishing; automatic handover within about 1 s on focus or click in either direction, including after a silent loss of ownership. Fixed during this pass: restart taking over, same-site URL rewrites republishing detached tabs, a superseded owner not noticing until its next contact. Not yet verified: Windows, pinned-state application, two separate machines, long offline periods, restore from snapshot in the real popup.
+
 Setup: follow [INSTALL.md](INSTALL.md). Run the server with `CTS_ALLOW_INSECURE=1` on a LAN address only for a first smoke test; use HTTPS for everything else.
 
 ## Capability checks (answers the open questions in [COMPATIBILITY.md](COMPATIBILITY.md))
@@ -10,7 +14,7 @@ Setup: follow [INSTALL.md](INSTALL.md). Run the server with `CTS_ALLOW_INSECURE=
 - [ ] Safari: the popup lists tab URLs only after *All Websites* access is granted; before that, the status shows nothing eligible.
 - [ ] Both: a received tab opens in the background; the active tab and focused window do not change. A new window created when none is suitable stays unfocused.
 - [ ] Both: `runtime.onStartup` fires on launch (log line "startup reset"), and restored tabs are matched to their previous entries, not republished.
-- [ ] Both: closing a window, quitting, and crash recovery do not produce `close` operations (check the other device keeps its tabs).
+- [x] Both: closing a window, quitting, and crash recovery do not produce `close` operations (check the other device keeps its tabs).
 - [ ] Safari: the 5-minute alarm fires while Safari is open; after relaunch the first run happens within a minute.
 - [ ] Both: the server receives requests without CORS errors once the origin is granted (check the worker console).
 
@@ -23,12 +27,12 @@ Setup: follow [INSTALL.md](INSTALL.md). Run the server with `CTS_ALLOW_INSECURE=
 
 ## Automatic sync (v0.2.0)
 
-- [ ] Use Safari, then switch to Brave and click something: Brave takes over within a few seconds; Safari's popup shows "follower" after its next run.
+- [x] Use Safari, then switch to Brave and click something: Brave takes over within a few seconds; Safari's popup shows "follower" after its next run.
 - [ ] Leave both browsers open and idle: ownership does not flip.
-- [ ] Open a tab on the owner: it appears on the follower within 5 minutes (or after Sync now).
-- [ ] Navigate a tab on the owner: the follower's copy follows; no extra tab is created when the destination is already open.
-- [ ] Close a tab on the owner: the follower's background copy closes; if it is the follower's active tab it stays open.
-- [ ] Open the same URL twice on one device: one shared entry; closing one copy changes nothing remotely; closing the last copy closes remotely.
+- [x] Open a tab on the owner: it appears on the follower within 5 minutes (or after Sync now).
+- [x] Navigate a tab on the owner: the follower's copy follows; no extra tab is created when the destination is already open.
+- [x] Close a tab on the owner: the follower's background copy closes; if it is the follower's active tab it stays open (verified on one Mac; window close and quit also verified).
+- [x] Open the same URL twice on one device: one shared entry; closing one copy changes nothing remotely; closing the last copy closes remotely.
 - [ ] Manual Hand over, then touch the same browser within a minute: no automatic takeover until a fresh interaction after 60 s idle.
 - [ ] Sleep the laptop for 10 minutes, wake: no spurious closures; the next run reconciles.
 

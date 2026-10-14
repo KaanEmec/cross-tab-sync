@@ -60,6 +60,9 @@ Other relevant numbers: Chrome worker idle limit 30 s, single event/API call 5 m
 
 ## 4. Open questions to verify on real browsers
 
+Answered on 2026-10-14 with Safari 27.0 / macOS 26.6.2 and Brave 1.97 (Chromium 155): closing a Safari window or quitting Safari produced no individual-close operations (the held-close rules dropped them); Safari fires `windows.onFocusChanged` on app activation; the pairing flow with `permissions.request` worked in both browsers; `tabs.create({active:false})` did not steal focus; Safari reports a pinned tab once per window with distinct ids; `storage.session` is available in both, so the new-session marker works; Brave restored its session with new tab ids and mappings re-matched by URL. Still open: everything Windows-specific, `isWindowClosing` accuracy (not needed any more thanks to held closes), and alarm behavior while Safari is closed.
+
+
 Run each on Safari (macOS, recommended floor and latest) and Brave (Windows), with extension granted all-site access.
 
 1. Does `tabs.move` exist and work in Safari, within and across windows? If not, confirm the fallback.
