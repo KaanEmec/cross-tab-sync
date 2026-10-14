@@ -143,14 +143,11 @@ Scope: ordinary `http` and `https` tabs, pinned state and order where the browse
 
 ```mermaid
 flowchart LR
-    subgraph Safari on macOS
-        SA["Swift host app"] --- SE["WebExtension<br>shared TypeScript core"]
-    end
-    subgraph Brave on Windows
-        BE["WebExtension<br>shared TypeScript core"]
-    end
-    SE <-- "HTTPS, JSON<br>ciphertext + fingerprints" --> SRV["Go service<br>SQLite, blind"]
-    BE <-- "HTTPS" --> SRV
+    SE["Safari on macOS<br>WebExtension in a Swift host app"]
+    SRV[("Go service + SQLite<br>blind: ciphertext and fingerprints")]
+    BE["Brave on Windows<br>WebExtension"]
+    SE <-- "HTTPS, JSON" --> SRV <-- "HTTPS, JSON" --> BE
+    style SRV fill:#eef2f6,stroke:#99a6b6,color:#141a20
 ```
 
 - **Extension**: one TypeScript core shared by both browsers, browser-free and unit tested; a thin adapter over the `chrome.*` API; encryption at the HTTP boundary so the sync logic never sees ciphertext.
