@@ -224,6 +224,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          # Only release assets; the docker build record (*.dockerbuild) is not one.
+          pattern: "{bin-*,extension-zips,safari-dmg}"
           path: assets
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
