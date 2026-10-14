@@ -203,6 +203,10 @@
     merge(operations) {
       return this.request("POST", "/v1/session/merge", { operations });
     }
+    /** Diagnostics trace lines (core/diag.ts); the server accepts them only with CTS_DEBUG (else 404). */
+    async postDiag(lines) {
+      await this.request("POST", "/v1/diag", { lines });
+    }
     async snapshots() {
       const res = await this.request("GET", "/v1/snapshots");
       return res.snapshots;
@@ -254,6 +258,15 @@
 
   // src/core/diag.ts
   var enabled = false;
+  var POST_LINES = 100;
+  var LINE_CHARS = 300;
+  var MAX_BUFFER = 500;
+  var DIAG_FLUSH_MS = 1e3;
+  var sink = null;
+  var buffer = [];
+  var timer = null;
+  var posting = false;
+  var rejected = false;
   var URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/\S*/gi;
   function isLoopbackUrl(url) {
     try {
@@ -278,6 +291,7 @@
     if (!enabled) return;
     const line = msg.replace(URL_LIKE, "<url>");
     console.log("[cts] " + line);
+    remember(line);
     try {
       const runtime = typeof chrome !== "undefined" ? chrome.runtime : void 0;
       if (typeof runtime?.sendNativeMessage !== "function") return;
@@ -285,6 +299,38 @@
       if (sent instanceof Promise) sent.catch(() => void 0);
     } catch {
     }
+  }
+  function setDiagSink(fn) {
+    sink = fn;
+    buffer = [];
+    rejected = false;
+  }
+  function remember(line) {
+    if (!sink || rejected) return;
+    buffer.push(line.slice(0, LINE_CHARS));
+    if (buffer.length > MAX_BUFFER) buffer.splice(0, buffer.length - MAX_BUFFER);
+    schedule();
+  }
+  function schedule() {
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      flushDiag();
+    }, DIAG_FLUSH_MS);
+  }
+  function flushDiag() {
+    if (!sink || rejected || posting || buffer.length === 0) return;
+    const lines = buffer.splice(0, POST_LINES);
+    posting = true;
+    sink(lines).catch((e) => {
+      if (e?.status === 404) {
+        rejected = true;
+        buffer = [];
+      }
+    }).finally(() => {
+      posting = false;
+      if (buffer.length > 0) schedule();
+    });
   }
 
   // src/core/activity.ts
@@ -1372,7 +1418,7 @@
   async function submitJournal(store) {
     const api = apiFor(store.deps, store.s);
     const revive = /* @__PURE__ */ new Set();
-    let rejected = 0;
+    let rejected2 = 0;
     for (; ; ) {
       const batch = batches(toMerge(store.s.pending))[0];
       if (!batch) break;
@@ -1381,18 +1427,18 @@
         res = await api.merge(batch);
       } catch (e) {
         if (!isMalformed(e)) throw e;
-        rejected += await dropBatch(store, batch);
+        rejected2 += await dropBatch(store, batch);
         continue;
       }
       await applyMergeResults(store, batch, res.results, revive);
       if (batch.every((op) => store.s.pending.some((p) => p.op.opId === op.opId))) break;
     }
-    return { rejected, revive };
+    return { rejected: rejected2, revive };
   }
 
   // src/core/sync.ts
-  function rejectedMessage(rejected) {
-    return rejected > 0 ? `${rejected} change(s) were rejected by the server and dropped` : null;
+  function rejectedMessage(rejected2) {
+    return rejected2 > 0 ? `${rejected2} change(s) were rejected by the server and dropped` : null;
   }
   function createFailedMessage(failed) {
     return failed > 0 ? `${failed} tab(s) could not be created` : null;
@@ -1407,7 +1453,7 @@
     const generation = store.s.generation;
     if (generation === null) throw new Error("This device is not the owner");
     const api = apiFor(deps2, store.s);
-    let rejected = 0;
+    let rejected2 = 0;
     let failed = 0;
     for (let first = true; ; first = false) {
       const batch = batches(list(store.s.pending))[0] ?? [];
@@ -1417,7 +1463,7 @@
         res = await api.operations({ generation, baseRevision: store.s.lastRevision, operations: batch });
       } catch (e) {
         if (!isMalformed(e)) throw e;
-        rejected += await dropBatch(store, batch);
+        rejected2 += await dropBatch(store, batch);
         continue;
       }
       let mappings = applyResults(store.s.mappings, batch, res.results);
@@ -1435,14 +1481,14 @@
       await store.set({ pending, mappings });
       if (res.fullResync) {
         failed += await resync(store);
-        rejected += (await submitJournal(store)).rejected;
+        rejected2 += (await submitJournal(store)).rejected;
         break;
       }
       await applyRemote(store, res.catchUp?.operations ?? [], navigated);
       await store.set({ lastRevision: res.revision, ...succeeded(deps2) });
       if (batch.length > 0 && batch.every((op) => store.s.pending.some((p) => p.op.opId === op.opId))) break;
     }
-    return { rejected, failed };
+    return { rejected: rejected2, failed };
   }
   async function resync(store) {
     const session = await apiFor(store.deps, store.s).session();
@@ -1488,10 +1534,10 @@
   async function ownerRun(store) {
     const generation = store.s.generation;
     try {
-      const { rejected, failed } = await flush(store);
+      const { rejected: rejected2, failed } = await flush(store);
       await store.set({
         ...succeeded(store.deps),
-        lastError: joined(createFailedMessage(failed), rejectedMessage(rejected)),
+        lastError: joined(createFailedMessage(failed), rejectedMessage(rejected2)),
         statusText: `Owner, generation ${generation}, revision ${store.s.lastRevision}`
       });
     } catch (e) {
@@ -1520,13 +1566,13 @@
       const generation = store.s.generation;
       if (generation === null) throw new Error("This device is not the owner. Use Continue here to take control first.");
       await materialize(store, null, true);
-      const { rejected, failed } = await flush(store);
+      const { rejected: rejected2, failed } = await flush(store);
       await apiFor(deps2, store.s).release(generation);
       await store.set({
         generation: null,
         owner: null,
         ...succeeded(deps2),
-        lastError: [createFailedMessage(failed), rejectedMessage(rejected)].filter(Boolean).join("; ") || null,
+        lastError: [createFailedMessage(failed), rejectedMessage(rejected2)].filter(Boolean).join("; ") || null,
         statusText: `Handed over at revision ${store.s.lastRevision}`,
         suppressAutoTakeover: true,
         lastActivityAt: nowMs(deps2),
@@ -1828,11 +1874,15 @@
      * `retrySchedule` runs the backoff retries and `rematchSchedule` the delayed re-matches after a
      * startup reset (separate so tests can fire them on their own).
      */
-    constructor(deps2, schedule = timeoutScheduler, retrySchedule = schedule, rematchSchedule = schedule) {
+    constructor(deps2, schedule2 = timeoutScheduler, retrySchedule = schedule2, rematchSchedule = schedule2) {
       this.deps = deps2;
-      this.schedule = schedule;
+      this.schedule = schedule2;
       this.retrySchedule = retrySchedule;
       this.rematchSchedule = rematchSchedule;
+      setDiagSink(async (lines) => {
+        const s = await loadState(deps2.adapter.storage);
+        if (isPaired(s)) await deps2.api({ baseUrl: s.serverUrl, token: s.token }).postDiag(lines);
+      });
     }
     deps;
     schedule;
@@ -1904,6 +1954,7 @@
           return await fn();
         } finally {
           diag(`task ${label} end ${Date.now() - started}ms`);
+          flushDiag();
         }
       });
       const done = () => {

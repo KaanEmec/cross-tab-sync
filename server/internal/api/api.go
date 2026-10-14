@@ -47,6 +47,10 @@ func New(st *store.Store, cfg config.Config, log *slog.Logger, now func() time.T
 	mux.Handle("POST /v1/session/merge", s.auth(s.merge))
 	mux.Handle("GET /v1/snapshots", s.auth(s.listSnapshots))
 	mux.Handle("POST /v1/snapshots/{id}/restore", s.auth(s.restore))
+	if cfg.Debug {
+		// Development aid only; without CTS_DEBUG the path falls through to 404 not_found.
+		mux.Handle("POST /v1/diag", s.auth(s.diag))
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint", nil)
 	})

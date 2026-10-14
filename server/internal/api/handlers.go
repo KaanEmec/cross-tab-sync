@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -377,4 +378,36 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"revision": res.Revision, "results": results(res.Results)})
+}
+
+// Limits for POST /v1/diag.
+const (
+	maxDiagLines    = 200
+	maxDiagLineRune = 300
+)
+
+// diag logs client diagnostics lines (CTS_DEBUG only). The extension sends
+// event kinds, tab ids, entry id prefixes and run results, never URLs or tokens.
+func (s *Server) diag(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Lines []string `json:"lines"`
+	}
+	if !decode(w, r, &req, false) {
+		return
+	}
+	if len(req.Lines) > maxDiagLines {
+		invalid(w, fmt.Sprintf("at most %d lines", maxDiagLines))
+		return
+	}
+	for _, l := range req.Lines {
+		if utf8.RuneCountInString(l) > maxDiagLineRune {
+			invalid(w, fmt.Sprintf("lines must be at most %d characters", maxDiagLineRune))
+			return
+		}
+	}
+	id := device(r).ID
+	for _, l := range req.Lines {
+		s.log.LogAttrs(r.Context(), slog.LevelInfo, "diag", slog.String("device_id", id), slog.String("line", l))
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

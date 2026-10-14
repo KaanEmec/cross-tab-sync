@@ -23,6 +23,7 @@ export type Api = Pick<
   | "merge"
   | "snapshots"
   | "restoreSnapshot"
+  | "postDiag"
 >;
 
 export interface Deps {

@@ -18,6 +18,7 @@ type Config struct {
 	SnapshotRetention int           // CTS_SNAPSHOT_RETENTION
 	HistoryRetention  time.Duration // CTS_HISTORY_RETENTION
 	PublicURL         string        // CTS_PUBLIC_URL, e.g. https://tabs.example.com (no trailing slash); "" when unset
+	Debug             bool          // CTS_DEBUG: accept and log client diagnostics (POST /v1/diag); development aid
 }
 
 // Default returns the configuration used when no variables are set.
@@ -46,6 +47,13 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("CTS_ALLOW_INSECURE: %w", err)
 		}
 		c.AllowInsecure = b
+	}
+	if v := getenv("CTS_DEBUG"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("CTS_DEBUG: %w", err)
+		}
+		c.Debug = b
 	}
 	if v := getenv("CTS_OWNER_LIVENESS"); v != "" {
 		d, err := time.ParseDuration(v)

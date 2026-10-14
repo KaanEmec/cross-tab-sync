@@ -28,17 +28,19 @@ func TestLoad(t *testing.T) {
 		"CTS_SNAPSHOT_RETENTION": "5",
 		"CTS_HISTORY_RETENTION":  "48h",
 		"CTS_PUBLIC_URL":         "https://tabs.example.com/",
+		"CTS_DEBUG":              "1",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{Addr: "127.0.0.1:9000", DBPath: "/data/x.db", AllowInsecure: true, OwnerLiveness: 90 * time.Second, SnapshotRetention: 5, HistoryRetention: 48 * time.Hour, PublicURL: "https://tabs.example.com"}
+	want := Config{Addr: "127.0.0.1:9000", DBPath: "/data/x.db", AllowInsecure: true, OwnerLiveness: 90 * time.Second, SnapshotRetention: 5, HistoryRetention: 48 * time.Hour, PublicURL: "https://tabs.example.com", Debug: true}
 	if c != want {
 		t.Fatalf("got %+v, want %+v", c, want)
 	}
 
 	for _, bad := range []map[string]string{
 		{"CTS_ALLOW_INSECURE": "maybe"},
+		{"CTS_DEBUG": "verbose"},
 		{"CTS_OWNER_LIVENESS": "-1m"},
 		{"CTS_OWNER_LIVENESS": "ten"},
 		{"CTS_SNAPSHOT_RETENTION": "0"},

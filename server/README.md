@@ -28,6 +28,7 @@ CTS_PUBLIC_URL=http://127.0.0.1:8080 ./bin/cross-tab-sync pair-code   # prints h
 | `CTS_SNAPSHOT_RETENTION` | `20` | Recovery snapshots kept |
 | `CTS_HISTORY_RETENTION` | `720h` | Operation log and tombstones kept (Go duration) |
 | `CTS_PUBLIC_URL` | unset | Public base URL, e.g. `https://tabs.example.com` (http/https, no query or fragment). Used for pairing links from `POST /v1/pairing-codes` and `pair-code`. Unset: the API derives it from the request (TLS or `X-Forwarded-Proto` scheme + `Host`) and the CLI prints bare codes |
+| `CTS_DEBUG` | `false` | Development aid. Enables `POST /v1/diag`, where the extension (with diagnostics on, by default when its server is a loopback address) sends its trace: event kinds, tab ids, entry id prefixes, op types and run results, never URLs or tokens. Each line is logged at info level as `msg: "diag"` with `device_id` and `line`. Unset: the route answers `404 not_found`. Do not enable in production |
 
 Logs are JSON on stdout with method, route pattern, status, device id and latency only. History older than `CTS_HISTORY_RETENTION` is pruned at startup and hourly (open entries are always kept); clients behind `minRevision` get `410 history_expired` or `fullResync: true` and reload the session. Operations older than the retention window are treated as new if resubmitted, so a resent opening of a pruned closed entry recreates it.
 

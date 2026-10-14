@@ -420,5 +420,10 @@ export class FakeServer {
       const results = ops.map((op) => this.apply(d.id, op));
       return { revision: this.revision, results };
     },
+    // Like a server without CTS_DEBUG.
+    postDiag: async () => {
+      this.auth(cfg.token);
+      throw new ApiError(404, "not_found", "no such endpoint", { error: "not_found" });
+    },
   });
 }

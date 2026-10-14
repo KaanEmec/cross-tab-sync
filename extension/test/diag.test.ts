@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { diag, diagnosticsOn, isLoopbackUrl, refreshDiagnostics, setDiagnostics } from "../src/core/diag.js";
+import { diag, diagnosticsOn, flushDiag, isLoopbackUrl, refreshDiagnostics, setDiagnostics, setDiagSink } from "../src/core/diag.js";
 import { MemoryStorage } from "../src/adapter/fake.js";
 
 afterEach(() => {
   setDiagnostics(false);
+  setDiagSink(null);
   vi.restoreAllMocks();
 });
 
@@ -31,5 +32,32 @@ describe("diagnostics", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     diag("on");
     expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it("posts buffered lines to the server; a 404 stops posting until the worker restarts", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const posted: string[][] = [];
+    let status = 204;
+    setDiagSink(async (lines) => {
+      posted.push(lines);
+      if (status === 404) throw Object.assign(new Error("not found"), { status: 404 });
+    });
+    setDiagnostics(true);
+    diag("a");
+    diag("b " + "x".repeat(400));
+    flushDiag();
+    await Promise.resolve();
+    expect(posted).toEqual([["a", "b " + "x".repeat(298)]]);
+
+    status = 404;
+    diag("c");
+    await new Promise((r) => setTimeout(r, 0)); // previous post settled
+    flushDiag();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(posted).toHaveLength(2);
+    diag("d");
+    flushDiag();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(posted).toHaveLength(2); // stopped
   });
 });

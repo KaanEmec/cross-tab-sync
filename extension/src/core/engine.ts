@@ -5,7 +5,7 @@
 
 import type { TabInfo } from "../adapter/types.js";
 import { onActivity, onDemoted, type ActivityKind } from "./activity.js";
-import { diag, errText, refreshDiagnostics } from "./diag.js";
+import { diag, errText, flushDiag, refreshDiagnostics, setDiagSink } from "./diag.js";
 import {
   CLOSE_HOLD_MS,
   recordCreated,
@@ -109,7 +109,13 @@ export class SyncEngine {
     private readonly schedule: Scheduler = timeoutScheduler,
     private readonly retrySchedule: Scheduler = schedule,
     private readonly rematchSchedule: Scheduler = schedule,
-  ) {}
+  ) {
+    // Server copy of the diagnostics trace (only sent while diagnostics are on).
+    setDiagSink(async (lines) => {
+      const s = await loadState(deps.adapter.storage);
+      if (isPaired(s)) await deps.api({ baseUrl: s.serverUrl, token: s.token }).postDiag(lines);
+    });
+  }
 
   /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
   attach(): void {
@@ -167,6 +173,7 @@ export class SyncEngine {
         return await fn();
       } finally {
         diag(`task ${label} end ${Date.now() - started}ms`);
+        flushDiag();
       }
     });
     const done = () => {

@@ -241,6 +241,11 @@ export class ApiClient {
     return this.request("POST", "/v1/session/merge", { operations });
   }
 
+  /** Diagnostics trace lines (core/diag.ts); the server accepts them only with CTS_DEBUG (else 404). */
+  async postDiag(lines: string[]): Promise<void> {
+    await this.request("POST", "/v1/diag", { lines });
+  }
+
   async snapshots(): Promise<Snapshot[]> {
     const res = await this.request<{ snapshots: Snapshot[] }>("GET", "/v1/snapshots");
     return res.snapshots;
