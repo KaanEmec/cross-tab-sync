@@ -44,6 +44,8 @@ export interface Dev {
   timers: ManualTimers;
   /** Backoff retry timers; `settle` never fires them. */
   retries: ManualTimers;
+  /** Delayed re-matches after a startup reset; `settle` never fires them. */
+  rematches: ManualTimers;
   /** The normal window created for the device (unless `noWindow`). */
   win: number;
   id: string;
@@ -82,7 +84,8 @@ export async function device(
   await b.sessionStorage?.set({ [SESSION_MARKER]: clock.t });
   const timers = new ManualTimers(clock);
   const retries = new ManualTimers(clock);
-  const engine = new SyncEngine(deps, timers.schedule, retries.schedule);
+  const rematches = new ManualTimers(clock);
+  const engine = new SyncEngine(deps, timers.schedule, retries.schedule, rematches.schedule);
   engine.attach();
   return {
     b,
@@ -90,6 +93,7 @@ export async function device(
     engine,
     timers,
     retries,
+    rematches,
     win,
     id,
     state: () => loadState(b.storage),

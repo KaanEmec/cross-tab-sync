@@ -33,6 +33,12 @@ export const SYNC_DEBOUNCE_MS = 2_000;
  */
 export const VERIFY_INTERVAL_MS = 10_000;
 
+/**
+ * After a startup reset the open tabs are re-matched by URL at once and again after these delays:
+ * Safari restores tabs lazily (no tab events until a tab is activated) and restores can trickle in.
+ */
+export const REMATCH_DELAYS_MS = [5_000, 30_000];
+
 /** Key in session storage present for the lifetime of one browser session. */
 export const SESSION_MARKER = "cts.browserSession";
 
@@ -81,11 +87,15 @@ export class SyncEngine {
    */
   private lastVerifyAt = -Infinity;
 
-  /** `retrySchedule` runs the backoff retries (separate so tests can fire them on their own). */
+  /**
+   * `retrySchedule` runs the backoff retries and `rematchSchedule` the delayed re-matches after a
+   * startup reset (separate so tests can fire them on their own).
+   */
   constructor(
     readonly deps: Deps,
     private readonly schedule: Scheduler = timeoutScheduler,
     private readonly retrySchedule: Scheduler = schedule,
+    private readonly rematchSchedule: Scheduler = schedule,
   ) {}
 
   /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
@@ -155,17 +165,33 @@ export class SyncEngine {
    * Tab ids from a previous browser session must never be read against the current tabs, and
    * restored tabs' events can arrive before runtime.onStartup. So every queued task first checks a
    * marker in session storage (cleared when the browser exits) and runs the startup reset when it
-   * is missing. Without session storage, only runtime.onStartup resets.
+   * is missing. Without session storage, only runtime.onStartup resets. After a reset the open
+   * tabs are re-matched by URL (tabs.query reports URLs of restored tabs that never loaded and send
+   * no events, as in Safari) now and after REMATCH_DELAYS_MS; restored tabs' events still re-match
+   * on their own during the stale-mapping window.
    */
   private async ensureSession(force: boolean | "always" = false): Promise<void> {
     const marker = this.deps.adapter.sessionStorage;
     if (!marker) {
-      if (force) await resetForBrowserStartup(this.deps);
+      if (force) await this.reset();
       return;
     }
     if (force !== "always" && (await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== undefined) return;
-    await resetForBrowserStartup(this.deps);
+    await this.reset();
     await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
+  }
+
+  private async reset(): Promise<void> {
+    await resetForBrowserStartup(this.deps);
+    await rematchTabs(this.deps);
+    for (const ms of REMATCH_DELAYS_MS) {
+      this.rematchSchedule(() => {
+        void this.enqueue(async () => {
+          await this.ensureSession();
+          await rematchTabs(this.deps);
+        }).catch(ignore);
+      }, ms);
+    }
   }
 
   /**
@@ -272,14 +298,11 @@ export class SyncEngine {
 
   /**
    * Browser startup (`browser`): set mappings aside unless already done for this session, start
-   * the grace period, catch up shortly after. Extension update (`update`): the same reset always.
+   * the grace period, re-match the open tabs by URL, catch up shortly after. Extension update
+   * (`update`): the same reset always (the tabs are already loaded and send no restore events).
    */
   async startup(reason: "browser" | "update" = "browser"): Promise<void> {
-    await this.enqueue(async () => {
-      await this.ensureSession(reason === "update" ? "always" : true);
-      // The tabs are already loaded after an update (no restore events): re-match them now.
-      if (reason === "update") await rematchTabs(this.deps);
-    });
+    await this.enqueue(() => this.ensureSession(reason === "update" ? "always" : true));
     this.requestSync();
   }
 

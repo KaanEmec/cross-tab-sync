@@ -551,6 +551,39 @@ describe("live testing fixes", () => {
     expect(s.detached).toEqual({});
   });
 
+  it("Safari restart: restored tabs that send no events are re-matched by URL, so closing one closes its entry", async () => {
+    await owner("Brave", ["https://a/", "https://b/", "https://c/"]);
+    const mac = await follower("Mac Safari");
+    clock.advance(120_000);
+    mac.b.restart();
+    const win = mac.b.addWindow({ focused: true });
+    // Lazily restored: listed by tabs.query with their URLs, but no onCreated/onUpdated.
+    mac.b.addTab(win, { url: "https://a/", active: true });
+    const b = mac.b.addTab(win, { url: "https://b/" });
+    mac.b.events.startup.emit();
+    await mac.settle();
+    const urls = async () => Object.values((await mac.state()).mappings.tabs).map((m) => m.url).sort();
+    expect(await urls()).toEqual(["https://a/", "https://b/"]);
+
+    // A window restored a little later, also silently: the delayed re-match finds it.
+    clock.advance(3_000);
+    const c = mac.b.addTab(mac.b.addWindow(), { url: "https://c/" });
+    mac.rematches.fire();
+    await mac.settle();
+    expect(await urls()).toEqual(["https://a/", "https://b/", "https://c/"]);
+    expect((await mac.state()).pending).toEqual([]);
+
+    // Past the startup grace: closing a never-activated restored tab closes its entry.
+    mac.b.userCloseTab(b.id);
+    mac.b.userCloseTab(c.id);
+    await mac.settle();
+    expect(list((await mac.state()).pending).map((o) => o.type)).toEqual(["close", "close"]);
+    await mac.engine.runNow(); // a follower sends its journal on its next run
+    await mac.settle();
+    expect(mac.merged().filter((o) => o.type === "close")).toHaveLength(2);
+    expect(server.openUrls()).toEqual(["https://a/"]);
+  });
+
   it("closing a Safari pinned tab, reported once per window, closes its entry once", async () => {
     const mac = await device(server, clock, "Mac Safari", { tabs: [{ url: "https://pinned/", pinned: true }, { url: "https://keep/" }] });
     mac.b.addWindow({ tabs: [{ url: "https://pinned/", pinned: true }] });
