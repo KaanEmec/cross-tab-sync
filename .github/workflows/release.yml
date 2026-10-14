@@ -209,6 +209,23 @@ jobs:
           name: safari-dmg
           path: Cross-Tab-Sync-*.dmg
 
+  # Redeploys the hosted server (cts.kexperiments.com) through Coolify's API once the release
+  # exists. Skips when COOLIFY_TOKEN is not set, so forks are unaffected.
+  deploy:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Coolify redeploy
+        env:
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          COOLIFY_URL: https://coolify.kexperiments.com
+          COOLIFY_APP_UUID: wax2mvy8vyhooqyeuls91oxs
+        run: |
+          if [ -z "$COOLIFY_TOKEN" ]; then echo "::notice::COOLIFY_TOKEN is not set; skipping the deploy"; exit 0; fi
+          curl -fsS -X POST "$COOLIFY_URL/api/v1/deploy" \
+            -H "Authorization: Bearer $COOLIFY_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"uuid\":\"$COOLIFY_APP_UUID\"}"
+
   release:
     needs: [binaries, image, extension, safari]
     # The safari job never blocks by being skipped; a failed signing run still blocks the release.

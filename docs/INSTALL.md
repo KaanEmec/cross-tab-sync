@@ -67,7 +67,7 @@ Backups hold only encrypted tab addresses and token hashes, but keep them privat
 
 ### Upgrades
 
-Take a backup, set the new `CTS_VERSION`, then `docker compose pull cts && docker compose up -d cts` (Coolify: redeploy). Database migrations run automatically and only move forward; to go back, restore the backup. Upgrade the server before the extensions. A v2 server upgraded to v3 keeps its paired browsers.
+Take a backup, set the new `CTS_VERSION`, then `docker compose pull cts && docker compose up -d cts` (Coolify: Redeploy, or let a release trigger it: the release workflow calls Coolify's deploy API when the repository secret `COOLIFY_TOKEN` holds an API token). Database migrations run automatically and only move forward; to go back, restore the backup. Upgrade the server before the extensions. A v2 server upgraded to v3 keeps its paired browsers.
 
 ## Stopping sync
 
