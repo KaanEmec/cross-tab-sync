@@ -1,83 +1,90 @@
 # Installation
 
-Three pieces: the server on a VPS, the Brave extension on Windows, the Safari app on macOS. Release assets (server binaries, Brave and Safari zips) are on the GitHub Releases page; the container image is `ghcr.io/kaanemec/cross-tab-sync`.
+Cross-Tab-Sync keeps the same open tabs in Brave and Safari. Install the extension in each browser, click **Start syncing** in the first one, and paste the invite link it shows into the second. No account is needed.
 
-## 1. Server (VPS, Docker Compose + Caddy)
+By default the extension uses the hosted server `https://cts.kexperiments.com`. Tab addresses are encrypted in your browser before they are sent; the server only stores ciphertext ([PRIVACY.md](PRIVACY.md)). You can also run your own server (section 3).
 
-Prerequisites: a VPS with Docker and the Compose plugin, ports 80, 443 (TCP and UDP) open, and a domain you control.
+## 1. Brave
 
-1. Create a DNS `A` (and `AAAA` if you have IPv6) record, for example `tabs.example.com`, pointing at the VPS. Wait until it resolves; Caddy obtains the Let's Encrypt certificate on first start and needs port 80 reachable.
-2. Get the deploy files: `git clone https://github.com/kaanemec/cross-tab-sync && cd cross-tab-sync/deploy`.
-3. Put the configuration in `deploy/.env`: `CTS_DOMAIN=tabs.example.com` and optionally `CTS_VERSION=1.0.0` (a release version, no leading `v`; default `latest`).
-4. Start: `docker compose pull cts && docker compose up -d`. Check `https://tabs.example.com/healthz` returns `{"status":"ok"}`.
-5. Create the first pairing link: `docker compose exec -e CTS_PUBLIC_URL=https://tabs.example.com cts /cross-tab-sync pair-code` prints `https://tabs.example.com#ABCD2345`. Without `CTS_PUBLIC_URL` it prints only the code. It is single use and expires after 10 minutes; run the command again for another. This link pairs the first browser, which generates the encryption key. Every further browser needs an invite: **Invite another browser** in the popup of a paired browser shows a link that carries the key. Share it privately and paste it into the other browser's extension; never open it as a page, because the page could read the key from the address. Anyone with the link and the 10-minute window can read your tab URLs. A link without a key is refused once a key exists or another browser is paired.
+1. Open the [Cross-Tab-Sync page in the Chrome Web Store](https://chromewebstore.google.com/detail/cross-tab-sync/<id>) in Brave and click **Add to Brave**, then **Add extension**. *(The store link is filled in after the first store review.)*
+2. Click the puzzle icon in the toolbar and pin Cross-Tab-Sync, then click its icon.
+3. If this is your first browser: check the device name and click **Start syncing**. Brave asks to let the extension reach the sync server; click **Allow**. If the popup closes, click the icon again.
+4. The popup now shows an invite link and "Install the extension in your other browser and paste this link there." Click **Copy** and get the link to your other computer privately (for example a note to yourself). It works once, for 10 minutes.
 
-Settings (`CTS_OWNER_LIVENESS`, `CTS_SNAPSHOT_RETENTION`, ...) are listed in [server/README.md](../server/README.md). The service port is never published; only Caddy reaches it, which is what makes `X-Forwarded-Proto` trustworthy. Without Docker, run a binary from the release with your own TLS proxy ([deploy/README.md](../deploy/README.md)).
+If Brave is your second browser, click **I have an invite link** instead, paste the link and confirm.
 
-### Data, backups and restore
+**Without the store:** download `cross-tab-sync-brave-<version>.zip` from the [latest release](https://github.com/KaanEmec/cross-tab-sync/releases/latest), extract it to a folder you keep, open `brave://extensions`, turn on **Developer mode**, click **Load unpacked** and pick that folder. This copy does not update itself.
 
-All state is one SQLite database in the `cts-data` volume: `cts.db` plus `cts.db-wal` and `cts.db-shm` (WAL mode). Copying only `cts.db` while the server runs can lose recent writes, so back up the whole directory. Find the volume name with `docker volume ls` (usually `deploy_cts-data`).
+## 2. Safari on macOS
+
+Needs Safari 18.4 or newer (macOS 13+).
+
+1. Download `Cross-Tab-Sync-<version>.dmg` from the [latest release](https://github.com/KaanEmec/cross-tab-sync/releases/latest), open it and drag **Cross-Tab-Sync** to **Applications**.
+2. Open the Cross-Tab-Sync app once, then quit it.
+3. In Safari open **Settings › Extensions** and tick **Cross-Tab-Sync**.
+4. Click **Edit Websites** and set access to **All Websites**. Without this Safari hides tab addresses and nothing syncs.
+5. Click the Cross-Tab-Sync icon in the toolbar, click **I have an invite link**, paste the link from Brave and confirm. Allow access to the sync server when Safari asks. (If Safari is your first browser, use **Start syncing** and paste its invite into Brave instead.)
+
+Your tabs now follow you: the browser you are using shares its tabs, the other one catches up when you switch to it.
+
+**Invite links contain the encryption key.** Paste them only into the extension, never into the address bar, and do not share them with anyone else.
+
+## 3. Your own server (optional)
+
+Run the server yourself, then in each extension open **Advanced**, enter your server address (for example `https://tabs.example.com`) and click **Start syncing** (first browser) or paste the invite (second browser). Set `CTS_MAX_SESSIONS=1` on a personal server so nobody else can start a session on it. Other settings: [server/README.md](../server/README.md).
+
+### Docker Compose
+
+You need a server with Docker, ports 80 and 443 open, and a domain name.
+
+1. Point a DNS record such as `tabs.example.com` at the server and wait until it resolves.
+2. `git clone https://github.com/KaanEmec/cross-tab-sync && cd cross-tab-sync/deploy`
+3. Create `deploy/.env` with `CTS_DOMAIN=tabs.example.com` and `CTS_MAX_SESSIONS=1`; optionally `CTS_VERSION=3.0.0` to pin a release (default `latest`).
+4. `docker compose pull cts && docker compose up -d`. `https://tabs.example.com/healthz` should answer `{"status":"ok"}`.
+
+Caddy obtains the HTTPS certificate on first start. The service port is never published; only Caddy reaches it. Without Docker: [deploy/README.md](../deploy/README.md).
+
+### Coolify
+
+New resource › **Public repository** `https://github.com/KaanEmec/cross-tab-sync`, branch `main`, build pack **Dockerfile**, base directory `/server`, Dockerfile `/Dockerfile`, exposed port `8080`. Set your domain, add a persistent volume mounted at `/data`, leave port mappings empty and the health check off (the image has no shell). No environment variables are required; add `CTS_MAX_SESSIONS=1` for a personal server. Deploy.
+
+### Backups
+
+All data is one SQLite database in the data volume (`cts.db`, `cts.db-wal`, `cts.db-shm`); back up the whole directory while the server is stopped. With Compose (the volume is usually `deploy_cts-data`, see `docker volume ls`):
 
 ```sh
-# Backup (stops the server for a few seconds so the WAL is quiescent)
 docker compose stop cts
 docker run --rm -v deploy_cts-data:/data -v "$PWD":/backup alpine tar czf /backup/cts-$(date +%F).tgz -C /data .
 docker compose start cts
-
-# Restore
-docker compose stop cts
+# restore: stop cts, then
 docker run --rm -v deploy_cts-data:/data -v "$PWD":/backup alpine sh -c \
   'rm -rf /data/* && tar xzf /backup/cts-YYYY-MM-DD.tgz -C /data && chown -R 65532:65532 /data'
-docker compose start cts
 ```
 
-Backups contain device token hashes and encrypted tab URLs, no readable URLs, but still store them privately. Restoring an old backup also restores old device records; a device revoked after the backup works again until you revoke it again. Run the backup from cron for regular copies; the Caddy volumes (`caddy-data`) hold certificates and can simply be re-issued.
+Backups hold only encrypted tab addresses and token hashes, but keep them private. A restored backup also restores devices revoked after it was taken.
 
-### Upgrades and migrations
+### Upgrades
 
-```sh
-# set the new CTS_VERSION in deploy/.env, take a backup first, then:
-docker compose pull cts && docker compose up -d cts
-```
+Take a backup, set the new `CTS_VERSION`, then `docker compose pull cts && docker compose up -d cts` (Coolify: redeploy). Database migrations run automatically and only move forward; to go back, restore the backup. Upgrade the server before the extensions. A v2 server upgraded to v3 keeps its paired browsers.
 
-Schema migrations are embedded in the binary and applied automatically at startup, in order, each in a transaction; applied versions are recorded in `schema_migrations`. They only move forward, so to roll back to an older image restore the backup taken before the upgrade. Extensions and server share the protocol in [PROTOCOL.md](PROTOCOL.md); upgrade the server first, then the extensions. Upgrading a server to v2 wipes the session (entries, operations, snapshots), resets the revision and revokes every device: update the extensions, then pair each browser again once (first browser from a CLI link, the rest by invite). Building from source instead: `git pull && docker compose up -d --build`.
+## Stopping sync
 
-## 2. Brave on Windows
-
-1. Download `cross-tab-sync-brave-<version>.zip` from the GitHub release and extract it to a permanent folder (Brave reads the files from there on every start; do not delete it).
-2. Open `brave://extensions`, enable **Developer mode**, click **Load unpacked** and select the extracted folder (the one containing `manifest.json`).
-3. Open the extension popup, paste the pairing link (`https://tabs.example.com#ABCD2345` from the CLI for the first browser, an invite link with the key for any other), check the device name (prefilled as `Brave on Windows`), then **Pair**. Server URL and code can also be entered separately under **Advanced**. If another device already has the name, the server adds a number (`Brave on Windows 2`); rename it under **This device**.
-4. Brave asks for permission to access the server origin. **Allow** it; the extension requests no other site access at install. If the popup closes, pairing finishes in the background; reopen the popup.
-
-Update by extracting a newer zip over the folder and pressing reload on the extension card. Details: [extension/README.md](../extension/README.md).
-
-## 3. Safari on macOS
-
-Requires macOS 13+ with Safari 18.4+ ([COMPATIBILITY.md](COMPATIBILITY.md)). The Safari zip holds only the extension resources; the app wrapper is built from source (no Developer ID signing yet).
-
-1. Clone the repository (or extract the source of the release) and build the extension: `cd extension && pnpm install && pnpm build`.
-2. Copy the resources and open the project: `cd .. && ./safari/sync-resources.sh && open safari/Cross-Tab-Sync/Cross-Tab-Sync.xcodeproj`. Alternatively unzip `cross-tab-sync-safari-resources-<version>.zip` into `safari/Cross-Tab-Sync/Cross-Tab-Sync Extension/Resources`.
-3. In Xcode choose your team under Signing (a free personal team works), then **Run**. Command-line build without signing: see [safari/README.md](../safari/README.md).
-4. In Safari: **Settings > Advanced > Show features for web developers**, then **Settings > Developer > Allow unsigned extensions** (this resets every time Safari quits; repeat after each restart for unsigned builds). Enable Cross-Tab-Sync under **Settings > Extensions**.
-5. Under the extension's **Edit Websites**, set access to **All Websites**. Without it Safari hides tab URLs and the extension cannot see or share tabs.
-6. Pair as in Brave (popup, paste the pairing link or invite, check the name) and allow the server origin when prompted.
-
-## Revoking a device or stopping sync
-
-- **On the device:** popup **Disconnect** releases ownership, revokes this device on the server and forgets its credentials. Tabs stay open. Pairing again later creates a new device identity.
-- **From another paired device or with curl:** `DELETE /v2/devices/{id}` with a bearer token of any paired device (ids from `GET /v2/devices`). The revoked device gets `401 device_revoked` and clears its credentials. Revoked devices stay in the list, greyed, for 7 days. See [PROTOCOL.md](PROTOCOL.md).
-- **Everything:** stop the server (`docker compose down`). Extensions report errors in the popup until it returns. `docker compose down -v` additionally deletes all data (devices, session, certificates).
+- **Disconnect** in the popup removes this browser from the session; its tabs stay open. To sync again, use a new invite.
+- **Revoke** in the Devices section removes another of your browsers (for example a lost laptop).
+- When the last browser of a session disconnects, the server deletes the session and all its data at once. Sessions unused for 180 days are deleted automatically (`CTS_SESSION_RETENTION`).
 
 ## Troubleshooting
 
-| Symptom | Cause and fix |
+| Problem | Fix |
 | --- | --- |
-| `403 invalid_request` / "HTTPS required" | The server received plain HTTP. Use the `https://` URL through Caddy; never point extensions at port 8080. `CTS_ALLOW_INSECURE=1` is for local development only. |
-| `invalid_code` on pairing | Codes are single use and expire after 10 minutes. Create a new link; check the server URL points at this server. |
-| Pairing link points at the wrong address | Invite links use the server address stored in that browser; the CLI link uses `CTS_PUBLIC_URL`. Set `CTS_PUBLIC_URL=https://tabs.example.com` on the server for the CLI. |
-| Pairing refused with a key message | The link has no key and the session already has tabs. Create an invite in a paired browser's popup. A browser reporting `key_mismatch` holds a different key than the others: disconnect it and pair again from an invite. |
-| `device_revoked` | This device was revoked. Click Disconnect or clear credentials, then pair again with a new code. |
-| Caddy has no certificate | DNS does not resolve to the VPS yet, or ports 80/443 are blocked. Check `docker compose logs caddy`. |
-| Safari shares nothing or tabs show empty URLs | Website access is not **All Websites**, or unsigned extensions were reset after a Safari restart. Re-enable both. |
-| Brave popup closes during pairing | Normal when the permission prompt appears; reopen the popup. |
-| Server will not start after restore | Volume files must be owned by uid 65532 (`chown -R 65532:65532 /data` as shown above). |
+| Invite link refused or expired | Links work once, for 10 minutes. Create a new invite in a synced browser. |
+| "Key mismatch" | That browser joined with a different link. Disconnect it and paste a fresh invite. |
+| "This server runs an older version" | The server needs upgrading to v3. |
+| Start syncing refused: no new sessions | The server's `CTS_MAX_SESSIONS` limit is reached. |
+| Joining refused: session full | A session holds up to 10 browsers (`CTS_MAX_DEVICES`). Revoke an old one. |
+| "Too many requests" | Wait 10 minutes and try again. |
+| Safari syncs nothing or shows empty addresses | Set **Edit Websites** to **All Websites** in Safari › Settings › Extensions. |
+| Popup closed while connecting | Normal when the permission prompt appears; click the icon again. |
+| "HTTPS required" (own server) | Use the `https://` address through Caddy or Coolify, never port 8080 directly. |
+| No certificate (own server) | DNS does not point at the server yet, or ports 80/443 are blocked: `docker compose logs caddy`. |
+| Server will not start after a restore | Files must belong to uid 65532 (the `chown` above). |

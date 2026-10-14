@@ -1,5 +1,5 @@
-# Usage: CTS_DOMAIN=tabs.example.com docker compose up -d
-# Pair:  docker compose exec cts /cross-tab-sync pair-code
+# Usage: CTS_DOMAIN=tabs.example.com CTS_MAX_SESSIONS=1 docker compose up -d
+# Then set the extension's Advanced > Server URL to https://$CTS_DOMAIN and click Start syncing.
 services:
   cts:
     # `docker compose pull cts` fetches the release image; `--build` builds from source.
@@ -10,7 +10,8 @@ services:
     restart: unless-stopped
     environment:
       CTS_DB_PATH: /data/cts.db
-      CTS_PUBLIC_URL: https://${CTS_DOMAIN:?set CTS_DOMAIN to the public hostname}
+      # 0 = unlimited sessions; a personal server sets 1.
+      CTS_MAX_SESSIONS: ${CTS_MAX_SESSIONS:-0}
       CTS_OWNER_LIVENESS: ${CTS_OWNER_LIVENESS:-10m}
       CTS_SNAPSHOT_RETENTION: ${CTS_SNAPSHOT_RETENTION:-20}
     volumes:

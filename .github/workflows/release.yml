@@ -90,8 +90,134 @@ jobs:
           name: extension-zips
           path: extension/dist/zips/*.zip
 
+  # Developer ID signed and notarized Safari app as a DMG. Skips (green) when the signing secrets
+  # are absent; secrets cannot be used in `if:`, so the first step turns their presence into an output.
+  safari:
+    runs-on: macos-latest
+    steps:
+      - id: check
+        name: Check signing secrets
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+        run: |
+          if [ -n "$MACOS_CERT_P12_BASE64" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::MACOS_CERT_P12_BASE64 is not set; skipping the Safari DMG"
+          fi
+      - if: steps.check.outputs.enabled == 'true'
+        uses: actions/checkout@v5
+      - if: steps.check.outputs.enabled == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - if: steps.check.outputs.enabled == 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: extension/pnpm-lock.yaml
+      - name: Build extension
+        if: steps.check.outputs.enabled == 'true'
+        working-directory: extension
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: Sync resources into the Xcode project
+        if: steps.check.outputs.enabled == 'true'
+        run: ./safari/sync-resources.sh
+      - name: Version and paths
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          echo "KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db" >> "$GITHUB_ENV"
+          version="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          # Bundle versions allow only dot-separated integers: v3.0.0-rc.1 -> 3.0.0.
+          echo "BUNDLE_VERSION=${version%%-*}" >> "$GITHUB_ENV"
+      - name: Import Developer ID certificate
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          cert="$RUNNER_TEMP/cert.p12"
+          echo -n "$MACOS_CERT_P12_BASE64" | base64 --decode -o "$cert"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$cert" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          rm "$cert"
+      - name: Archive and export
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcodebuild archive \
+            -project safari/Cross-Tab-Sync/Cross-Tab-Sync.xcodeproj \
+            -scheme Cross-Tab-Sync -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/Cross-Tab-Sync.xcarchive" \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
+            MARKETING_VERSION="$BUNDLE_VERSION" CURRENT_PROJECT_VERSION="$BUNDLE_VERSION"
+          cat > "$RUNNER_TEMP/export.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>developer-id</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Developer ID Application</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Cross-Tab-Sync.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+      - name: Build DMG
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          stage="$RUNNER_TEMP/dmg"
+          mkdir -p "$stage"
+          ditto "$RUNNER_TEMP/export/Cross-Tab-Sync.app" "$stage/Cross-Tab-Sync.app"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname Cross-Tab-Sync -srcfolder "$stage" -format UDZO -ov "Cross-Tab-Sync-$VERSION.dmg"
+          codesign --sign "Developer ID Application" --keychain "$KEYCHAIN_PATH" --timestamp "Cross-Tab-Sync-$VERSION.dmg"
+      - name: Notarize and staple
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s\n' "$ASC_API_KEY_P8" > "$key"
+          # Notarizing the DMG also notarizes the app inside it.
+          xcrun notarytool submit "Cross-Tab-Sync-$VERSION.dmg" --wait \
+            --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID"
+          rm "$key"
+          xcrun stapler staple "Cross-Tab-Sync-$VERSION.dmg"
+          xcrun stapler validate "Cross-Tab-Sync-$VERSION.dmg"
+      - name: Remove keychain
+        if: always() && steps.check.outputs.enabled == 'true'
+        run: security delete-keychain "$KEYCHAIN_PATH" || true
+      - if: steps.check.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: safari-dmg
+          path: Cross-Tab-Sync-*.dmg
+
   release:
-    needs: [binaries, image, extension]
+    needs: [binaries, image, extension, safari]
+    # The safari job never blocks by being skipped; a failed signing run still blocks the release.
+    if: >-
+      always() &&
+      needs.binaries.result == 'success' &&
+      needs.image.result == 'success' &&
+      needs.extension.result == 'success' &&
+      contains(fromJSON('["success", "skipped"]'), needs.safari.result)
     runs-on: ubuntu-latest
     permissions:
       contents: write

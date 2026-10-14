@@ -1,6 +1,14 @@
 # Cross-Tab-Sync
 
-Cross-Tab-Sync preserves your browsing context when switching between Safari on macOS and Brave on Windows. Browser extensions share open webpage tabs through a small service hosted on your VPS.
+Cross-Tab-Sync preserves your browsing context when switching between Safari on macOS and Brave on Windows. Browser extensions share open webpage tabs, end-to-end encrypted, through a small server: the hosted one or your own.
+
+## Install
+
+1. **Brave:** add Cross-Tab-Sync from the [Chrome Web Store](https://chromewebstore.google.com/detail/cross-tab-sync/<id>) and click **Start syncing**.
+2. **Safari 18.4+:** download `Cross-Tab-Sync-<version>.dmg` from the [latest release](https://github.com/KaanEmec/cross-tab-sync/releases/latest), open the app once, enable it in Safari › Settings › Extensions with access to **All Websites**.
+3. Paste the invite link from the first browser into the extension in the second.
+
+The hosted server `https://cts.kexperiments.com` is used by default, or [run your own](docs/INSTALL.md#3-your-own-server-optional). Step by step: [docs/INSTALL.md](docs/INSTALL.md). Privacy: [docs/PRIVACY.md](docs/PRIVACY.md).
 
 ## App behavior
 
@@ -28,7 +36,7 @@ Exclude private tabs, browser-internal pages, tab groups, cookies, history, logi
 - **Extensions:** shared TypeScript WebExtension logic and a small HTML/CSS popup, with browser-specific adapters and manifests.
 - **Safari:** minimal Swift macOS app wrapper, packaged with Xcode.
 - **Backend:** Go HTTP API with SQLite for devices, ownership, revisions, changes, and recovery snapshots.
-- **Hosting:** HTTPS on the VPS, optionally using Docker Compose and Caddy.
+- **Hosting:** one server holds many independent, encrypted sessions; hosted at `cts.kexperiments.com` or self-hosted with Docker Compose and Caddy, or Coolify.
 - **Protocol:** snapshots plus retry-safe open, navigate, and close operations. Persist pending changes locally; enforce ownership and revisions on the server.
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). Build and run: [server/README.md](server/README.md), [extension/README.md](extension/README.md), [safari/README.md](safari/README.md). Milestones: [ROADMAP.md](ROADMAP.md).

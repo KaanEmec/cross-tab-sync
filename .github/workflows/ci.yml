@@ -44,8 +44,9 @@ jobs:
           cache-dependency-path: extension/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
-      - run: pnpm test
+      # Build first: the manifest test checks dist/.
       - run: pnpm build
+      - run: pnpm test
 
   integration:
     runs-on: ubuntu-latest
