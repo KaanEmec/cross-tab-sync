@@ -393,7 +393,11 @@ describe("automatic ownership", () => {
     });
     expect(server.openUrls().sort()).toEqual(["https://a/", "https://b/", "https://c/"]);
 
-    clock.advance(10_000);
+    clock.advance(11_000); // a restore-related activation just after 10 s (Brave) is still suppressed
+    mac.b.userActivate(c.id);
+    await mac.settle();
+    expect(mac.acquires()).toBe(0);
+    clock.advance(19_000);
     mac.b.userActivate(a.id);
     await mac.settle();
     expect(mac.acquires()).toBe(1);
@@ -455,36 +459,41 @@ describe("live testing fixes", () => {
     expect(mac.sent().length).toBe(sent); // the verifying run was an empty batch
   });
 
-  it("focus on a window makes a silently superseded owner verify at once and take over, even inside the idle window", async () => {
-    const mac = await owner("Mac Safari", ["https://a/"]);
-    const generation = (await mac.state()).generation;
-    clock.advance(30_000); // past the takeover rate limit of mac's own takeover
-    await mac.quiet();
-    const brave = await device(server, clock, "Brave");
-    await brave.engine.takeover();
-    await brave.settle();
+  for (const [signal, act] of [
+    ["window focus", (d: Dev) => d.b.userFocusWindow(d.win)],
+    ["a tab switch without a focus event (Safari)", (d: Dev) => d.b.userActivate(d.tab("https://b/"))],
+  ] as const) {
+    it(`${signal} makes a silently superseded owner verify at once and take over, even inside the idle window`, async () => {
+      const mac = await owner("Mac Safari", ["https://a/", "https://b/"]);
+      const generation = (await mac.state()).generation;
+      clock.advance(30_000); // past the takeover rate limit of mac's own takeover
+      await mac.quiet();
+      const brave = await device(server, clock, "Brave");
+      await brave.engine.takeover();
+      await brave.settle();
 
-    clock.advance(20_000); // not a fresh interaction: within 60 s of the last activity
-    const before = server.requests.length;
-    mac.b.userFocusWindow(mac.win);
-    await mac.engine.idle();
-    const calls = server.requests.slice(before).filter((r) => r.device === mac.id);
-    const paths = calls.map((r) => r.path);
-    const acquire = paths.indexOf("acquire");
-    // One empty batch (409 stale_owner), the follower pull of that run, then the takeover (catch-up, acquire).
-    expect(paths.slice(0, acquire)).toEqual(["operations", "changes", "changes"]);
-    expect(calls[0]!.body).toMatchObject({ generation, operations: [] });
-    expect(paths.filter((p) => p === "acquire")).toHaveLength(1);
-    expect((await mac.state()).generation).not.toBeNull();
-    expect(server.owner?.deviceId).toBe(mac.id);
+      clock.advance(20_000); // not a fresh interaction: within 60 s of the last activity
+      const before = server.requests.length;
+      act(mac);
+      await mac.engine.idle();
+      const calls = server.requests.slice(before).filter((r) => r.device === mac.id);
+      const paths = calls.map((r) => r.path);
+      const acquire = paths.indexOf("acquire");
+      // One empty batch (409 stale_owner), the follower pull of that run, then the takeover (catch-up, acquire).
+      expect(paths.slice(0, acquire)).toEqual(["operations", "changes", "changes"]);
+      expect(calls[0]!.body).toMatchObject({ generation, operations: [] });
+      expect(paths.filter((p) => p === "acquire")).toHaveLength(1);
+      expect((await mac.state()).generation).not.toBeNull();
+      expect(server.owner?.deviceId).toBe(mac.id);
 
-    // Rate limited: focus again within 10 s does not verify again.
-    clock.advance(5_000);
-    const after = server.requests.length;
-    mac.b.userFocusWindow(mac.win);
-    await mac.engine.idle();
-    expect(server.requests.length).toBe(after);
-  });
+      // Rate limited: another signal within 10 s does not verify again.
+      clock.advance(5_000);
+      const after = server.requests.length;
+      act(mac);
+      await mac.engine.idle();
+      expect(server.requests.length).toBe(after);
+    });
+  }
 
   it("a run that finds ownership lost without recent activity here only follows", async () => {
     const mac = await owner("Mac Safari", ["https://a/"]);

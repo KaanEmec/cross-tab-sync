@@ -163,7 +163,7 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 
 ### Automatic ownership
 
-- **Activity signals**: `tabs.onActivated` (not for tabs the extension created), `windows.onFocusChanged` to a normal window, and user-created tabs whose URL is eligible (http/https; a new tab page or extension page is not). Navigation and page loads are never activity: restored tabs finish loading long after startup. Signals in the first 10 s after startup, restored tabs, and signals caused by remote application are not activity. Heartbeats are never activity.
+- **Activity signals**: `tabs.onActivated` (not for tabs the extension created), `windows.onFocusChanged` to a normal window, and user-created tabs whose URL is eligible (http/https; a new tab page or extension page is not). Navigation and page loads are never activity: restored tabs finish loading long after startup. Signals in the first 30 s after startup (browser start or extension update), restored tabs, and signals caused by remote application are not activity. Heartbeats are never activity.
 - **Fresh interaction**: a signal after at least 60 s without signals, or the first signal after this device lost ownership. A browser that merely stays focused produces none.
 - **Takeover**: on a fresh interaction while not owner, run Continue here (`acquire {force:true}`, reconcile, flush the journal). At most one attempt per 30 s.
 - **Manual Hand over** counts as the latest interaction and suppresses the "ownership lost" rule; only 60 s of quiet followed by a signal takes over again.
@@ -178,7 +178,7 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 - Previous-session mappings and the detached set survive a restart for 60 s so late-restored tabs still match.
 - Local pin changes are not published in v0.2.
 - The superseded owner learns of the change from `409 stale_owner` on its next run, keeps its journal, and follows; its pending work goes through `merge` on that run. The cadence bounds the window in which the prior owner's unpublished changes are invisible to the new owner.
-- A device that believes it is owner verifies ownership at once (no debounce; an empty batch when nothing is pending) on a fresh interaction, and on `windows.onFocusChanged` to a normal window at most once per 10 s regardless of the 60 s idle rule. When a run demotes the device and the last activity signal is less than 15 s old (not paused), it takes over right after the run, subject to the 30 s limit (a rate-limited takeover stays pending).
+- A device that believes it is owner verifies ownership at once (no debounce; an empty batch when nothing is pending) on any counted activity signal, at most once per 10 s regardless of the 60 s idle rule (always on a fresh interaction). Window focus alone is not enough: Safari does not reliably report it when the app is activated. The 60 s rule still decides takeovers. When a run demotes the device and the last activity signal is less than 15 s old (not paused), it takes over right after the run, subject to the 30 s limit (a rate-limited takeover stays pending).
 
 ## Client behavior (v1.0 offline merging, recovery, controls)
 

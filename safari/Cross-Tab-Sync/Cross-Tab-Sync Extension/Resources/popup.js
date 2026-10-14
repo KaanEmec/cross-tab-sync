@@ -46,6 +46,7 @@
       detached: {},
       startupAt: null,
       lastActivityAt: null,
+      lastActivityKind: null,
       lastTakeoverAt: null,
       suppressAutoTakeover: false,
       freshPending: false,
@@ -109,6 +110,12 @@
     if (secs < 86400) return `${Math.round(secs / 3600)} h ago`;
     return new Date(iso).toLocaleString();
   }
+  var ACTIVITY_WORDS = { activated: "tab switch", focus: "window focus", created: "new tab" };
+  function lastActivity(s) {
+    if (s.lastActivityAt === null) return "";
+    const kind = s.lastActivityKind ? `${ACTIVITY_WORDS[s.lastActivityKind] ?? s.lastActivityKind}, ` : "";
+    return `Last activity: ${kind}${new Date(s.lastActivityAt).toLocaleTimeString()}`;
+  }
   function showError(message) {
     errorEl.textContent = message ?? "";
     errorEl.hidden = !message;
@@ -135,6 +142,8 @@
     $("last-sync").title = `Revision ${s.lastRevision}` + (s.minRevision !== null ? `; server history from revision ${s.minRevision}` : "");
     $("sync-state").textContent = s.summary;
     $("status-text").textContent = s.running ? "Working\u2026" : s.statusText ?? "";
+    $("last-activity").textContent = lastActivity(s);
+    $("last-activity").hidden = s.lastActivityAt === null;
     $("identity").textContent = `${s.deviceName} \xB7 ${hostOf(s.serverUrl)}`;
     $("identity").title = s.serverUrl;
     const handOver = $("hand-over");

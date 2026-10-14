@@ -38,6 +38,7 @@ export async function handOver(deps: Deps): Promise<State> {
       statusText: `Handed over at revision ${store.s.lastRevision}`,
       suppressAutoTakeover: true,
       lastActivityAt: nowMs(deps),
+      lastActivityKind: null,
       freshPending: false,
     });
     return store.s;

@@ -248,7 +248,7 @@
   };
 
   // src/core/activity.ts
-  var STARTUP_SUPPRESSION_MS = 1e4;
+  var STARTUP_SUPPRESSION_MS = 3e4;
   var FRESH_IDLE_MS = 6e4;
   var TAKEOVER_INTERVAL_MS = 3e4;
   var ACTIVITY_WRITE_GRANULARITY_MS = 5e3;
@@ -260,7 +260,10 @@
     const idle = s.lastActivityAt === null || now - s.lastActivityAt >= FRESH_IDLE_MS;
     const fresh = idle || s.freshPending && !s.suppressAutoTakeover;
     const patch = {};
-    if (fresh || !within(s.lastActivityAt, now, ACTIVITY_WRITE_GRANULARITY_MS)) patch.lastActivityAt = now;
+    if (fresh || !within(s.lastActivityAt, now, ACTIVITY_WRITE_GRANULARITY_MS)) {
+      patch.lastActivityAt = now;
+      patch.lastActivityKind = ctx.kind ?? null;
+    }
     if (!fresh) return { patch, counted: true, fresh, takeover: false };
     if (s.suppressAutoTakeover) patch.suppressAutoTakeover = false;
     if (s.freshPending) patch.freshPending = false;
@@ -653,6 +656,7 @@
       detached: {},
       startupAt: null,
       lastActivityAt: null,
+      lastActivityKind: null,
       lastTakeoverAt: null,
       suppressAutoTakeover: false,
       freshPending: false,
@@ -1452,6 +1456,7 @@
         statusText: `Handed over at revision ${store.s.lastRevision}`,
         suppressAutoTakeover: true,
         lastActivityAt: nowMs(deps2),
+        lastActivityKind: null,
         freshPending: false
       });
       return store.s;
@@ -1687,7 +1692,7 @@
 
   // src/core/engine.ts
   var SYNC_DEBOUNCE_MS = 2e3;
-  var FOCUS_VERIFY_INTERVAL_MS = 1e4;
+  var VERIFY_INTERVAL_MS = 1e4;
   var SESSION_MARKER = "cts.browserSession";
   var PAUSED_MESSAGE = "Sync is paused. Resume to sync again.";
   var BACKED_OFF = /* @__PURE__ */ new Set(["sync", "alarm"]);
@@ -1699,8 +1704,8 @@
   function isCommitted(tab, change) {
     return change.status === "complete" || change.url !== void 0 && tab.status === "complete";
   }
-  function outcome(o) {
-    return { patch: o.patch, ops: o.ops.length, activity: o.activity };
+  function outcome(o, kind) {
+    return { patch: o.patch, ops: o.ops.length, activity: o.activity, kind };
   }
   var SyncEngine = class {
     /** `retrySchedule` runs the backoff retries (separate so tests can fire them on their own). */
@@ -1718,14 +1723,14 @@
     cancelRelease = null;
     cancelRetry = null;
     /**
-     * Last ownership verification started by a signal. In memory only: a restarted worker may verify
-     * once more, which costs one empty batch.
+     * Last ownership verification started by an activity signal. In memory only: a restarted worker
+     * may verify once more, which costs one empty batch.
      */
     lastVerifyAt = -Infinity;
     /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
     attach() {
       const a = this.deps.adapter;
-      a.onTabCreated((tab) => this.event(async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab), ctx))));
+      a.onTabCreated((tab) => this.event(async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab), ctx), "created")));
       a.onTabUpdated((tab, change) => {
         if (!isCommitted(tab, change)) return;
         this.event(async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab), ctx)));
@@ -1738,7 +1743,8 @@
         (tabId) => this.event(async (s, ctx) => ({
           patch: {},
           ops: 0,
-          activity: !s.expected.some((e) => e.kind === "load" && e.created && e.tabId === tabId && e.until > ctx.now)
+          activity: !s.expected.some((e) => e.kind === "load" && e.created && e.tabId === tabId && e.until > ctx.now),
+          kind: "activated"
         }))
       );
       a.onWindowFocusChanged((windowId) => {
@@ -1795,8 +1801,8 @@
       await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
     }
     /**
-     * Owner or follower run now (alarm, Sync now, debounced local changes, retry, `verify` after a
-     * fresh interaction while owner). Paused: nothing runs (Sync now reports it). Automatic runs
+     * Owner or follower run now (alarm, Sync now, debounced local changes, retry, `verify` after
+     * activity while owner). Paused: nothing runs (Sync now reports it). Automatic runs
      * before `nextRetryAt` wait for the retry timer. A run that finds ownership lost takes over right
      * after it when the user was active here moments ago (activity.onDemoted).
      */
@@ -1950,12 +1956,12 @@
       const now = nowMs(this.deps);
       const out = await step(s, { now, newId: idGen(this.deps) });
       const isOwner = s.generation !== null;
-      const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner }) : null;
+      const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner, kind: out.kind }) : null;
       await saveState(storage, { ...out.patch, ...decision?.patch });
       if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
       if (s.paused) return;
       if (decision?.takeover) void this.takeover().catch(ignore);
-      else if (isOwner && (decision?.fresh || out.verify && decision?.counted && now - this.lastVerifyAt >= FOCUS_VERIFY_INTERVAL_MS)) {
+      else if (isOwner && (decision?.fresh || decision?.counted && now - this.lastVerifyAt >= VERIFY_INTERVAL_MS)) {
         this.lastVerifyAt = now;
         void this.runNow("verify").catch(ignore);
       } else if (isOwner && out.ops > 0) this.requestSync();
@@ -1976,7 +1982,7 @@
       const w = (await this.deps.adapter.getWindows()).find((x) => x.id === windowId);
       const normal = w !== void 0 && w.type === "normal";
       const receiving = normal && !w.incognito && s.receivingWindowId !== w.id;
-      return { patch: receiving ? { receivingWindowId: w.id } : {}, ops: 0, activity: normal, verify: normal };
+      return { patch: receiving ? { receivingWindowId: w.id } : {}, ops: 0, activity: normal, kind: "focus" };
     }
   };
 
@@ -2002,7 +2008,9 @@
       lastError: s.lastError,
       errorKind: s.errorKind,
       statusText: s.statusText,
-      running: isLocked(s, now)
+      running: isLocked(s, now),
+      lastActivityAt: s.lastActivityAt,
+      lastActivityKind: s.lastActivityKind
     };
   }
 

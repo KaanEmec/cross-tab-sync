@@ -4,7 +4,7 @@
 // its own: everything it decides on is loaded from storage per event.
 
 import type { TabInfo } from "../adapter/types.js";
-import { onActivity, onDemoted } from "./activity.js";
+import { onActivity, onDemoted, type ActivityKind } from "./activity.js";
 import {
   CLOSE_HOLD_MS,
   recordCreated,
@@ -27,8 +27,11 @@ import { syncRun } from "./sync.js";
 
 /** Local changes are sent about this long after the first one. */
 export const SYNC_DEBOUNCE_MS = 2_000;
-/** Focus on a normal window makes an owner verify its ownership at most this often. */
-export const FOCUS_VERIFY_INTERVAL_MS = 10_000;
+/**
+ * Any counted activity signal makes an owner verify its ownership at most this often (Safari does
+ * not reliably report window focus when the app is activated, so focus alone is not enough).
+ */
+export const VERIFY_INTERVAL_MS = 10_000;
 
 /** Key in session storage present for the lifetime of one browser session. */
 export const SESSION_MARKER = "cts.browserSession";
@@ -53,8 +56,8 @@ export function isCommitted(tab: TabInfo, change: { url?: string; status?: strin
   return change.status === "complete" || (change.url !== undefined && tab.status === "complete");
 }
 
-function outcome(o: Outcome): Step {
-  return { patch: o.patch, ops: o.ops.length, activity: o.activity };
+function outcome(o: Outcome, kind?: ActivityKind): Step {
+  return { patch: o.patch, ops: o.ops.length, activity: o.activity, kind };
 }
 
 interface Step {
@@ -62,8 +65,8 @@ interface Step {
   /** Number of journaled operations. */
   ops: number;
   activity: boolean;
-  /** Focus moved to a normal window: an owner verifies its ownership (rate limited). */
-  verify?: boolean;
+  /** What kind of activity signal (diagnostics). */
+  kind?: ActivityKind;
 }
 
 export class SyncEngine {
@@ -73,8 +76,8 @@ export class SyncEngine {
   private cancelRelease: (() => void) | null = null;
   private cancelRetry: (() => void) | null = null;
   /**
-   * Last ownership verification started by a signal. In memory only: a restarted worker may verify
-   * once more, which costs one empty batch.
+   * Last ownership verification started by an activity signal. In memory only: a restarted worker
+   * may verify once more, which costs one empty batch.
    */
   private lastVerifyAt = -Infinity;
 
@@ -88,7 +91,7 @@ export class SyncEngine {
   /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
   attach(): void {
     const a = this.deps.adapter;
-    a.onTabCreated((tab) => this.event(async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab), ctx))));
+    a.onTabCreated((tab) => this.event(async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab), ctx), "created")));
     a.onTabUpdated((tab, change) => {
       if (!isCommitted(tab, change)) return;
       this.event(async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab), ctx)));
@@ -103,6 +106,7 @@ export class SyncEngine {
         patch: {},
         ops: 0,
         activity: !s.expected.some((e) => e.kind === "load" && e.created && e.tabId === tabId && e.until > ctx.now),
+        kind: "activated",
       })),
     );
     a.onWindowFocusChanged((windowId) => {
@@ -165,8 +169,8 @@ export class SyncEngine {
   }
 
   /**
-   * Owner or follower run now (alarm, Sync now, debounced local changes, retry, `verify` after a
-   * fresh interaction while owner). Paused: nothing runs (Sync now reports it). Automatic runs
+   * Owner or follower run now (alarm, Sync now, debounced local changes, retry, `verify` after
+   * activity while owner). Paused: nothing runs (Sync now reports it). Automatic runs
    * before `nextRetryAt` wait for the retry timer. A run that finds ownership lost takes over right
    * after it when the user was active here moments ago (activity.onDemoted).
    */
@@ -338,16 +342,16 @@ export class SyncEngine {
     const out = await step(s, { now, newId: idGen(this.deps) });
     const isOwner = s.generation !== null;
     // Paused: journal only; activity neither takes over nor triggers a run.
-    const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner }) : null;
+    const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner, kind: out.kind }) : null;
     await saveState(storage, { ...out.patch, ...decision?.patch });
     if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
     if (s.paused) return;
     if (decision?.takeover) void this.takeover().catch(ignore);
-    // A fresh interaction, or focus coming back to this browser (at most every
-    // FOCUS_VERIFY_INTERVAL_MS, regardless of the idle rule), makes an owner verify its ownership at
-    // once (empty batch when nothing is pending): if another device took over, the run's 409
-    // stale_owner demotes and the takeover follows (afterDemotion).
-    else if (isOwner && (decision?.fresh || (out.verify && decision?.counted && now - this.lastVerifyAt >= FOCUS_VERIFY_INTERVAL_MS))) {
+    // Any counted signal (at most every VERIFY_INTERVAL_MS, regardless of the idle rule; a fresh
+    // interaction always) makes an owner verify its ownership at once (empty batch when nothing is
+    // pending): if another device took over, the run's 409 stale_owner demotes and the takeover
+    // follows (afterDemotion).
+    else if (isOwner && (decision?.fresh || (decision?.counted && now - this.lastVerifyAt >= VERIFY_INTERVAL_MS))) {
       this.lastVerifyAt = now;
       void this.runNow("verify").catch(ignore);
     } else if (isOwner && out.ops > 0) this.requestSync();
@@ -370,6 +374,6 @@ export class SyncEngine {
     const w = (await this.deps.adapter.getWindows()).find((x) => x.id === windowId);
     const normal = w !== undefined && w.type === "normal";
     const receiving = normal && !w.incognito && s.receivingWindowId !== w.id;
-    return { patch: receiving ? { receivingWindowId: w.id } : {}, ops: 0, activity: normal, verify: normal };
+    return { patch: receiving ? { receivingWindowId: w.id } : {}, ops: 0, activity: normal, kind: "focus" };
   }
 }

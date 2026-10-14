@@ -41,6 +41,15 @@ function relative(iso: string | null): string {
   return new Date(iso).toLocaleString();
 }
 
+const ACTIVITY_WORDS: Record<string, string> = { activated: "tab switch", focus: "window focus", created: "new tab" };
+
+/** "Last activity: tab switch, 09:22:38" (diagnostics for automatic ownership). */
+function lastActivity(s: StatusView): string {
+  if (s.lastActivityAt === null) return "";
+  const kind = s.lastActivityKind ? `${ACTIVITY_WORDS[s.lastActivityKind] ?? s.lastActivityKind}, ` : "";
+  return `Last activity: ${kind}${new Date(s.lastActivityAt).toLocaleTimeString()}`;
+}
+
 function showError(message: string | null): void {
   errorEl.textContent = message ?? "";
   errorEl.hidden = !message;
@@ -74,6 +83,8 @@ function render(s: StatusView): void {
   $("last-sync").title = `Revision ${s.lastRevision}` + (s.minRevision !== null ? `; server history from revision ${s.minRevision}` : "");
   $("sync-state").textContent = s.summary;
   $("status-text").textContent = s.running ? "Working…" : (s.statusText ?? "");
+  $("last-activity").textContent = lastActivity(s);
+  $("last-activity").hidden = s.lastActivityAt === null;
   $("identity").textContent = `${s.deviceName} · ${hostOf(s.serverUrl)}`;
   $("identity").title = s.serverUrl;
 

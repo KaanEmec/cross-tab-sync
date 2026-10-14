@@ -14,6 +14,7 @@ const T0 = 10_000_000;
 const st = (over: Partial<ActivityState> = {}): ActivityState => ({
   startupAt: null,
   lastActivityAt: null,
+  lastActivityKind: null,
   lastTakeoverAt: null,
   suppressAutoTakeover: false,
   freshPending: false,
@@ -68,8 +69,9 @@ describe("activity", () => {
   it("rewrites lastActivityAt only every few seconds", () => {
     const s = st({ lastActivityAt: T0 });
     expect(onActivity(s, { now: T0 + 1000, isOwner: true }).patch).toEqual({});
-    expect(onActivity(s, { now: T0 + ACTIVITY_WRITE_GRANULARITY_MS, isOwner: true }).patch).toEqual({
+    expect(onActivity(s, { now: T0 + ACTIVITY_WRITE_GRANULARITY_MS, isOwner: true, kind: "focus" }).patch).toEqual({
       lastActivityAt: T0 + ACTIVITY_WRITE_GRANULARITY_MS,
+      lastActivityKind: "focus",
     });
   });
 

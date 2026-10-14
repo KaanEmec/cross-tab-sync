@@ -1,4 +1,5 @@
 import type { KeyValueStorage } from "../adapter/types.js";
+import type { ActivityKind } from "./activity.js";
 import type { Owner } from "./client.js";
 import type { Expectation, HeldClose } from "./changes.js";
 import type { Journal } from "./journal.js";
@@ -54,6 +55,8 @@ export interface State {
   startupAt: number | null;
   /** Epoch ms of the last activity signal (stored with a few seconds of granularity). */
   lastActivityAt: number | null;
+  /** Kind of the signal behind `lastActivityAt` (null: Hand over, or none yet). Diagnostics only. */
+  lastActivityKind: ActivityKind | null;
   /** Epoch ms of the last takeover attempt (rate limit). */
   lastTakeoverAt: number | null;
   /** Set by manual Hand over; cleared by the next fresh interaction. */
@@ -115,6 +118,7 @@ export function defaultState(): State {
     detached: {},
     startupAt: null,
     lastActivityAt: null,
+    lastActivityKind: null,
     lastTakeoverAt: null,
     suppressAutoTakeover: false,
     freshPending: false,

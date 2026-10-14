@@ -1,8 +1,11 @@
 // Automatic ownership (PROTOCOL.md "Automatic ownership"). Pure: decides whether an activity
 // signal is a fresh interaction and whether it triggers a takeover.
 
-/** Signals right after browser startup come from session restore, not the user. */
-export const STARTUP_SUPPRESSION_MS = 10_000;
+/**
+ * Signals right after browser startup or an extension update come from session restore, not the
+ * user (Brave activates restored tabs more than 10 s after launch).
+ */
+export const STARTUP_SUPPRESSION_MS = 30_000;
 /** A signal after this much quiet is a fresh interaction. */
 export const FRESH_IDLE_MS = 60_000;
 /** At most one takeover attempt per this interval. */
@@ -12,9 +15,13 @@ export const ACTIVITY_WRITE_GRANULARITY_MS = 5_000;
 /** A run that finds ownership lost takes over at once when the last signal is this recent. */
 export const RECENT_ACTIVITY_MS = 15_000;
 
+/** What the last activity signal was (diagnostics, shown in the popup). */
+export type ActivityKind = "activated" | "focus" | "created";
+
 export interface ActivityState {
   startupAt: number | null;
   lastActivityAt: number | null;
+  lastActivityKind: ActivityKind | null;
   lastTakeoverAt: number | null;
   suppressAutoTakeover: boolean;
   freshPending: boolean;
@@ -42,14 +49,17 @@ const within = (since: number | null, now: number, ms: number) => since !== null
  * takes over unless the last attempt was less than TAKEOVER_INTERVAL_MS ago; a rate-limited fresh
  * interaction stays pending so the next signal after the interval takes over.
  */
-export function onActivity(s: ActivityState, ctx: { now: number; isOwner: boolean }): Decision {
+export function onActivity(s: ActivityState, ctx: { now: number; isOwner: boolean; kind?: ActivityKind }): Decision {
   const { now } = ctx;
   if (within(s.startupAt, now, STARTUP_SUPPRESSION_MS)) return { patch: {}, counted: false, fresh: false, takeover: false };
 
   const idle = s.lastActivityAt === null || now - s.lastActivityAt >= FRESH_IDLE_MS;
   const fresh = idle || (s.freshPending && !s.suppressAutoTakeover);
   const patch: Partial<ActivityState> = {};
-  if (fresh || !within(s.lastActivityAt, now, ACTIVITY_WRITE_GRANULARITY_MS)) patch.lastActivityAt = now;
+  if (fresh || !within(s.lastActivityAt, now, ACTIVITY_WRITE_GRANULARITY_MS)) {
+    patch.lastActivityAt = now;
+    patch.lastActivityKind = ctx.kind ?? null;
+  }
   if (!fresh) return { patch, counted: true, fresh, takeover: false };
 
   if (s.suppressAutoTakeover) patch.suppressAutoTakeover = false;

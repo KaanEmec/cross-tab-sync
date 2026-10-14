@@ -1,4 +1,5 @@
 import type { Device, Owner, Snapshot } from "./client.js";
+import type { ActivityKind } from "./activity.js";
 import { isLocked, isPaired, type ErrorKind, type State } from "./state.js";
 import { syncSummary } from "./status.js";
 
@@ -41,6 +42,9 @@ export interface StatusView {
   errorKind: ErrorKind | null;
   statusText: string | null;
   running: boolean;
+  /** Last activity signal (diagnostics). */
+  lastActivityAt: number | null;
+  lastActivityKind: ActivityKind | null;
   /** False when the last status refresh could not reach the server. Not persisted. */
   reachable?: boolean;
 }
@@ -77,5 +81,7 @@ export function statusView(s: State, now = Date.now()): StatusView {
     errorKind: s.errorKind,
     statusText: s.statusText,
     running: isLocked(s, now),
+    lastActivityAt: s.lastActivityAt,
+    lastActivityKind: s.lastActivityKind,
   };
 }
