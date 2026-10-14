@@ -1,6 +1,6 @@
 # Deploy
 
-`docker-compose.yml` runs the Cross-Tab-Sync service (`cts`, built from `../server` with `Dockerfile`) behind Caddy, which terminates TLS for `CTS_DOMAIN`. Step-by-step install, backups, upgrades and restore: [docs/INSTALL.md](../docs/INSTALL.md).
+`docker-compose.yml` runs the Cross-Tab-Sync service (`cts`, built from `../server` with `server/Dockerfile`) behind Caddy, which terminates TLS for `CTS_DOMAIN`. Step-by-step install, backups, upgrades and restore: [docs/INSTALL.md](../docs/INSTALL.md).
 
 Quick start: `CTS_DOMAIN=tabs.example.com docker compose up -d`, then `docker compose exec cts /cross-tab-sync pair-code`.
 

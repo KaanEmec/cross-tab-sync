@@ -6,7 +6,7 @@ services:
     image: ghcr.io/kaanemec/cross-tab-sync:${CTS_VERSION:-latest}
     build:
       context: ../server
-      dockerfile: ../deploy/Dockerfile
+      dockerfile: Dockerfile
     restart: unless-stopped
     environment:
       CTS_DB_PATH: /data/cts.db

@@ -1,4 +1,4 @@
-# Build context: server/ (see docker-compose.yml).
+# Build context: server/ (deploy/docker-compose.yml, release workflow, Coolify).
 FROM golang:1.27-alpine AS build
 # Set by BuildKit for multi-arch builds; empty (native) on the legacy builder.
 ARG TARGETOS
