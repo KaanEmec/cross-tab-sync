@@ -8,6 +8,10 @@ Driven with AppleScript on both browsers and Chrome DevTools Protocol on Brave; 
 
 Setup: follow [INSTALL.md](INSTALL.md). Run the server with `CTS_ALLOW_INSECURE=1` on a LAN address only for a first smoke test; use HTTPS for everything else.
 
+## Encryption cutover results (2026-10-14, local server, Brave paired first)
+
+Upgrade of the live v1 database: entries, operations and snapshots wiped, revision 0, key check null, all three devices revoked, `/v1/session` answers 404. Brave re-paired from the CLI link (keyless), generated the key and stored the key check; "Encryption: on" in its popup. After Continue here the database held four entries with 43-character keys and 124-character ciphertexts and zero occurrences of `http` across entries, operations and snapshots. Invite link with key produced from Brave's popup for Safari. Per-round cost for 200 tabs: v1 45 KB up / 150 KB down, v2 81 KB up / 219 KB down, server CPU about 10 ms.
+
 ## Capability checks (answers the open questions in [COMPATIBILITY.md](COMPATIBILITY.md))
 
 - [ ] Safari: pairing from the popup shows the host-permission prompt, `permissions.onAdded` completes pairing when the popup closes.
