@@ -4,14 +4,14 @@
 
 import { applyRemote, captureTabs, currentMappings } from "./apply.js";
 import { materialize } from "./materialize.js";
-import { ApiError, normalizeServerUrl, type Owner } from "./client.js";
+import { ApiError, normalizeServerUrl, type Owner, type Paired } from "./client.js";
 import { generateKey, keyCheck } from "./crypto.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 import { pairingLink } from "./pairing.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
 import { apiFor, dropCredentials, fail, nowIso, nowMs, ownerLabel, requireKey, Store, succeeded, type Api, type Deps } from "./store.js";
 import { submitJournal } from "./merge.js";
-import { classify } from "./status.js";
+import { classify, INVITE_KEY_MISMATCH_MESSAGE, isRemovedKind, pairingRefusal } from "./status.js";
 import { createFailedMessage, flush, rejectedMessage } from "./sync.js";
 
 export type { Api, Deps } from "./store.js";
@@ -109,83 +109,129 @@ export async function continueHere(deps: Deps): Promise<State> {
   }
 }
 
-/** A keyless link was used against a session that already has (encrypted) history. */
-export const KEY_REQUIRED_MESSAGE =
-  "This server already holds encrypted tabs. Pair with an invite link from a browser that is already paired.";
+/** Device name rules shared by Start syncing and joining (the server allows 1–64 characters). */
+function checkDeviceName(input: string): string {
+  const name = input.trim();
+  if (!name) throw new Error("Device name is required");
+  if (name.length > 64) throw new Error("Device name must be at most 64 characters");
+  return name;
+}
+
+/** Refusals of `sessions`/`pair` (closed server, full session, rate limit, used code) in plain words. */
+function explained(deps: Deps, e: unknown): unknown {
+  const message = pairingRefusal(e, nowMs(deps));
+  return message && e instanceof ApiError ? new ApiError(e.status, e.code, message, e.body) : e;
+}
+
+/** Credentials of a new device, written at once (the key is verified: see `startSyncing` and `pair`). */
+async function storePaired(
+  store: Store,
+  deps: Deps,
+  p: { serverUrl: string; deviceName: string; res: Paired; syncKey: string; started: boolean },
+): Promise<void> {
+  // The server suffixes the name when another active device uses it ("Brave on macOS 2").
+  const name = p.res.name ?? p.deviceName;
+  const renamed = name !== p.deviceName ? ` as "${name}" (another device is named "${p.deviceName}")` : "";
+  await store.set({
+    ...clearedCredentials(),
+    serverUrl: p.serverUrl,
+    deviceName: name,
+    deviceId: p.res.deviceId,
+    token: p.res.token,
+    syncKey: p.syncKey,
+    keyVerified: true,
+    pairedAt: nowIso(deps),
+    invitePending: p.started,
+    mappings: emptyMappings(),
+    ...succeeded(deps),
+    lastError: null,
+    statusText: p.started
+      ? `Started syncing${renamed}. Invite your other browser.`
+      : `Paired${renamed}. This browser follows the shared tabs and takes over when you use it.`,
+  });
+}
 
 /**
- * Pair with a code. `key` comes from an invite link (`#CODE.KEY`). Without one, this browser may
- * only start an empty session (revision 0), for which it generates the key; otherwise it revokes
- * itself again and asks for an invite link.
+ * Start syncing: this browser generates the root key and creates a new session on `serverUrl`
+ * with the key's check (`POST /v3/sessions`), as its first device.
  */
-export async function pair(
-  deps: Deps,
-  input: { serverUrl: string; deviceName: string; code: string; key?: string },
-): Promise<State> {
+export async function startSyncing(deps: Deps, input: { serverUrl: string; deviceName: string }): Promise<State> {
   const store = await Store.open(deps);
+  // A second trigger (popup and permissions.onAdded) must not replace a session that just started.
+  if (isPaired(store.s)) return store.s;
   try {
     const serverUrl = normalizeServerUrl(input.serverUrl);
-    const deviceName = input.deviceName.trim();
-    const code = input.code.replace(/\s+/g, "");
-    if (!deviceName) throw new Error("Device name is required");
-    if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
-    if (!code) throw new Error("Pairing code is required");
-    const res = await deps.api({ baseUrl: serverUrl, token: null }).pair({ code, name: deviceName, browser: deps.browser });
-    const syncKey = await verifyKey(store, deps.api({ baseUrl: serverUrl, token: res.token }), res.deviceId, input.key);
-    // The server suffixes the name when another active device uses it ("Brave on macOS 2").
-    const name = res.name ?? deviceName;
-    const renamed = name !== deviceName ? ` as "${name}" (another device is named "${deviceName}")` : "";
-    await store.set({
-      ...clearedCredentials(),
-      serverUrl,
-      deviceName: name,
-      deviceId: res.deviceId,
-      token: res.token,
-      syncKey,
-      keyVerified: true,
-      pairedAt: nowIso(deps),
-      mappings: emptyMappings(),
-      ...succeeded(deps),
-      lastError: null,
-      statusText: `Paired${renamed}. This browser follows the shared tabs and takes over when you use it.`,
-    });
+    const deviceName = checkDeviceName(input.deviceName);
+    // Errors name this server and check its permission (unpaired: no token, so not paired yet).
+    await store.set({ serverUrl });
+    const syncKey = generateKey();
+    const res = await deps
+      .api({ baseUrl: serverUrl, token: null })
+      .createSession({ keyCheck: await keyCheck(syncKey), name: deviceName, browser: deps.browser });
+    await keepOrRevoke(deps, serverUrl, res, () => storePaired(store, deps, { serverUrl, deviceName, res, syncKey, started: true }));
     return store.s;
   } catch (e) {
-    return fail(store, e);
+    return fail(store, explained(deps, e));
   }
 }
 
 /**
- * The key this new device uses, verified against the session's key check (PROTOCOL.md
- * "Encryption"). An invite key must match the stored check (`PUT` 204; it stores the check if none
- * is set yet). Without a key, this browser may only start a session that has no check and no older
- * active device (of two keyless browsers racing, the older one wins; a `409 key_set` settles the
- * rest). A refused or failed check revokes the fresh device (best effort) and forgets everything.
+ * Store a new device's credentials; if that fails, revoke the device again (best effort) so no
+ * session or device is left that nobody can reach (revoking the last device deletes the session).
  */
-async function verifyKey(store: Store, api: Api, deviceId: string, linkKey: string | undefined): Promise<string> {
-  const refuse = async (message: string): Promise<never> => {
-    await api.deleteDevice(deviceId).catch(() => undefined);
-    await dropCredentials(store, { errorKind: "key", statusText: null });
-    throw new Error(message);
-  };
+async function keepOrRevoke(deps: Deps, serverUrl: string, res: Paired, save: () => Promise<void>): Promise<void> {
   try {
-    let key = linkKey;
-    if (!key) {
-      const [check, devices] = await Promise.all([api.sessionKeyCheck(), api.devices()]);
-      const self = devices.findIndex((d) => d.isSelf);
-      const older = devices.slice(0, self < 0 ? devices.length : self).some((d) => !d.revokedAt);
-      if (check !== null || older) return await refuse(KEY_REQUIRED_MESSAGE);
-      key = generateKey();
-    }
-    await api.putKeyCheck(await keyCheck(key));
-    return key;
+    await save();
   } catch (e) {
-    if (e instanceof ApiError && e.code === "key_set") return refuse(KEY_REQUIRED_MESSAGE);
-    if (!(e instanceof ApiError)) throw e; // already refused (or a local failure)
+    await deps.api({ baseUrl: serverUrl, token: res.token }).deleteDevice(res.deviceId).catch(() => undefined);
+    throw e;
+  }
+}
+
+/**
+ * Join with an invite link (`#CODE.KEY`): pair, then compare the key's check with the session's
+ * before anything else; a mismatch revokes the fresh device again (`verifyKey`).
+ */
+export async function pair(deps: Deps, input: { serverUrl: string; deviceName: string; code: string; key?: string }): Promise<State> {
+  const store = await Store.open(deps);
+  // Already paired (e.g. the other trigger finished first): keep the existing credentials.
+  if (isPaired(store.s)) return store.s;
+  try {
+    const serverUrl = normalizeServerUrl(input.serverUrl);
+    const deviceName = checkDeviceName(input.deviceName);
+    const code = input.code.replace(/\s+/g, "");
+    if (!code) throw new Error("Pairing code is required");
+    const key = input.key;
+    if (!key) throw new Error("This link has no encryption key, so it cannot be used. Copy the whole invite link again.");
+    await store.set({ serverUrl });
+    const res = await deps.api({ baseUrl: serverUrl, token: null }).pair({ code, name: deviceName, browser: deps.browser });
+    await verifyKey(store, deps.api({ baseUrl: serverUrl, token: res.token }), res.deviceId, key);
+    await keepOrRevoke(deps, serverUrl, res, () => storePaired(store, deps, { serverUrl, deviceName, res, syncKey: key, started: false }));
+    return store.s;
+  } catch (e) {
+    return fail(store, explained(deps, e));
+  }
+}
+
+/**
+ * The invite key must match the session's key check (PROTOCOL.md "Encryption"). A different (or
+ * missing) check, or a failed comparison, revokes the fresh device (best effort) and forgets
+ * everything; a mismatch reports kind "key".
+ */
+async function verifyKey(store: Store, api: Api, deviceId: string, key: string): Promise<void> {
+  let matches: boolean;
+  try {
+    const [stored, own] = await Promise.all([api.sessionKeyCheck(), keyCheck(key)]);
+    matches = stored === own;
+  } catch (e) {
     await api.deleteDevice(deviceId).catch(() => undefined);
     await dropCredentials(store, {});
     throw e;
   }
+  if (matches) return;
+  await api.deleteDevice(deviceId).catch(() => undefined);
+  await dropCredentials(store, { errorKind: "key", statusText: null });
+  throw new Error(INVITE_KEY_MISMATCH_MESSAGE);
 }
 
 /** A pairing form saved by the popup that can no longer be used (codes last 10 minutes) is dropped. */
@@ -197,8 +243,9 @@ export async function dropExpiredPendingPair(deps: Deps, now = Date.now()): Prom
 }
 
 /**
- * Complete a pairing saved by the popup (see State.pendingPair). Consumes the record first so a
- * second trigger cannot reuse the single-use code. Returns null when there is nothing to do.
+ * Complete Start syncing or a join saved by the popup (see State.pendingPair). Consumes the record
+ * first so a second trigger can neither reuse the single-use code nor start a second session.
+ * Returns null when there is nothing to do.
  */
 export async function pairFromPending(deps: Deps, now = Date.now()): Promise<State | null> {
   const s = await loadState(deps.adapter.storage);
@@ -206,19 +253,21 @@ export async function pairFromPending(deps: Deps, now = Date.now()): Promise<Sta
   if (!pending) return null;
   await saveState(deps.adapter.storage, { pendingPair: null });
   if (now - pending.createdAt > PENDING_PAIR_TTL_MS) return null;
-  return pair(deps, pending);
+  if (pending.code === undefined) return startSyncing(deps, pending);
+  return pair(deps, { ...pending, code: pending.code });
 }
 
 /**
  * A single-use code for another browser, with its invite link `#CODE.KEY`, the only place the key
- * is shown. Built from the stored server URL, never from the server's `link`: a page at the link's
- * origin could read the fragment.
+ * is shown. Built from the stored server URL: the link is meant to be pasted, and a page at its
+ * origin could read the fragment. Clears `invitePending`.
  */
 export async function createPairingCode(deps: Deps): Promise<{ code: string; expiresAt: string; link: string }> {
   const store = await Store.open(deps);
   try {
     requireKey(store.s);
     const res = await apiFor(deps, store.s).createPairingCode();
+    if (store.s.invitePending) await store.set({ invitePending: false });
     return { code: res.code, expiresAt: res.expiresAt, link: pairingLink(store.s.serverUrl, res.code, store.s.syncKey!) };
   } catch (e) {
     return fail(store, e);
@@ -252,7 +301,8 @@ export async function refreshOwner(deps: Deps): Promise<boolean> {
       ({ owner, minRevision } = await api.session());
     }
   } catch (e) {
-    if (e instanceof ApiError && (e.code === "device_revoked" || classify(e, true) === "key")) await fail(store, e).catch(() => undefined);
+    const kind = classify(e, true);
+    if (isRemovedKind(kind) || kind === "key") await fail(store, e).catch(() => undefined);
     return false;
   }
   const lostOwnership =

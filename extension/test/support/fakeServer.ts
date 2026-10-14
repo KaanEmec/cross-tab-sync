@@ -1,4 +1,5 @@
-// In-memory implementation of the PROTOCOL.md (v2) server semantics behind a `fetch` handler, so
+// In-memory implementation of the PROTOCOL.md (v3) server semantics for one session behind a
+// `fetch` handler (like a server with CTS_MAX_SESSIONS=1), so
 // the real ApiClient (sealing and opening URLs) runs in every test. Like the real server it stores
 // `urlKey`/`urlEnc` verbatim and coalesces on `urlKey`. Plaintext views for assertions come from a
 // test-only oracle (`urlKey` -> URL, recorded by the test cipher), never from decryption.
@@ -17,7 +18,7 @@ import {
   type WireLoggedOperation,
   type WireOperation,
 } from "../../src/core/client.js";
-import { cipherFor, type Cipher } from "../../src/core/crypto.js";
+import { cipherFor, keyCheck, type Cipher } from "../../src/core/crypto.js";
 import type { Api } from "../../src/core/handover.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -28,6 +29,8 @@ const encoder = new TextEncoder();
 
 /** Root key shared by test devices (as if every device paired from an invite link). */
 export const TEST_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+/** The key check of TEST_KEY: the fake session starts with it. */
+export const TEST_KEY_CHECK = await keyCheck(TEST_KEY);
 
 /** urlKey -> URL for every URL a test cipher sealed or opened. */
 const oracle = new Map<string, string>();
@@ -155,10 +158,12 @@ export class FakeServer {
   /** Answer the next N authenticated requests with this HTTP status and error code (default `internal`). */
   failNext: { status: number; count: number; code?: string } | null = null;
   snapshots: WireSnapshot[] = [];
-  /** Key check stored by the first browser (`PUT /v2/session/key`). */
-  keyCheck: string | null = null;
-  /** Origin of the `link` returned by `POST /v2/pairing-codes` (default: the request's). */
-  linkOrigin: string | null = null;
+  /** The session's key check (TEST_KEY's; `POST /v3/sessions` sets it when no device is active). */
+  keyCheck: string | null = TEST_KEY_CHECK;
+  /** Answer `POST /v3/sessions` and `/v3/pair` with `429 rate_limited` and this `Retry-After` (seconds). */
+  rateLimited: number | null = null;
+  /** Active devices per session (`CTS_MAX_DEVICES`): `pair` beyond it is `403 session_full`. */
+  maxDevices = 10;
   /** Requests whose JSON body had a key named `url` anywhere (must stay empty: URLs are sealed). */
   leaks: string[] = [];
   /** Restore ids per (snapshot, generation, index): a retry in the same generation replays. */
@@ -414,7 +419,7 @@ export class FakeServer {
   api = (cfg: { baseUrl: string; token: string | null; key?: string | null }): Api =>
     new ApiClient({ baseUrl: cfg.baseUrl, token: cfg.token, fetch: this.fetch, cipher: cfg.key ? testCipher(cfg.key) : undefined });
 
-  /** HTTP surface: `/v2/...` routes, JSON bodies, `{error, message, ...}` errors. */
+  /** HTTP surface: `/v3/...` routes, JSON bodies, `{error, message, ...}` errors. */
   fetch: FetchLike = async (input, init) => {
     const url = new URL(input, "http://fake.invalid");
     const method = init?.method ?? "GET";
@@ -433,6 +438,13 @@ export class FakeServer {
       if (e instanceof Unreachable) throw new TypeError("Failed to fetch");
       // A 2xx failure (failNext) is a response the client cannot parse.
       if (e instanceof ApiError && e.status < 300) return new Response("<html>", { status: e.status });
+      if (e instanceof ApiError && e.retryAfter !== null) {
+        const { retryAfter, ...rest } = e.body;
+        return new Response(JSON.stringify({ ...rest, error: e.code, message: e.message }), {
+          status: e.status,
+          headers: { "Content-Type": "application/json", "Retry-After": String(retryAfter) },
+        });
+      }
       if (e instanceof ApiError) return json(e.status, { ...e.body, error: e.code, message: e.message });
       throw e;
     }
@@ -447,33 +459,47 @@ export class FakeServer {
   ): Promise<{ status: number; body: unknown } | undefined> {
     const ok = (b: unknown, status = 200) => ({ status, body: b });
     const path = url.pathname;
-    const route = `${method} ${path.replace(/^\/v2\/(devices|snapshots)\/[^/]+/, "/v2/$1/{id}")}`;
+    const route = `${method} ${path.replace(/^\/v3\/(devices|snapshots)\/[^/]+/, "/v3/$1/{id}")}`;
     const param = decodeURIComponent(path.split("/")[3] ?? "");
+    const active = () => this.devices.filter((x) => !x.revoked);
 
-    if (route === "POST /v2/pair") {
+    if (route === "POST /v3/sessions" || route === "POST /v3/pair") {
       if (this.unreachable) throw new Unreachable();
+      if (this.rateLimited !== null) throw new ApiError(429, "rate_limited", "too many requests", { retryAfter: this.rateLimited });
+    }
+    if (route === "POST /v3/sessions") {
+      const { keyCheck: check, name, browser } = body as { keyCheck: string; name: string; browser: string };
+      this.requests.push({ path: "sessions", body: { keyCheck: check, name, browser } });
+      if (typeof check !== "string" || !URL_KEY.test(check)) throw bad("keyCheck must be 43 base64url characters");
+      // One session per fake server: it is free again once no device is active.
+      if (active().length > 0) throw new ApiError(403, "sessions_closed", "no new sessions");
+      this.keyCheck = check;
+      const d = this.addDevice(name, browser);
+      return ok({ deviceId: d.id, token: d.token, name: d.name }, 201);
+    }
+    if (route === "POST /v3/pair") {
       const { code, name, browser } = body as { code: string; name: string; browser: string };
       this.requests.push({ path: "pair", body: { code, name, browser } });
       if (!this.codes.delete(code)) throw new ApiError(400, "invalid_code", "invalid or expired code");
+      if (active().length >= this.maxDevices) throw new ApiError(403, "session_full", "session full");
       const d = this.addDevice(name, browser);
       return ok({ deviceId: d.id, token: d.token, name: d.name }, 201);
     }
     const d = this.auth(token);
     switch (route) {
-      case "POST /v2/pairing-codes": {
+      case "POST /v3/pairing-codes": {
         const code = `CODE${this.codes.size}`.padEnd(8, "X");
         this.codes.add(code);
-        const base = this.linkOrigin ?? (url.origin === "http://fake.invalid" ? "https://sync.example" : url.origin);
-        return ok({ code, expiresAt: new Date(this.now() + 600_000).toISOString(), link: `${base}#${code}` }, 201);
+        return ok({ code, expiresAt: new Date(this.now() + 600_000).toISOString() }, 201);
       }
-      case "GET /v2/devices": {
+      case "GET /v3/devices": {
         const cutoff = this.now() - REVOKED_LISTED_MS;
         const recent = this.devices
           .filter((x) => x.revokedAt && Date.parse(x.revokedAt) > cutoff)
           .sort((a, b) => b.revokedAt!.localeCompare(a.revokedAt!));
         return ok({ devices: [...this.devices.filter((x) => !x.revoked), ...recent].map((x) => this.deviceJson(x, d.id)) });
       }
-      case "PATCH /v2/devices/{id}": {
+      case "PATCH /v3/devices/{id}": {
         if (param !== d.id) throw new ApiError(403, "forbidden", "a device can only rename itself");
         const trimmed = String(body["name"] ?? "").trim();
         if (!trimmed || [...trimmed].length > 64) throw bad("bad name");
@@ -481,7 +507,7 @@ export class FakeServer {
         if (this.owner?.deviceId === d.id) this.owner = { ...this.owner, name: d.name };
         return ok(this.deviceJson(d, d.id));
       }
-      case "DELETE /v2/devices/{id}": {
+      case "DELETE /v3/devices/{id}": {
         const x = this.devices.find((y) => y.id === param);
         if (!x || x.revoked) throw new ApiError(404, "not_found", "not found");
         x.revoked = true;
@@ -489,25 +515,17 @@ export class FakeServer {
         if (this.owner?.deviceId === param) this.owner = null;
         return undefined;
       }
-      case "PUT /v2/session/key": {
-        const check = body["keyCheck"];
-        if (typeof check !== "string" || !URL_KEY.test(check)) throw bad("keyCheck must be 43 base64url characters");
-        this.requests.push({ path: "key", body: { keyCheck: check }, device: d.id });
-        if (this.keyCheck !== null && this.keyCheck !== check) throw new ApiError(409, "key_set", "another key check is stored", { owner: this.owner });
-        this.keyCheck = check;
-        return undefined;
-      }
-      case "GET /v2/session":
+      case "GET /v3/session":
         this.requests.push({ path: "session", device: d.id });
         return ok(this.wireSession());
-      case "GET /v2/session/changes": {
+      case "GET /v3/session/changes": {
         const since = Number(url.searchParams.get("since"));
         this.requests.push({ path: "changes", body: { since }, device: d.id });
         if (since < 0 || since > this.revision || this.expired(since)) throw new ApiError(410, "history_expired", "history expired");
         const operations = this.log.filter((l) => l.seq > since);
         return ok({ revision: this.revision, minRevision: this.minRevision, owner: this.owner, operations });
       }
-      case "POST /v2/session/acquire": {
+      case "POST /v3/session/acquire": {
         const force = body["force"] === true;
         this.requests.push({ path: "acquire", body: { force }, device: d.id });
         if (this.owner?.deviceId === d.id) return ok({ generation: this.owner.generation, session: this.wireSession() });
@@ -516,14 +534,14 @@ export class FakeServer {
         this.owner = { deviceId: d.id, name: d.name, generation: this.generation, lastSeenAt: new Date().toISOString() };
         return ok({ generation: this.generation, session: this.wireSession() });
       }
-      case "POST /v2/session/release":
+      case "POST /v3/session/release":
         this.checkOwner(d, body["generation"] as number);
         this.owner = null;
         return undefined;
-      case "POST /v2/session/heartbeat":
+      case "POST /v3/session/heartbeat":
         this.checkOwner(d, body["generation"] as number);
         return undefined;
-      case "POST /v2/session/operations": {
+      case "POST /v3/session/operations": {
         const { generation, baseRevision, operations } = body as { generation: number; baseRevision: number; operations: WireOperation[] };
         this.requests.push({ path: "operations", body: { generation, baseRevision, operations: operations.map(plainOp) }, device: d.id, bytes });
         validateBatch({ baseRevision, operations }, bytes); // 400/413 before 409, as the server
@@ -537,7 +555,7 @@ export class FakeServer {
         if (fullResync) return ok({ revision: this.revision, results, fullResync: true });
         return ok({ revision: this.revision, results, catchUp: { operations: catchUp } });
       }
-      case "POST /v2/session/merge": {
+      case "POST /v3/session/merge": {
         const operations = body["operations"] as WireMergeOperation[];
         this.requests.push({ path: "merge", body: { operations: operations.map((o) => ({ ...plainOp(o), baseRevision: o.baseRevision })) }, device: d.id, bytes });
         validateBatch({ baseRevision: 0, operations }, bytes);
@@ -546,9 +564,9 @@ export class FakeServer {
         this.dropResponse();
         return ok({ revision: this.revision, results });
       }
-      case "GET /v2/snapshots":
+      case "GET /v3/snapshots":
         return ok({ snapshots: this.snapshots.map(({ entries: _e, ...s }) => ({ ...s })) });
-      case "POST /v2/snapshots/{id}/restore": {
+      case "POST /v3/snapshots/{id}/restore": {
         const id = Number(param);
         const generation = body["generation"] as number;
         this.requests.push({ path: "restore", body: { id, generation }, device: d.id });
@@ -566,7 +584,7 @@ export class FakeServer {
         return ok({ revision: this.revision, results });
       }
       default:
-        // Includes /v2/diag (like a server without CTS_DEBUG) and every /v1 route.
+        // Includes /v3/diag (like a server without CTS_DEBUG) and every /v1 and /v2 route.
         throw new ApiError(404, "not_found", "no such endpoint");
     }
   }

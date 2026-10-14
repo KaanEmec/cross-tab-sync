@@ -2,7 +2,7 @@
   "_comment": "Shared MV3 manifest. scripts/build.mjs merges the browser file over this one (objects merge, arrays replace), fills in the version from package.json and strips every _comment key.",
   "manifest_version": 3,
   "name": "Cross-Tab-Sync",
-  "description": "Keep one shared set of open tabs between Safari and Brave through your own server.",
+  "description": "Keep the same open tabs in Brave and Safari. End-to-end encrypted, through a hosted or your own server.",
   "version": "0.0.0",
   "permissions": ["tabs", "storage", "alarms"],
   "_comment_hosts": "No install-time host access. The popup requests the backend origin at pairing time (chrome.permissions.request). Loopback http is allowed only for local development (CTS_ALLOW_INSECURE=1).",

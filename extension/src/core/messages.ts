@@ -1,12 +1,12 @@
 import type { Device, Owner, Snapshot } from "./client.js";
 import type { ActivityKind } from "./activity.js";
-import { isLocked, isPaired, type ErrorKind, type State } from "./state.js";
+import { isLocked, isPaired, PENDING_PAIR_TTL_MS, type ErrorKind, type State } from "./state.js";
 import { syncSummary } from "./status.js";
 
 /** Messages from the popup to the service worker. */
 export type Request =
   | { type: "getStatus"; refresh?: boolean }
-  /** Pair using the form the popup saved as `pendingPair` (see State). */
+  /** Start syncing or join, using the form the popup saved as `pendingPair` (see State). */
   | { type: "pair" }
   | { type: "handOver" }
   | { type: "continueHere" }
@@ -40,6 +40,10 @@ export interface StatusView {
   paused: boolean;
   /** URLs are end-to-end encrypted (an encryption key is stored). The key itself is never in the view. */
   encrypted: boolean;
+  /** Start syncing just created the session: open Devices with a fresh invite. */
+  invitePending: boolean;
+  /** Unpaired, with Start syncing or a join saved or in progress in the worker. */
+  finishing: boolean;
   /** "Saved to server", "3 changes waiting (offline, retrying at 10:05)", … (status.syncSummary). */
   summary: string;
   lastError: string | null;
@@ -82,6 +86,8 @@ export function statusView(s: State, now = Date.now()): StatusView {
     nextRetryAt: s.nextRetryAt,
     paused: s.paused,
     encrypted: s.syncKey !== null,
+    invitePending: s.invitePending,
+    finishing: !isPaired(s) && ((s.pendingPair !== null && now - s.pendingPair.createdAt <= PENDING_PAIR_TTL_MS) || (isLocked(s, now) && s.runLock?.action === "pair")),
     summary: syncSummary({ ...s, pendingCount }),
     lastError: s.lastError,
     errorKind: s.errorKind,

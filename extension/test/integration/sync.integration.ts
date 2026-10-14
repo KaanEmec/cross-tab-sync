@@ -9,10 +9,11 @@ import { FakeBrowser } from "../../src/adapter/fake.js";
 import { ApiClient, type BrowserKind, type Session } from "../../src/core/client.js";
 import { cipherFor } from "../../src/core/crypto.js";
 import { SyncEngine } from "../../src/core/engine.js";
-import { continueHere, createPairingCode, disconnect, handOver, KEY_REQUIRED_MESSAGE, pair, type Deps } from "../../src/core/handover.js";
+import { continueHere, createPairingCode, disconnect, handOver, pair, startSyncing, type Deps } from "../../src/core/handover.js";
 import { parsePairingInput } from "../../src/core/pairing.js";
 import { listDevices, renameDevice } from "../../src/core/recovery.js";
 import { loadState } from "../../src/core/state.js";
+import { INVITE_KEY_MISMATCH_MESSAGE } from "../../src/core/status.js";
 
 const SERVER_DIR = resolve(import.meta.dirname, "../../../server");
 const hasSqlite = (() => {
@@ -58,12 +59,12 @@ const serverEnv = (extra: Record<string, string> = {}) => ({
   ...extra,
 });
 
-/** Fresh server and database per test: the session is a singleton, scenarios must not leak into each other. */
-async function startServer(): Promise<void> {
+/** Fresh server and database per test (and a fresh rate limit budget): scenarios must not leak into each other. */
+async function startServer(env: Record<string, string> = {}): Promise<void> {
   dbDir = mkdtempSync(join(scratch, "db-"));
   const port = await freePort();
   baseUrl = `http://127.0.0.1:${port}`;
-  proc = spawn(binary, ["serve"], { env: serverEnv({ CTS_ADDR: `127.0.0.1:${port}` }), stdio: "ignore" });
+  proc = spawn(binary, ["serve"], { env: serverEnv({ ...env, CTS_ADDR: `127.0.0.1:${port}` }), stdio: "ignore" });
   for (let i = 0; i < 100; i++) {
     if (proc.exitCode !== null) throw new Error(`server exited early with ${proc.exitCode}`);
     try {
@@ -96,19 +97,17 @@ interface Dev {
 const clientFactory: Deps["api"] = ({ key, ...cfg }) =>
   new ApiClient({ ...cfg, timeoutMs: 10_000, cipher: key ? cipherFor(key) : undefined });
 
-const cliCode = (env: Record<string, string> = {}) =>
-  execFileSync(binary, ["pair-code"], { env: serverEnv(env), stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
-
 /**
- * The first device pairs with a keyless CLI code (empty session: it generates the key); later
- * devices pair from an invite link of `inviter` (`#CODE.KEY`), as users do.
+ * Without `inviter` the device starts a new session (Start syncing: it generates the key); with
+ * one it joins from an invite link of `inviter` (`#CODE.KEY`), as users do.
  */
 async function device(name: string, browser: BrowserKind, urls: string[], inviter?: Dev): Promise<Dev> {
   const b = new FakeBrowser();
   b.addWindow({ focused: true, tabs: urls.map((url, i) => ({ url, active: i === 0 })) });
   const deps: Deps = { adapter: b, browser, api: clientFactory };
-  const target = inviter ? parsePairingInput((await createPairingCode(inviter.deps)).link) : { serverUrl: baseUrl, code: cliCode() };
-  const s = await pair(deps, { ...target, deviceName: name });
+  const s = inviter
+    ? await pair(deps, { ...parsePairingInput((await createPairingCode(inviter.deps)).link), deviceName: name })
+    : await startSyncing(deps, { serverUrl: baseUrl, deviceName: name });
   expect(s.syncKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
   return { b, deps, state: () => loadState(b.storage) };
 }
@@ -219,7 +218,7 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     expect(urlsOf(safari.b)).toContain(bad); // local tab untouched
     // The server cannot judge URLs any more; it only checks the sealed fields' shape.
     const post = (op: Record<string, unknown>) =>
-      fetch(`${baseUrl}/v2/session/operations`, {
+      fetch(`${baseUrl}/v3/session/operations`, {
         method: "POST",
         headers: { Authorization: `Bearer ${state.token}` },
         body: JSON.stringify({ generation: state.generation, baseRevision: 0, operations: [{ opId: crypto.randomUUID(), type: "open", entryId: crypto.randomUUID(), ...op }] }),
@@ -242,7 +241,7 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     };
 
     type RawChanges = { revision: number; owner: { lastSeenAt: string } | null; operations: { seq: number; op: Record<string, unknown> }[] };
-    const all = await get<RawChanges>("/v2/session/changes?since=0");
+    const all = await get<RawChanges>("/v3/session/changes?since=0");
     expect(all.operations.map((o) => o.seq)).toEqual([1, 2, 3]);
     // The wire carries only the sealed fields, never the URL.
     for (const { op } of all.operations) {
@@ -254,13 +253,15 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     const opened = (await (await api(safari)).changes(0)).operations;
     expect(opened.map((o) => (o.op.type === "open" ? o.op.url : ""))).toEqual(urls);
     expect(all.revision).toBe(3);
-    const tail = await get<RawChanges>("/v2/session/changes?since=2");
+    const tail = await get<RawChanges>("/v3/session/changes?since=2");
     expect(tail.operations.map((o) => o.seq)).toEqual([3]);
-    expect((await get<RawChanges>("/v2/session/changes?since=3")).operations).toEqual([]);
-    expect((await fetch(`${baseUrl}/v1/session`, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(404);
+    expect((await get<RawChanges>("/v3/session/changes?since=3")).operations).toEqual([]);
+    for (const old of ["/v1/session", "/v2/session"]) {
+      expect((await fetch(baseUrl + old, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(404);
+    }
 
     expect(all.owner?.lastSeenAt).toMatch(/\d{3}Z$/);
-    const { devices } = await get<{ devices: { createdAt: string; lastSeenAt: string }[] }>("/v2/devices");
+    const { devices } = await get<{ devices: { createdAt: string; lastSeenAt: string }[] }>("/v3/devices");
     for (const d of devices) {
       expect(d.createdAt).toMatch(/\d{3}Z$/);
       expect(d.lastSeenAt).toMatch(/\d{3}Z$/);
@@ -299,19 +300,16 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     expect(urlsOf(brave.b)).toEqual(["https://a.example/brave", "https://a.example/safari"]);
   });
 
-  it("pairing link: invite, duplicate names, rename, revoked devices listed", async () => {
+  it("start, invite, join: duplicate names, rename, revoked devices listed", async () => {
     await startServer();
     const mac = await device("Brave on macOS", "brave", []);
+    expect((await mac.state()).invitePending).toBe(true);
 
-    // CLI: a link with CTS_PUBLIC_URL, a bare code without it.
-    const cli = execFileSync(binary, ["pair-code"], { env: serverEnv({ CTS_PUBLIC_URL: baseUrl }), stdio: ["ignore", "pipe", "ignore"] });
-    expect(cli.toString().trim()).toMatch(new RegExp(`^${baseUrl.replace(/\./g, "\\.")}#[A-Z2-9]{8}$`));
-
-    // Invite: the server derives the link from the request (no CTS_PUBLIC_URL on the server); the
-    // popup appends the key.
+    // Invite: the popup builds the link from the stored server URL and appends the key.
     const invite = await createPairingCode(mac.deps);
     const key = (await mac.state()).syncKey;
     expect(invite.link).toBe(`${baseUrl}#${invite.code}.${key}`);
+    expect((await mac.state()).invitePending).toBe(false);
     const b = new FakeBrowser();
     const deps: Deps = { adapter: b, browser: "brave", api: clientFactory };
     const target = parsePairingInput(invite.link);
@@ -319,6 +317,9 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     const second = await pair(deps, { ...target, deviceName: "Brave on macOS" });
     expect(second.deviceName).toBe("Brave on macOS 2");
     expect(second.syncKey).toBe(key);
+    // Single use.
+    const reuse: Deps = { adapter: new FakeBrowser(), browser: "safari", api: clientFactory };
+    await expect(pair(reuse, { ...target, deviceName: "Safari" })).rejects.toMatchObject({ code: "invalid_code" });
 
     const renamed = await renameDevice(deps, "Work Brave");
     expect(renamed.deviceName).toBe("Work Brave");
@@ -333,26 +334,53 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     ]);
   });
 
-  it("keyless pairing: refused once the session has history, the new device revoked", async () => {
+  it("an invite with another key is refused by the key check; the new device revokes itself", async () => {
     await startServer();
     const safari = await device("Safari", "safari", ["https://a.example/"]);
     await continueHere(safari.deps);
-    const b = new FakeBrowser();
-    const deps: Deps = { adapter: b, browser: "brave", api: clientFactory };
-    await expect(pair(deps, { serverUrl: baseUrl, deviceName: "Late", code: cliCode() })).rejects.toThrow(KEY_REQUIRED_MESSAGE);
-    const s = await loadState(b.storage);
-    expect(s).toMatchObject({ token: null, syncKey: null, errorKind: "key" });
-    const devices = await listDevices(safari.deps);
-    expect(devices.find((d) => d.name === "Late")?.revokedAt).toEqual(expect.any(String));
-
-    // An invite link with another key fails the key check (409 key_set) and revokes itself too.
     const invite = parsePairingInput((await createPairingCode(safari.deps)).link);
     const wrong: Deps = { adapter: new FakeBrowser(), browser: "brave", api: clientFactory };
     const owner = (await (await api(safari)).session()).owner;
-    await expect(pair(wrong, { ...invite, key: "A".repeat(43), deviceName: "Wrong" })).rejects.toThrow(KEY_REQUIRED_MESSAGE);
+    await expect(pair(wrong, { ...invite, key: "A".repeat(43), deviceName: "Wrong" })).rejects.toThrow(INVITE_KEY_MISMATCH_MESSAGE);
     expect(await loadState(wrong.adapter.storage)).toMatchObject({ token: null, syncKey: null, errorKind: "key" });
     expect((await listDevices(safari.deps)).find((d) => d.name === "Wrong")?.revokedAt).toEqual(expect.any(String));
     expect((await (await api(safari)).session()).owner).toEqual(owner);
+  });
+
+  it("sessions on one server are invisible to each other", async () => {
+    await startServer();
+    const a = await device("Safari A", "safari", ["https://a.example/"]);
+    const a2 = await device("Brave A", "brave", [], a);
+    const b = await device("Safari B", "safari", ["https://b.example/"]);
+    expect((await b.state()).syncKey).not.toBe((await a.state()).syncKey);
+    await continueHere(a.deps);
+    await continueHere(b.deps);
+
+    // Each session has its own entries, owner, devices and revision.
+    const sa = await (await api(a2)).session();
+    const sb = await (await api(b)).session();
+    expect(entryUrls(sa)).toEqual(["https://a.example/"]);
+    expect(entryUrls(sb)).toEqual(["https://b.example/"]);
+    expect(sa.owner?.name).toBe("Safari A");
+    expect(sb.owner?.name).toBe("Safari B");
+    expect((await listDevices(b.deps)).map((d) => d.name)).toEqual(["Safari B"]);
+    expect((await listDevices(a.deps)).map((d) => d.name)).toEqual(["Safari A", "Brave A"]);
+
+    // Ids from the other session behave as unknown; a code from one session joins only that one.
+    const bId = (await b.state()).deviceId!;
+    await expect((await api(a)).deleteDevice(bId)).rejects.toMatchObject({ status: 404, code: "not_found" });
+    const late = await device("Brave B", "brave", [], b);
+    await continueHere(late.deps);
+    expect(urlsOf(late.b)).toEqual(["https://b.example/"]);
+    expect(entryUrls(await (await api(a)).session())).toEqual(["https://a.example/"]);
+  });
+
+  it("a personal server takes one session; the next Start syncing is told it is closed", async () => {
+    await startServer({ CTS_MAX_SESSIONS: "1" });
+    await device("Safari", "safari", []);
+    const late: Deps = { adapter: new FakeBrowser(), browser: "brave", api: clientFactory };
+    await expect(startSyncing(late, { serverUrl: baseUrl, deviceName: "Brave" })).rejects.toMatchObject({ status: 403, code: "sessions_closed" });
+    expect((await loadState(late.adapter.storage)).lastError).toMatch(/does not take new sessions/);
   });
 
   it.skipIf(!hasSqlite)("the database holds no readable URLs", async () => {

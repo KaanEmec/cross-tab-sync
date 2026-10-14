@@ -4,7 +4,7 @@
 import { ApiError, type Device, type Snapshot } from "./client.js";
 import { continueHere } from "./handover.js";
 import { isPaired, type State } from "./state.js";
-import { classify, errorMessage } from "./status.js";
+import { classify, errorMessage, isRemovedKind } from "./status.js";
 import { apiFor, fail, requireKey, requirePaired, Store, succeeded, type Deps } from "./store.js";
 import { createFailedMessage, flush, rejectedMessage, resync } from "./sync.js";
 
@@ -18,7 +18,7 @@ async function read<T>(deps: Deps, fn: (store: Store) => Promise<T>): Promise<T>
     return result;
   } catch (e) {
     const kind = classify(e, true);
-    if (kind === "device_revoked" || kind === "key") return fail(store, e);
+    if (isRemovedKind(kind) || kind === "key") return fail(store, e);
     throw kind ? new Error(errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0)) : e;
   }
 }

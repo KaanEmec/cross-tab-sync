@@ -1,4 +1,4 @@
-// Typed client for the endpoints in docs/PROTOCOL.md (v2). No logging: requests carry tokens.
+// Typed client for the endpoints in docs/PROTOCOL.md (v3). No logging: requests carry tokens.
 // URLs are end-to-end encrypted here, at the HTTP boundary: callers and the rest of the core see
 // plaintext `url` fields, the wire carries only `urlKey`/`urlEnc` (core/crypto.ts).
 
@@ -23,7 +23,7 @@ export interface Entry {
 
 export interface Session {
   revision: number;
-  /** base64url(HMAC(K_mac, "cts-key-check")) stored by the first browser; null until then. */
+  /** base64url(HMAC(K_mac, "cts-key-check")), sent by the browser that started the session. */
   keyCheck?: string | null;
   /** Oldest retained operation sequence number (v1.0). */
   minRevision?: number;
@@ -109,17 +109,24 @@ export interface Device {
   revokedAt?: string;
 }
 
-/** `POST /v2/pairing-codes`. `link` is the server URL with the code as fragment (absent on older servers). */
+/** `POST /v3/pairing-codes`. */
 export interface PairingCode {
   code: string;
   expiresAt: string;
-  link?: string;
+}
+
+/** `POST /v3/sessions` and `POST /v3/pair`: the new device. `name` is the stored, possibly suffixed, name. */
+export interface Paired {
+  deviceId: string;
+  token: string;
+  name?: string;
 }
 
 /**
  * Error codes from PROTOCOL.md plus client-only ones: `network_error` (no HTTP response),
- * `http_<status>`, `key_mismatch` (a URL could not be decrypted: another key, or no key) and
- * `bad_wire` (a received operation or entry is not in sealed form). Both mean "key" to the user.
+ * `http_<status>`, `old_server` (a `404` from a route every v3 server has), `key_mismatch` (a URL
+ * could not be decrypted: another key, or no key) and `bad_wire` (a received operation or entry is
+ * not in sealed form). The last two mean "key" to the user.
  */
 export type ErrorCode =
   | "invalid_request"
@@ -132,9 +139,12 @@ export type ErrorCode =
   | "stale_owner"
   | "history_expired"
   | "payload_too_large"
-  | "key_set"
+  | "sessions_closed"
+  | "session_full"
+  | "rate_limited"
   | "internal"
   | "network_error"
+  | "old_server"
   | "key_mismatch"
   | "bad_wire"
   | (string & {});
@@ -157,7 +167,16 @@ export class ApiError extends Error {
     const o = this.body["owner"];
     return o && typeof o === "object" ? (o as Owner) : null;
   }
+
+  /** Seconds from the `Retry-After` header of `429 rate_limited`, when given. */
+  get retryAfter(): number | null {
+    const v = this.body["retryAfter"];
+    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
+  }
 }
+
+/** A `404` from a route every v3 server has. */
+export const OLD_SERVER_MESSAGE = "This server runs an older version.";
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -222,51 +241,51 @@ export class ApiClient {
     this.cipher = opts.cipher ?? null;
   }
 
-  /** `name` in the response is the stored name, suffixed when another device uses it (absent on older servers). */
-  pair(body: { code: string; name: string; browser: BrowserKind }): Promise<{ deviceId: string; token: string; name?: string }> {
-    return this.request("POST", "/v2/pair", body, false);
+  /** Start a new session with this browser as its first device (Start syncing). */
+  createSession(body: { keyCheck: string; name: string; browser: BrowserKind }): Promise<Paired> {
+    return this.request("POST", "/v3/sessions", body, false);
+  }
+
+  /** Join the session of an invite code. */
+  pair(body: { code: string; name: string; browser: BrowserKind }): Promise<Paired> {
+    return this.request("POST", "/v3/pair", body, false);
   }
 
   createPairingCode(): Promise<PairingCode> {
-    return this.request("POST", "/v2/pairing-codes");
+    return this.request("POST", "/v3/pairing-codes");
   }
 
   /** Rename this device (self only); the response carries the stored, possibly suffixed, name. */
   renameDevice(id: string, name: string): Promise<Device> {
-    return this.request("PATCH", `/v2/devices/${encodeURIComponent(id)}`, { name });
+    return this.request("PATCH", `/v3/devices/${encodeURIComponent(id)}`, { name });
   }
 
   async devices(): Promise<Device[]> {
-    const res = await this.request<{ devices: Device[] }>("GET", "/v2/devices");
+    const res = await this.request<{ devices: Device[] }>("GET", "/v3/devices");
     return res.devices;
   }
 
   async deleteDevice(id: string): Promise<void> {
-    await this.request("DELETE", `/v2/devices/${encodeURIComponent(id)}`);
+    await this.request("DELETE", `/v3/devices/${encodeURIComponent(id)}`, undefined, true, true);
   }
 
   async session(): Promise<Session> {
-    return this.openSession(await this.request<WireSession>("GET", "/v2/session"));
+    return this.openSession(await this.request<WireSession>("GET", "/v3/session"));
   }
 
-  /** The session's key check only, without decrypting entries (keyless pairing). */
+  /** The session's key check only, without decrypting entries (joining checks it first). */
   async sessionKeyCheck(): Promise<string | null> {
-    return (await this.request<{ keyCheck?: string | null }>("GET", "/v2/session")).keyCheck ?? null;
-  }
-
-  /** Store the key check (first browser) or confirm it: `409 key_set` when another key's check is stored. */
-  async putKeyCheck(keyCheck: string): Promise<void> {
-    await this.request("PUT", "/v2/session/key", { keyCheck });
+    return (await this.request<{ keyCheck?: string | null }>("GET", "/v3/session")).keyCheck ?? null;
   }
 
   async changes(since: number): Promise<ChangesResponse> {
-    const res = await this.request<Omit<ChangesResponse, "operations"> & { operations: WireLoggedOperation[] }>("GET", `/v2/session/changes?since=${encodeURIComponent(String(since))}`);
+    const res = await this.request<Omit<ChangesResponse, "operations"> & { operations: WireLoggedOperation[] }>("GET", `/v3/session/changes?since=${encodeURIComponent(String(since))}`);
     return { ...res, operations: await this.openLogged(res.operations) };
   }
 
   /** A session this device cannot open gives the ownership straight back (best effort). */
   async acquire(force: boolean): Promise<{ generation: number; session: Session }> {
-    const res = await this.request<{ generation: number; session: WireSession }>("POST", "/v2/session/acquire", { force });
+    const res = await this.request<{ generation: number; session: WireSession }>("POST", "/v3/session/acquire", { force });
     try {
       return { ...res, session: await this.openSession(res.session) };
     } catch (e) {
@@ -276,36 +295,36 @@ export class ApiClient {
   }
 
   async release(generation: number): Promise<void> {
-    await this.request("POST", "/v2/session/release", { generation });
+    await this.request("POST", "/v3/session/release", { generation });
   }
 
   async heartbeat(generation: number): Promise<void> {
-    await this.request("POST", "/v2/session/heartbeat", { generation });
+    await this.request("POST", "/v3/session/heartbeat", { generation });
   }
 
   async operations(body: { generation: number; baseRevision: number; operations: Operation[] }): Promise<OperationsResponse> {
     const sealed = { ...body, operations: await this.sealAll(body.operations) };
     type Wire = Omit<OperationsResponse, "catchUp"> & { catchUp?: { operations: WireLoggedOperation[] } };
-    const { catchUp, ...res } = await this.request<Wire>("POST", "/v2/session/operations", sealed);
+    const { catchUp, ...res } = await this.request<Wire>("POST", "/v3/session/operations", sealed);
     return catchUp ? { ...res, catchUp: { operations: await this.openLogged(catchUp.operations) } } : res;
   }
 
   async merge(operations: MergeOperation[]): Promise<BatchResponse> {
-    return this.request("POST", "/v2/session/merge", { operations: await this.sealAll(operations) });
+    return this.request("POST", "/v3/session/merge", { operations: await this.sealAll(operations) });
   }
 
   /** Diagnostics trace lines (core/diag.ts); the server accepts them only with CTS_DEBUG (else 404). */
   async postDiag(lines: string[]): Promise<void> {
-    await this.request("POST", "/v2/diag", { lines });
+    await this.request("POST", "/v3/diag", { lines }, true, true);
   }
 
   async snapshots(): Promise<Snapshot[]> {
-    const res = await this.request<{ snapshots: Snapshot[] }>("GET", "/v2/snapshots");
+    const res = await this.request<{ snapshots: Snapshot[] }>("GET", "/v3/snapshots");
     return res.snapshots;
   }
 
   restoreSnapshot(id: number, generation: number): Promise<BatchResponse> {
-    return this.request("POST", `/v2/snapshots/${encodeURIComponent(String(id))}/restore`, { generation });
+    return this.request("POST", `/v3/snapshots/${encodeURIComponent(String(id))}/restore`, { generation }, true, true);
   }
 
   private requireCipher(): Cipher {
@@ -372,7 +391,11 @@ export class ApiClient {
     return { ...s, entries };
   }
 
-  private async request<T>(method: string, path: string, body?: unknown, auth = true): Promise<T> {
+  /**
+   * `mayNotFind`: the route answers `404 not_found` for an unknown id (or a disabled feature).
+   * Elsewhere a `404` means the server predates v3 (`old_server`).
+   */
+  private async request<T>(method: string, path: string, body?: unknown, auth = true, mayNotFind = false): Promise<T> {
     const headers: Record<string, string> = { Accept: "application/json" };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (auth) {
@@ -409,7 +432,9 @@ export class ApiClient {
       const obj = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
       const code = typeof obj["error"] === "string" ? obj["error"] : `http_${res.status}`;
       const message = typeof obj["message"] === "string" ? obj["message"] : `Request failed with status ${res.status}`;
-      throw new ApiError(res.status, code, message, obj);
+      if (res.status === 404 && !mayNotFind) throw new ApiError(404, "old_server", OLD_SERVER_MESSAGE, obj);
+      const retryAfter = res.status === 429 ? Number(res.headers.get("Retry-After") ?? NaN) : NaN;
+      throw new ApiError(res.status, code, message, Number.isFinite(retryAfter) ? { ...obj, retryAfter } : obj);
     }
     if (data === undefined) throw new ApiError(res.status, "invalid_response", "Server returned an invalid response");
     return data as T;

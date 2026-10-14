@@ -6,10 +6,11 @@ import { ApiError, originPattern, type ApiClient, type BrowserKind, type Owner }
 import { forgetCiphers } from "./crypto.js";
 import { newOpId } from "./journal.js";
 import { clearedCredentials, isPaired, loadState, saveState, type State } from "./state.js";
-import { classify, errorMessage, isRetryable, KEY_MISMATCH_MESSAGE, retryDelay } from "./status.js";
+import { classify, errorMessage, isRemovedKind, isRetryable, KEY_MISMATCH_MESSAGE, retryDelay } from "./status.js";
 
 export type Api = Pick<
   ApiClient,
+  | "createSession"
   | "pair"
   | "createPairingCode"
   | "devices"
@@ -17,7 +18,6 @@ export type Api = Pick<
   | "deleteDevice"
   | "session"
   | "sessionKeyCheck"
-  | "putKeyCheck"
   | "changes"
   | "acquire"
   | "release"
@@ -126,7 +126,8 @@ async function hasPermission(deps: Deps, serverUrl: string): Promise<boolean> {
 }
 
 /**
- * Record an error in state: `stale_owner` demotes, `device_revoked` clears credentials, network
+ * Record an error in state: `stale_owner` demotes, `device_revoked` and `unauthorized` (session
+ * deleted) clear credentials and key while paired, network
  * errors and 5xx mark the device offline and schedule the next retry with bounded exponential
  * backoff (RETRY_BASE_MS doubling to RETRY_MAX_MS). Always rethrows so the caller can report it.
  */
@@ -137,8 +138,11 @@ export async function fail(store: Store, e: unknown, sentGeneration?: number | n
   }
   const kind = classify(e, e instanceof ApiError && e.code === "network_error" ? await hasPermission(store.deps, store.s.serverUrl) : true);
   const message = kind ? errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0) : null;
-  if (kind === "device_revoked") {
+  if (isRemovedKind(kind) && isPaired(store.s)) {
     await dropCredentials(store, { statusText: "Disconnected", lastError: message, errorKind: kind });
+  } else if (isRetryable(e) && !isPaired(store.s)) {
+    // Start syncing or joining: nothing to retry automatically; the user tries again.
+    await store.set({ errorKind: kind, lastError: message });
   } else if (isRetryable(e)) {
     const retryAttempts = store.s.retryAttempts + 1;
     await store.set({

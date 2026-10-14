@@ -229,7 +229,13 @@
       const o = this.body["owner"];
       return o && typeof o === "object" ? o : null;
     }
+    /** Seconds from the `Retry-After` header of `429 rate_limited`, when given. */
+    get retryAfter() {
+      const v = this.body["retryAfter"];
+      return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
+    }
   };
+  var OLD_SERVER_MESSAGE = "This server runs an older version.";
   function normalizeServerUrl(input) {
     let url;
     try {
@@ -270,42 +276,42 @@
       this.timeoutMs = opts.timeoutMs ?? 15e3;
       this.cipher = opts.cipher ?? null;
     }
-    /** `name` in the response is the stored name, suffixed when another device uses it (absent on older servers). */
+    /** Start a new session with this browser as its first device (Start syncing). */
+    createSession(body) {
+      return this.request("POST", "/v3/sessions", body, false);
+    }
+    /** Join the session of an invite code. */
     pair(body) {
-      return this.request("POST", "/v2/pair", body, false);
+      return this.request("POST", "/v3/pair", body, false);
     }
     createPairingCode() {
-      return this.request("POST", "/v2/pairing-codes");
+      return this.request("POST", "/v3/pairing-codes");
     }
     /** Rename this device (self only); the response carries the stored, possibly suffixed, name. */
     renameDevice(id, name) {
-      return this.request("PATCH", `/v2/devices/${encodeURIComponent(id)}`, { name });
+      return this.request("PATCH", `/v3/devices/${encodeURIComponent(id)}`, { name });
     }
     async devices() {
-      const res = await this.request("GET", "/v2/devices");
+      const res = await this.request("GET", "/v3/devices");
       return res.devices;
     }
     async deleteDevice(id) {
-      await this.request("DELETE", `/v2/devices/${encodeURIComponent(id)}`);
+      await this.request("DELETE", `/v3/devices/${encodeURIComponent(id)}`, void 0, true, true);
     }
     async session() {
-      return this.openSession(await this.request("GET", "/v2/session"));
+      return this.openSession(await this.request("GET", "/v3/session"));
     }
-    /** The session's key check only, without decrypting entries (keyless pairing). */
+    /** The session's key check only, without decrypting entries (joining checks it first). */
     async sessionKeyCheck() {
-      return (await this.request("GET", "/v2/session")).keyCheck ?? null;
-    }
-    /** Store the key check (first browser) or confirm it: `409 key_set` when another key's check is stored. */
-    async putKeyCheck(keyCheck2) {
-      await this.request("PUT", "/v2/session/key", { keyCheck: keyCheck2 });
+      return (await this.request("GET", "/v3/session")).keyCheck ?? null;
     }
     async changes(since) {
-      const res = await this.request("GET", `/v2/session/changes?since=${encodeURIComponent(String(since))}`);
+      const res = await this.request("GET", `/v3/session/changes?since=${encodeURIComponent(String(since))}`);
       return { ...res, operations: await this.openLogged(res.operations) };
     }
     /** A session this device cannot open gives the ownership straight back (best effort). */
     async acquire(force) {
-      const res = await this.request("POST", "/v2/session/acquire", { force });
+      const res = await this.request("POST", "/v3/session/acquire", { force });
       try {
         return { ...res, session: await this.openSession(res.session) };
       } catch (e) {
@@ -314,29 +320,29 @@
       }
     }
     async release(generation) {
-      await this.request("POST", "/v2/session/release", { generation });
+      await this.request("POST", "/v3/session/release", { generation });
     }
     async heartbeat(generation) {
-      await this.request("POST", "/v2/session/heartbeat", { generation });
+      await this.request("POST", "/v3/session/heartbeat", { generation });
     }
     async operations(body) {
       const sealed = { ...body, operations: await this.sealAll(body.operations) };
-      const { catchUp, ...res } = await this.request("POST", "/v2/session/operations", sealed);
+      const { catchUp, ...res } = await this.request("POST", "/v3/session/operations", sealed);
       return catchUp ? { ...res, catchUp: { operations: await this.openLogged(catchUp.operations) } } : res;
     }
     async merge(operations) {
-      return this.request("POST", "/v2/session/merge", { operations: await this.sealAll(operations) });
+      return this.request("POST", "/v3/session/merge", { operations: await this.sealAll(operations) });
     }
     /** Diagnostics trace lines (core/diag.ts); the server accepts them only with CTS_DEBUG (else 404). */
     async postDiag(lines) {
-      await this.request("POST", "/v2/diag", { lines });
+      await this.request("POST", "/v3/diag", { lines }, true, true);
     }
     async snapshots() {
-      const res = await this.request("GET", "/v2/snapshots");
+      const res = await this.request("GET", "/v3/snapshots");
       return res.snapshots;
     }
     restoreSnapshot(id, generation) {
-      return this.request("POST", `/v2/snapshots/${encodeURIComponent(String(id))}/restore`, { generation });
+      return this.request("POST", `/v3/snapshots/${encodeURIComponent(String(id))}/restore`, { generation }, true, true);
     }
     requireCipher() {
       if (!this.cipher) throw new ApiError(0, "key_mismatch", "This device has no encryption key");
@@ -396,7 +402,11 @@
       );
       return { ...s, entries };
     }
-    async request(method, path, body, auth = true) {
+    /**
+     * `mayNotFind`: the route answers `404 not_found` for an unknown id (or a disabled feature).
+     * Elsewhere a `404` means the server predates v3 (`old_server`).
+     */
+    async request(method, path, body, auth = true, mayNotFind = false) {
       const headers = { Accept: "application/json" };
       if (body !== void 0) headers["Content-Type"] = "application/json";
       if (auth) {
@@ -431,7 +441,9 @@
         const obj = data && typeof data === "object" ? data : {};
         const code = typeof obj["error"] === "string" ? obj["error"] : `http_${res.status}`;
         const message = typeof obj["message"] === "string" ? obj["message"] : `Request failed with status ${res.status}`;
-        throw new ApiError(res.status, code, message, obj);
+        if (res.status === 404 && !mayNotFind) throw new ApiError(404, "old_server", OLD_SERVER_MESSAGE, obj);
+        const retryAfter = res.status === 429 ? Number(res.headers.get("Retry-After") ?? NaN) : NaN;
+        throw new ApiError(res.status, code, message, Number.isFinite(retryAfter) ? { ...obj, retryAfter } : obj);
       }
       if (data === void 0) throw new ApiError(res.status, "invalid_response", "Server returned an invalid response");
       return data;
@@ -474,13 +486,6 @@
     const line = msg.replace(URL_LIKE, "<url>");
     console.log("[cts] " + line);
     remember(line);
-    try {
-      const runtime = typeof chrome !== "undefined" ? chrome.runtime : void 0;
-      if (typeof runtime?.sendNativeMessage !== "function") return;
-      const sent = runtime.sendNativeMessage("application.id", { diag: line });
-      if (sent instanceof Promise) sent.catch(() => void 0);
-    } catch {
-    }
   }
   function setDiagSink(fn) {
     sink = fn;
@@ -941,6 +946,7 @@
       statusText: null,
       receivingWindowId: null,
       pendingPair: null,
+      invitePending: false,
       runLock: null,
       expected: [],
       detached: {},
@@ -991,6 +997,7 @@
       syncKey: null,
       keyVerified: false,
       pendingPair: null,
+      invitePending: false,
       pairedAt: null,
       lastRevision: 0,
       generation: null,
@@ -1024,6 +1031,9 @@
   function retryDelay(attempt) {
     return Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1), RETRY_MAX_MS);
   }
+  function isRemovedKind(kind) {
+    return kind === "device_revoked" || kind === "unauthorized";
+  }
   function isRetryableKind(kind) {
     return kind === "unreachable" || kind === "server" || kind === "permission";
   }
@@ -1036,7 +1046,7 @@
     if (e.code === "key_mismatch" || e.code === "bad_wire") return "key";
     if (e.code === "unauthorized" && e.status === 401) return "unauthorized";
     if (e.code === "network_error") return hasPermission2 ? "unreachable" : "permission";
-    if (e.status >= 500) return "server";
+    if (e.status >= 500 || e.code === "old_server") return "server";
     return null;
   }
   function hostOf(serverUrl2) {
@@ -1049,20 +1059,39 @@
   function errorMessage(kind, serverUrl2, status = 0) {
     switch (kind) {
       case "device_revoked":
-        return "This device was revoked on the server. Pair it again.";
       case "unauthorized":
-        return "The server does not accept this device's credentials. Disconnect, then pair again with a new code.";
+        return REMOVED_MESSAGE;
       case "permission":
         return `Grant access to ${hostOf(serverUrl2)} in the extension's site permissions.`;
       case "unreachable":
         return `Cannot reach ${hostOf(serverUrl2)}. Check the connection or the server; changes are kept and retried.`;
       case "server":
+        if (status === 404) return OLD_SERVER_MESSAGE;
         return `The server failed${status ? ` (HTTP ${status})` : ""}. Changes are kept and retried.`;
       case "key":
         return KEY_MISMATCH_MESSAGE;
     }
   }
+  var REMOVED_MESSAGE = "This browser was removed from sync. Start syncing or paste a new invite.";
   var KEY_MISMATCH_MESSAGE = "Different encryption key. Disconnect and pair again with an invite link.";
+  var INVITE_KEY_MISMATCH_MESSAGE = "This invite link's encryption key does not match. Copy a new invite link from your other browser.";
+  function pairingRefusal(e, now) {
+    if (!(e instanceof ApiError)) return null;
+    switch (e.code) {
+      case "sessions_closed":
+        return "This server does not take new sessions. Paste an invite link instead, or choose another server under Advanced.";
+      case "session_full":
+        return "Too many browsers are paired. Revoke one under Devices on a paired browser, then use a new invite link.";
+      case "invalid_code":
+        return "This invite link has expired or was already used. Create a new one on your other browser.";
+      case "rate_limited": {
+        const after = e.retryAfter;
+        return after === null ? "Too many attempts. Try again in a few minutes." : `Too many attempts. Try again at ${clock(now + after * 1e3)}.`;
+      }
+      default:
+        return null;
+    }
+  }
   function clock(ms) {
     const d = new Date(ms);
     return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -1150,8 +1179,10 @@
     }
     const kind = classify(e, e instanceof ApiError && e.code === "network_error" ? await hasPermission(store.deps, store.s.serverUrl) : true);
     const message = kind ? errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0) : null;
-    if (kind === "device_revoked") {
+    if (isRemovedKind(kind) && isPaired(store.s)) {
       await dropCredentials(store, { statusText: "Disconnected", lastError: message, errorKind: kind });
+    } else if (isRetryable(e) && !isPaired(store.s)) {
+      await store.set({ errorKind: kind, lastError: message });
     } else if (isRetryable(e)) {
       const retryAttempts = store.s.retryAttempts + 1;
       await store.set({
@@ -1585,7 +1616,7 @@
 
   // src/core/pairing.ts
   function pairingLink(serverUrl2, code, key) {
-    return key ? `${serverUrl2}#${code}.${key}` : `${serverUrl2}#${code}`;
+    return `${serverUrl2}#${code}.${key}`;
   }
   function browserLabel(browser) {
     if (browser === "safari") return "Safari";
@@ -1847,63 +1878,91 @@
       return fail(store, e, store.s.generation);
     }
   }
-  var KEY_REQUIRED_MESSAGE = "This server already holds encrypted tabs. Pair with an invite link from a browser that is already paired.";
-  async function pair(deps2, input) {
+  function checkDeviceName(input) {
+    const name = input.trim();
+    if (!name) throw new Error("Device name is required");
+    if (name.length > 64) throw new Error("Device name must be at most 64 characters");
+    return name;
+  }
+  function explained(deps2, e) {
+    const message = pairingRefusal(e, nowMs(deps2));
+    return message && e instanceof ApiError ? new ApiError(e.status, e.code, message, e.body) : e;
+  }
+  async function storePaired(store, deps2, p) {
+    const name = p.res.name ?? p.deviceName;
+    const renamed = name !== p.deviceName ? ` as "${name}" (another device is named "${p.deviceName}")` : "";
+    await store.set({
+      ...clearedCredentials(),
+      serverUrl: p.serverUrl,
+      deviceName: name,
+      deviceId: p.res.deviceId,
+      token: p.res.token,
+      syncKey: p.syncKey,
+      keyVerified: true,
+      pairedAt: nowIso(deps2),
+      invitePending: p.started,
+      mappings: emptyMappings(),
+      ...succeeded(deps2),
+      lastError: null,
+      statusText: p.started ? `Started syncing${renamed}. Invite your other browser.` : `Paired${renamed}. This browser follows the shared tabs and takes over when you use it.`
+    });
+  }
+  async function startSyncing(deps2, input) {
     const store = await Store.open(deps2);
+    if (isPaired(store.s)) return store.s;
     try {
       const serverUrl2 = normalizeServerUrl(input.serverUrl);
-      const deviceName = input.deviceName.trim();
-      const code = input.code.replace(/\s+/g, "");
-      if (!deviceName) throw new Error("Device name is required");
-      if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
-      if (!code) throw new Error("Pairing code is required");
-      const res = await deps2.api({ baseUrl: serverUrl2, token: null }).pair({ code, name: deviceName, browser: deps2.browser });
-      const syncKey = await verifyKey(store, deps2.api({ baseUrl: serverUrl2, token: res.token }), res.deviceId, input.key);
-      const name = res.name ?? deviceName;
-      const renamed = name !== deviceName ? ` as "${name}" (another device is named "${deviceName}")` : "";
-      await store.set({
-        ...clearedCredentials(),
-        serverUrl: serverUrl2,
-        deviceName: name,
-        deviceId: res.deviceId,
-        token: res.token,
-        syncKey,
-        keyVerified: true,
-        pairedAt: nowIso(deps2),
-        mappings: emptyMappings(),
-        ...succeeded(deps2),
-        lastError: null,
-        statusText: `Paired${renamed}. This browser follows the shared tabs and takes over when you use it.`
-      });
+      const deviceName = checkDeviceName(input.deviceName);
+      await store.set({ serverUrl: serverUrl2 });
+      const syncKey = generateKey();
+      const res = await deps2.api({ baseUrl: serverUrl2, token: null }).createSession({ keyCheck: await keyCheck(syncKey), name: deviceName, browser: deps2.browser });
+      await keepOrRevoke(deps2, serverUrl2, res, () => storePaired(store, deps2, { serverUrl: serverUrl2, deviceName, res, syncKey, started: true }));
       return store.s;
     } catch (e) {
-      return fail(store, e);
+      return fail(store, explained(deps2, e));
     }
   }
-  async function verifyKey(store, api, deviceId, linkKey) {
-    const refuse = async (message) => {
-      await api.deleteDevice(deviceId).catch(() => void 0);
-      await dropCredentials(store, { errorKind: "key", statusText: null });
-      throw new Error(message);
-    };
+  async function keepOrRevoke(deps2, serverUrl2, res, save) {
     try {
-      let key = linkKey;
-      if (!key) {
-        const [check, devices] = await Promise.all([api.sessionKeyCheck(), api.devices()]);
-        const self = devices.findIndex((d) => d.isSelf);
-        const older = devices.slice(0, self < 0 ? devices.length : self).some((d) => !d.revokedAt);
-        if (check !== null || older) return await refuse(KEY_REQUIRED_MESSAGE);
-        key = generateKey();
-      }
-      await api.putKeyCheck(await keyCheck(key));
-      return key;
+      await save();
     } catch (e) {
-      if (e instanceof ApiError && e.code === "key_set") return refuse(KEY_REQUIRED_MESSAGE);
-      if (!(e instanceof ApiError)) throw e;
+      await deps2.api({ baseUrl: serverUrl2, token: res.token }).deleteDevice(res.deviceId).catch(() => void 0);
+      throw e;
+    }
+  }
+  async function pair(deps2, input) {
+    const store = await Store.open(deps2);
+    if (isPaired(store.s)) return store.s;
+    try {
+      const serverUrl2 = normalizeServerUrl(input.serverUrl);
+      const deviceName = checkDeviceName(input.deviceName);
+      const code = input.code.replace(/\s+/g, "");
+      if (!code) throw new Error("Pairing code is required");
+      const key = input.key;
+      if (!key) throw new Error("This link has no encryption key, so it cannot be used. Copy the whole invite link again.");
+      await store.set({ serverUrl: serverUrl2 });
+      const res = await deps2.api({ baseUrl: serverUrl2, token: null }).pair({ code, name: deviceName, browser: deps2.browser });
+      await verifyKey(store, deps2.api({ baseUrl: serverUrl2, token: res.token }), res.deviceId, key);
+      await keepOrRevoke(deps2, serverUrl2, res, () => storePaired(store, deps2, { serverUrl: serverUrl2, deviceName, res, syncKey: key, started: false }));
+      return store.s;
+    } catch (e) {
+      return fail(store, explained(deps2, e));
+    }
+  }
+  async function verifyKey(store, api, deviceId, key) {
+    let matches;
+    try {
+      const [stored, own] = await Promise.all([api.sessionKeyCheck(), keyCheck(key)]);
+      matches = stored === own;
+    } catch (e) {
       await api.deleteDevice(deviceId).catch(() => void 0);
       await dropCredentials(store, {});
       throw e;
     }
+    if (matches) return;
+    await api.deleteDevice(deviceId).catch(() => void 0);
+    await dropCredentials(store, { errorKind: "key", statusText: null });
+    throw new Error(INVITE_KEY_MISMATCH_MESSAGE);
   }
   async function dropExpiredPendingPair(deps2, now = Date.now()) {
     const s = await loadState(deps2.adapter.storage);
@@ -1917,13 +1976,15 @@
     if (!pending) return null;
     await saveState(deps2.adapter.storage, { pendingPair: null });
     if (now - pending.createdAt > PENDING_PAIR_TTL_MS) return null;
-    return pair(deps2, pending);
+    if (pending.code === void 0) return startSyncing(deps2, pending);
+    return pair(deps2, { ...pending, code: pending.code });
   }
   async function createPairingCode(deps2) {
     const store = await Store.open(deps2);
     try {
       requireKey(store.s);
       const res = await apiFor(deps2, store.s).createPairingCode();
+      if (store.s.invitePending) await store.set({ invitePending: false });
       return { code: res.code, expiresAt: res.expiresAt, link: pairingLink(store.s.serverUrl, res.code, store.s.syncKey) };
     } catch (e) {
       return fail(store, e);
@@ -1953,7 +2014,8 @@
         ({ owner, minRevision } = await api.session());
       }
     } catch (e) {
-      if (e instanceof ApiError && (e.code === "device_revoked" || classify(e, true) === "key")) await fail(store, e).catch(() => void 0);
+      const kind = classify(e, true);
+      if (isRemovedKind(kind) || kind === "key") await fail(store, e).catch(() => void 0);
       return false;
     }
     const lostOwnership = store.s.generation !== null && (!owner || owner.deviceId !== store.s.deviceId || owner.generation !== store.s.generation);
@@ -2019,7 +2081,7 @@
       return result;
     } catch (e) {
       const kind = classify(e, true);
-      if (kind === "device_revoked" || kind === "key") return fail(store, e);
+      if (isRemovedKind(kind) || kind === "key") return fail(store, e);
       throw kind ? new Error(errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0)) : e;
     }
   }
@@ -2501,6 +2563,8 @@
       nextRetryAt: s.nextRetryAt,
       paused: s.paused,
       encrypted: s.syncKey !== null,
+      invitePending: s.invitePending,
+      finishing: !isPaired(s) && (s.pendingPair !== null && now - s.pendingPair.createdAt <= PENDING_PAIR_TTL_MS || isLocked(s, now) && s.runLock?.action === "pair"),
       summary: syncSummary({ ...s, pendingCount }),
       lastError: s.lastError,
       errorKind: s.errorKind,
@@ -2530,7 +2594,7 @@
       return;
     }
     const s = await loadState(adapter.storage);
-    if (!isPaired(s)) throw new Error(s.lastError ?? "Pairing form expired or was already used; enter the code again");
+    if (!isPaired(s)) throw new Error(s.lastError ?? "The form expired or was already used. Try again.");
   }
   async function setup() {
     const state = await loadState(adapter.storage);

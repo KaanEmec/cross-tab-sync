@@ -93,7 +93,7 @@ describe("devices", () => {
     ]);
     await expect(brave.engine.runNow("syncNow")).rejects.toMatchObject({ code: "device_revoked" });
     const b = await brave.state();
-    expect(b).toMatchObject({ token: null, errorKind: "device_revoked", lastError: "This device was revoked on the server. Pair it again." });
+    expect(b).toMatchObject({ token: null, errorKind: "device_revoked", lastError: "This browser was removed from sync. Start syncing or paste a new invite." });
   });
 });
 
@@ -122,11 +122,13 @@ describe("status", () => {
     s = await mac.state();
     expect(s).toMatchObject({ errorKind: "server", online: false, lastError: "The server failed (HTTP 503). Changes are kept and retried." });
 
+    // An unknown token (the session was deleted): treated like a revoked device.
     server.devices.find((d) => d.id === mac.id)!.token = "cts_rotated";
     await run(mac);
     s = await mac.state();
-    expect(s.errorKind).toBe("unauthorized");
-    expect(s.lastError).toBe("The server does not accept this device's credentials. Disconnect, then pair again with a new code.");
+    expect(s).toMatchObject({ errorKind: "unauthorized", token: null, deviceId: null, syncKey: null, keyVerified: false });
+    expect(s.lastError).toBe("This browser was removed from sync. Start syncing or paste a new invite.");
+    expect(statusView(s).paired).toBe(false);
     // The server answered: no retry can fix this, so none stays scheduled.
     expect(s).toMatchObject({ online: true, nextRetryAt: null, retryAttempts: 0 });
     expect(mac.retries.size).toBe(0);

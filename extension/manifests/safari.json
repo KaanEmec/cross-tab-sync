@@ -1,7 +1,5 @@
 {
   "_comment": "Safari (macOS). Same permissions as Brave; the user still grants website access in Safari Settings > Extensions. Packaged by xcrun safari-web-extension-converter (see README). Never add background.scripts here: Safari prefers scripts over service_worker when both exist. Bundles are IIFE, so no type: module. Floor 18.4 per docs/COMPATIBILITY.md (fetch needs a permissions.request grant from 18.4; tabs.create pinned fixed in 18.3). tabs.move is unsupported and not used.",
-  "_comment_permissions": "Arrays replace on merge: the base permissions plus nativeMessaging, which sends the diagnostics trace (core/diag.ts) to the app extension's os_log.",
-  "permissions": ["tabs", "storage", "alarms", "nativeMessaging"],
   "browser_specific_settings": {
     "safari": {
       "strict_min_version": "18.4"

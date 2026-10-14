@@ -43,7 +43,7 @@ async function pairQueued(): Promise<void> {
   }
   const s = await loadState(adapter.storage);
   // The other trigger may already have failed (e.g. invalid_code): report its error.
-  if (!isPaired(s)) throw new Error(s.lastError ?? "Pairing form expired or was already used; enter the code again");
+  if (!isPaired(s)) throw new Error(s.lastError ?? "The form expired or was already used. Try again.");
 }
 
 async function setup(): Promise<void> {

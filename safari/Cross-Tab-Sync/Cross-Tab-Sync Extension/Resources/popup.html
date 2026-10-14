@@ -88,36 +88,36 @@
 
     <form id="pair-view" class="pair" novalidate hidden>
       <label class="field">
-        <span class="field-label">Pairing link</span>
-        <input id="pair-link" type="text" placeholder="https://your-server#CODE.KEY" autocomplete="off" spellcheck="false"
-          autocapitalize="off" />
-      </label>
-      <p id="pair-target" class="hint">Get one from <b>Invite another browser</b> on a paired browser; it ends
-        with <code>#CODE.KEY</code>. For the first browser only, run <code>cross-tab-sync pair-code</code> on the
-        server.</p>
-      <label class="field">
         <span class="field-label">This browser's name</span>
         <input id="device-name" type="text" maxlength="64" />
       </label>
-      <button id="pair" type="submit" class="btn primary wide">Pair this browser</button>
+      <button id="start" type="button" class="btn primary wide">Start syncing</button>
+      <p class="hint disclosure">Tab addresses are encrypted in this browser before they are sent. The server only stores
+        ciphertext.</p>
+      <button id="show-join" type="button" class="btn secondary wide">I have an invite link</button>
+      <div id="join-box" hidden>
+        <label class="field">
+          <span class="field-label">Invite link</span>
+          <input id="pair-link" type="text" placeholder="https://server#CODE.KEY" autocomplete="off" spellcheck="false"
+            autocapitalize="off" />
+        </label>
+        <p id="pair-target" class="hint">Copy it from <b>Invite another browser</b> in your other browser.</p>
+        <button id="join" type="button" class="btn primary wide">Join</button>
+      </div>
       <details id="pair-advanced" class="fold">
         <summary>
           <svg class="glyph" aria-hidden="true"><use href="#i-sliders" /></svg>
           <span class="fold-label">Advanced</span>
-          <span class="fold-summary">Server URL and code</span>
+          <span class="fold-summary">Server URL</span>
           <svg class="chev" aria-hidden="true"><use href="#i-chevron" /></svg>
         </summary>
         <div class="fold-body">
           <label class="field">
             <span class="field-label">Server URL</span>
-            <input id="server-url" type="text" inputmode="url" placeholder="https://your-server" autocomplete="url"
-              spellcheck="false" autocapitalize="off" />
+            <input id="server-url" type="text" inputmode="url" autocomplete="url" spellcheck="false"
+              autocapitalize="off" />
           </label>
-          <label class="field">
-            <span class="field-label">Code</span>
-            <input id="pair-code" type="text" maxlength="16" autocomplete="one-time-code" spellcheck="false"
-              autocapitalize="characters" placeholder="8 letters and digits" />
-          </label>
+          <p class="hint">For Start syncing. Leave empty for the hosted server.</p>
         </div>
       </details>
     </form>
@@ -165,7 +165,7 @@
             </button>
             <div id="invite-box" class="invite" hidden>
               <div class="inline">
-                <input id="invite-link" type="text" readonly aria-label="Pairing link" />
+                <input id="invite-link" type="text" readonly aria-label="Invite link" />
                 <button id="copy-link" type="button" class="btn small secondary">
                   <svg aria-hidden="true"><use href="#i-copy" /></svg>
                   <span>Copy</span>

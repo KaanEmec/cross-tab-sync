@@ -1,7 +1,9 @@
-// Pairing links, device identity (rename, duplicate names) and the device list view model.
+// Invite links, Start syncing and joining, popup screens, device identity (rename, duplicate names) and the device list view model.
 import { beforeEach, describe, expect, it } from "vitest";
 import { FakeBrowser } from "../src/adapter/fake.js";
-import type { Device } from "../src/core/client.js";
+import { ApiClient, ApiError, type Device } from "../src/core/client.js";
+import { DEFAULT_SERVER_URL } from "../src/core/config.js";
+import { keyCheck } from "../src/core/crypto.js";
 import {
   activityLine,
   deviceRows,
@@ -9,8 +11,10 @@ import {
   errorFix,
   heroView,
   type HeroContext,
+  inviteNote,
   ownerLine,
   primaryAction,
+  screenOf,
   relativeTime,
   secondsAgo,
   shortId,
@@ -19,32 +23,23 @@ import {
   snapshotRows,
   snapshotsSummary,
 } from "../src/core/devices.js";
-import { createPairingCode, pair, pairFromPending, type Deps } from "../src/core/handover.js";
+import { createPairingCode, pair, pairFromPending, startSyncing, type Deps } from "../src/core/handover.js";
 import { statusView, type StatusView } from "../src/core/messages.js";
-import { defaultDeviceName, normalizeCode, pairingLink, parsePairingInput, resolvePairingForm } from "../src/core/pairing.js";
+import { defaultDeviceName, normalizeCode, pairingLink, pairSubmitAction, parsePairingInput, startServerUrl } from "../src/core/pairing.js";
 import { listDevices, renameDevice } from "../src/core/recovery.js";
 import { loadState, saveState } from "../src/core/state.js";
-import { FakeServer } from "./support/fakeServer.js";
+import { clock, pairingRefusal } from "../src/core/status.js";
+import { FakeServer, TEST_KEY } from "./support/fakeServer.js";
 
 describe("parsePairingInput", () => {
-  it.each([
-    ["https://tabs.example.com#ABCD2345", "https://tabs.example.com", "ABCD2345"],
-    ["https://tabs.example.com/#abcd-2345", "https://tabs.example.com", "ABCD2345"],
-    ["https://tabs.example.com/cts#ABCD2345", "https://tabs.example.com/cts", "ABCD2345"],
-    ["http://127.0.0.1:8080#ABCD2345", "http://127.0.0.1:8080", "ABCD2345"],
-    ["  https://tabs.example.com#ABCD 2345 \n", "https://tabs.example.com", "ABCD2345"],
-    ["tabs.example.com#ABCD2345", "https://tabs.example.com", "ABCD2345"],
-  ])("link %j", (input, serverUrl, code) => {
-    expect(parsePairingInput(input)).toEqual({ serverUrl, code });
-  });
-
   const KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
   it.each([
     [`https://tabs.example.com#ABCD2345.${KEY}`, "https://tabs.example.com"],
     [`https://tabs.example.com/cts/#abcd-2345.${KEY}`, "https://tabs.example.com/cts"],
-    [`  http://127.0.0.1:8080#ABCD2345.${KEY} \n`, "http://127.0.0.1:8080"],
-  ])("invite link with a key %j", (input, serverUrl) => {
+    [`  http://127.0.0.1:8080#ABCD 2345.${KEY} \n`, "http://127.0.0.1:8080"],
+    [`tabs.example.com#ABCD2345.${KEY}`, "https://tabs.example.com"],
+  ])("invite link %j", (input, serverUrl) => {
     expect(parsePairingInput(input)).toEqual({ serverUrl, code: "ABCD2345", key: KEY });
   });
 
@@ -54,50 +49,48 @@ describe("parsePairingInput", () => {
     [`https://tabs.example.com#ABCD2345.${KEY}x`],
     [`https://tabs.example.com#ABCD2345.${KEY.slice(0, 42)}+`],
     [`https://tabs.example.com#ABCD2345.${KEY.slice(0, 42)}9`], // not canonical
-  ])("rejects a damaged key %j, naming the #CODE.KEY format", (input) => {
-    expect(() => parsePairingInput(input)).toThrow(/#CODE\.KEY/);
+  ])("rejects a damaged key %j", (input) => {
+    expect(() => parsePairingInput(input)).toThrow(/key in this link is incomplete or damaged/);
   });
 
-  it("checks the code before the key", () => {
-    expect(() => parsePairingInput(`https://tabs.example.com#ABC.${KEY}`)).toThrow(/8 letters and digits/);
-  });
-
-  it("accepts a bare code when the server is known", () => {
-    expect(parsePairingInput(" abcd-2345 ", "https://tabs.example.com/")).toEqual({ serverUrl: "https://tabs.example.com", code: "ABCD2345" });
-    expect(() => parsePairingInput("ABCD2345")).toThrow(/whole pairing link/);
-    expect(() => parsePairingInput("ABCD2345", "  ")).toThrow(/whole pairing link/);
+  it("rejects a link without a key and a bare code", () => {
+    expect(() => parsePairingInput("https://tabs.example.com#ABCD2345")).toThrow(/no encryption key/);
+    expect(() => parsePairingInput("https://tabs.example.com/#")).toThrow(/no encryption key/);
+    expect(() => parsePairingInput("ABCD2345")).toThrow(/not a whole invite link.*#CODE\.KEY/);
+    expect(() => parsePairingInput(" abcd-2345 ")).toThrow(/not a whole invite link/);
   });
 
   it.each([
-    ["", /Paste the pairing link/],
-    ["   ", /Paste the pairing link/],
-    ["https://tabs.example.com", /no pairing code.*#CODE/],
-    ["https://tabs.example.com/#", /no pairing code/],
-    ["https://tabs.example.com#ABC", /8 letters and digits/],
-    ["https://tabs.example.com#ABCD_2345", /8 letters and digits/],
-    ["http://tabs.example.com#ABCD2345", /https/],
-    ["https://tabs.example.com/?a=1#ABCD2345", /query/],
-    ["ABCD", /8 letters and digits/],
+    ["", /Paste the invite link/],
+    ["   ", /Paste the invite link/],
+    ["https://tabs.example.com", /not a whole invite link/],
+    [`#ABCD2345.${KEY}`, /no server address/],
+    [`https://tabs.example.com#ABC.${KEY}`, /incomplete/],
+    [`https://tabs.example.com#ABCD_2345.${KEY}`, /incomplete/],
+    [`http://tabs.example.com#ABCD2345.${KEY}`, /https/],
+    [`https://tabs.example.com/?a=1#ABCD2345.${KEY}`, /query/],
   ])("rejects %j", (input, message) => {
-    expect(() => parsePairingInput(input, "https://known.example")).toThrow(message);
+    expect(() => parsePairingInput(input)).toThrow(message);
   });
 
-  it("resolves the popup form: link first, then the Advanced fields", () => {
-    const known = "https://old.example";
-    expect(resolvePairingForm({ link: "https://new.example#ABCD2345", serverUrl: "", code: "" }, known)).toEqual({
-      serverUrl: "https://new.example",
-      code: "ABCD2345",
-    });
-    expect(resolvePairingForm({ link: "ABCD2345", serverUrl: "", code: "" }, known).serverUrl).toBe(known);
-    expect(resolvePairingForm({ link: "ABCD2345", serverUrl: "https://adv.example", code: "" }, known).serverUrl).toBe("https://adv.example");
-    expect(resolvePairingForm({ link: " ", serverUrl: "https://adv.example", code: "wxyz-2345" }, "")).toEqual({
-      serverUrl: "https://adv.example",
-      code: "WXYZ2345",
-    });
+  it("Start syncing uses the default server unless Advanced names one", () => {
+    expect(DEFAULT_SERVER_URL).toBe("https://cts.kexperiments.com");
+    expect(startServerUrl("")).toBe(DEFAULT_SERVER_URL);
+    expect(startServerUrl("  ")).toBe(DEFAULT_SERVER_URL);
+    expect(startServerUrl(" https://tabs.example.com/ ")).toBe("https://tabs.example.com");
+    expect(startServerUrl(" tabs.example.com ")).toBe("https://tabs.example.com"); // a bare host, as in invite links
+    expect(startServerUrl("tabs.example.com/cts/")).toBe("https://tabs.example.com/cts");
+    expect(() => startServerUrl("http://tabs.example.com")).toThrow(/https/);
+  });
+
+  it("joins on every submit once the invite field is shown, unless Start syncing was clicked", () => {
+    expect(pairSubmitAction(false, null)).toBe("start"); // Enter in the name field
+    expect(pairSubmitAction(true, null)).toBe("join"); // Enter in any field with the invite field shown
+    expect(pairSubmitAction(true, "start")).toBe("start");
+    expect(pairSubmitAction(true, "join")).toBe("join");
   });
 
   it("builds links and default names", () => {
-    expect(pairingLink("https://tabs.example.com", "ABCD2345")).toBe("https://tabs.example.com#ABCD2345");
     expect(pairingLink("https://tabs.example.com", "ABCD2345", "k".repeat(43))).toBe(`https://tabs.example.com#ABCD2345.${"k".repeat(43)}`);
     expect(normalizeCode("ab cd-23 45")).toBe("ABCD2345");
     expect(defaultDeviceName("brave", "mac")).toBe("Brave on macOS");
@@ -107,61 +100,183 @@ describe("parsePairingInput", () => {
   });
 });
 
-describe("pairing from a link", () => {
+describe("Start syncing and joining", () => {
   let server: FakeServer;
   beforeEach(() => {
     server = new FakeServer();
   });
   const browser = (kind: "brave" | "safari" = "brave"): Deps => ({ adapter: new FakeBrowser(), api: server.api, browser: kind });
 
-  /** What the popup does: parse the field, save the form, then the worker pairs from it. */
+  /** What the popup does for Start syncing: save the form, then the worker finishes it. */
+  async function start(deps: Deps, deviceName: string, serverUrl = "https://sync.example") {
+    await saveState(deps.adapter.storage, { pendingPair: { serverUrl, deviceName, createdAt: Date.now() } });
+    return pairFromPending(deps);
+  }
+
+  /** What the popup does for an invite link: parse the field, save the form, then the worker pairs. */
   async function pairWithLink(deps: Deps, link: string, deviceName: string) {
     const target = parsePairingInput(link);
     await saveState(deps.adapter.storage, { pendingPair: { ...target, deviceName, createdAt: Date.now() } });
     return pairFromPending(deps);
   }
 
-  it("pairs from a link, invites another browser, and suffixes its duplicate name", async () => {
+  it("starts a session with a fresh key, invites another browser, and suffixes its duplicate name", async () => {
     const mac = browser();
-    const s = await pairWithLink(mac, "https://sync.example/#good-code", "Brave on macOS");
-    expect(s).toMatchObject({ serverUrl: "https://sync.example", deviceName: "Brave on macOS", deviceId: "dev-1" });
+    const s = await start(mac, "Brave on macOS");
+    expect(s).toMatchObject({ serverUrl: "https://sync.example", deviceName: "Brave on macOS", deviceId: "dev-1", keyVerified: true });
     expect(s?.pairedAt).toEqual(expect.any(String));
-    expect(server.requests.find((r) => r.path === "pair")?.body).toEqual({ code: "GOODCODE", name: "Brave on macOS", browser: "brave" });
-
-    // First browser of an empty session: it generated the key.
+    expect(server.requests.map((r) => r.path)).toEqual(["sessions"]);
     const key = s!.syncKey!;
     expect(key).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(statusView(s!).encrypted).toBe(true);
-    expect(JSON.stringify(statusView(s!))).not.toContain(key);
+    expect(server.requests[0]!.body).toEqual({ keyCheck: await keyCheck(key), name: "Brave on macOS", browser: "brave" });
+    expect(server.keyCheck).toBe(await keyCheck(key));
+    expect(JSON.stringify(server.requests)).not.toContain(key); // the key itself never leaves
+    const view = statusView(s!);
+    expect(view.encrypted).toBe(true);
+    expect(JSON.stringify(view)).not.toContain(key);
+    expect(screenOf(view)).toBe("welcome");
+    expect(await pairFromPending(mac)).toBeNull(); // the saved form is consumed: no second session
 
-    // Invite another browser: the link carries the server URL, the new code and the key.
+    // The popup creates the first invite at once; that ends the welcome screen.
     const invite = await createPairingCode(mac);
     expect(invite.link).toBe(`https://sync.example#${invite.code}.${key}`);
     expect(server.codes.has(invite.code)).toBe(true);
+    expect(screenOf(statusView(await loadState(mac.adapter.storage)))).toBe("main");
 
     const other = browser();
     const t = await pairWithLink(other, invite.link, "Brave on macOS");
-    expect(t).toMatchObject({ deviceName: "Brave on macOS 2", deviceId: "dev-2", syncKey: key });
+    expect(t).toMatchObject({ deviceName: "Brave on macOS 2", deviceId: "dev-2", syncKey: key, keyVerified: true, invitePending: false });
     expect(t?.statusText).toMatch(/^Paired as "Brave on macOS 2" \(another device is named "Brave on macOS"\)/);
+    expect(screenOf(statusView(t!))).toBe("main");
     expect(server.codes.has(invite.code)).toBe(false); // single use
+    // Joining compares the key check before anything else.
+    expect(server.requests.slice(-2).map((r) => r.path)).toEqual(["pair", "session"]);
   });
 
-  it("falls back to a locally built link when the server does not send one", async () => {
-    const mac = browser();
-    await pair(mac, { serverUrl: "https://sync.example", deviceName: "Mac", code: "GOODCODE" });
-    const api = server.api;
-    const noLink: Deps = {
-      ...mac,
-      api: (cfg) => Object.assign(api(cfg), { createPairingCode: async () => ({ code: "ABCD2345", expiresAt: "2026-01-01T00:00:00.000Z" }) }),
+  it("maps a closed server, the rate limit and an older server to plain messages", async () => {
+    const first = browser();
+    await start(first, "Mac");
+    const late = browser();
+    await expect(start(late, "Brave")).rejects.toMatchObject({ status: 403, code: "sessions_closed" });
+    expect(await loadState(late.adapter.storage)).toMatchObject({
+      token: null,
+      syncKey: null,
+      lastError: expect.stringMatching(/^This server does not take new sessions\. Paste an invite link instead/),
+    });
+
+    server.rateLimited = 90;
+    const at = Date.now();
+    await expect(start(late, "Brave")).rejects.toMatchObject({ status: 429, code: "rate_limited" });
+    expect((await loadState(late.adapter.storage)).lastError).toBe(`Too many attempts. Try again at ${clock(at + 90_000)}.`);
+
+    const old: Deps = {
+      ...browser(),
+      api: (cfg) => new ApiClient({ ...cfg, fetch: async () => new Response(JSON.stringify({ error: "not_found", message: "no" }), { status: 404 }) }),
     };
-    const key = (await loadState(mac.adapter.storage)).syncKey;
-    expect((await createPairingCode(noLink)).link).toBe(`https://sync.example#ABCD2345.${key}`);
+    await expect(startSyncing(old, { serverUrl: "https://old.example", deviceName: "Brave" })).rejects.toMatchObject({ code: "old_server" });
+    const s = await loadState(old.adapter.storage);
+    expect(s).toMatchObject({ errorKind: "server", lastError: "This server runs an older version.", token: null });
+    expect(errorFix(statusView(s))).toBeNull(); // unpaired: the form is the fix
+    await expect(pair(old, { serverUrl: "https://old.example", deviceName: "Brave", code: "ABCD2345", key: TEST_KEY })).rejects.toMatchObject({
+      code: "old_server",
+    });
+    expect((await loadState(old.adapter.storage)).lastError).toBe("This server runs an older version.");
+  });
+
+  it("maps a full session, a used code and a rate-limited join to plain messages", async () => {
+    const mac = browser();
+    await start(mac, "Mac");
+    const { link } = await createPairingCode(mac);
+    server.maxDevices = 1;
+    const brave = browser();
+    await expect(pairWithLink(brave, link, "Brave")).rejects.toMatchObject({ code: "session_full" });
+    expect((await loadState(brave.adapter.storage)).lastError).toMatch(/^Too many browsers are paired/);
+    server.maxDevices = 10;
+    await expect(pairWithLink(brave, link, "Brave")).rejects.toMatchObject({ code: "invalid_code" });
+    expect((await loadState(brave.adapter.storage)).lastError).toMatch(/expired or was already used/);
+    server.rateLimited = 30;
+    await expect(pairWithLink(brave, (await createPairingCode(mac)).link, "Brave")).rejects.toMatchObject({ code: "rate_limited" });
+    expect((await loadState(brave.adapter.storage)).lastError).toMatch(/^Too many attempts\. Try again at \d\d:\d\d\.$/);
+    expect(pairingRefusal(new ApiError(429, "rate_limited", "x"), 0)).toBe("Too many attempts. Try again in a few minutes.");
+    expect(pairingRefusal(new ApiError(400, "invalid_request", "x"), 0)).toBeNull();
+  });
+
+  it("an unreachable server is named in the error; nothing is retried while unpaired", async () => {
+    server.unreachable = true;
+    for (const run of [
+      (d: Deps) => startSyncing(d, { serverUrl: "https://sync.example/", deviceName: "Brave" }),
+      (d: Deps) => pair(d, { serverUrl: "https://sync.example", deviceName: "Brave", code: "GOODCODE", key: TEST_KEY }),
+    ]) {
+      const d = browser();
+      await saveState(d.adapter.storage, { serverUrl: "https://stale.example" }); // left by an earlier Disconnect
+      await expect(run(d)).rejects.toMatchObject({ code: "network_error" });
+      const s = await loadState(d.adapter.storage);
+      expect(s).toMatchObject({ serverUrl: "https://sync.example", token: null, errorKind: "unreachable", online: true, nextRetryAt: null, retryAttempts: 0 });
+      expect(s.lastError).toMatch(/^Cannot reach https:\/\/sync\.example\./);
+      expect(statusView(s).paired).toBe(false);
+    }
+  });
+
+  it("a second Start syncing or join after pairing keeps the first session", async () => {
+    const mac = browser();
+    const first = await startSyncing(mac, { serverUrl: "https://sync.example", deviceName: "Mac" });
+    const before = server.requests.length;
+    // E.g. the popup's message and permissions.onAdded both finishing saved forms.
+    expect(await startSyncing(mac, { serverUrl: "https://other.example", deviceName: "Mac" })).toEqual(first);
+    expect(await pair(mac, { serverUrl: "https://sync.example", deviceName: "Mac", code: "GOODCODE", key: TEST_KEY })).toEqual(first);
+    expect(server.requests.length).toBe(before);
+    expect(server.devices.filter((d) => !d.revoked)).toHaveLength(1);
+  });
+
+  it("shows a saved or running pairing as finishing", async () => {
+    const d = browser();
+    const now = Date.now();
+    const s = await loadState(d.adapter.storage);
+    expect(statusView(s, now).finishing).toBe(false);
+    const pendingPair = { serverUrl: "https://sync.example", deviceName: "Brave", createdAt: now };
+    expect(statusView({ ...s, pendingPair }, now).finishing).toBe(true);
+    expect(statusView({ ...s, pendingPair }, now + 11 * 60_000).finishing).toBe(false); // expired form
+    expect(statusView({ ...s, runLock: { action: "pair", startedAt: now } }, now).finishing).toBe(true);
+    expect(statusView({ ...s, runLock: { action: "alarm", startedAt: now } }, now).finishing).toBe(false);
+    const view = statusView({ ...s, pendingPair }, now);
+    expect(heroView(view, { now, offline: false, working: false, devices: null }).detail).toBe("Finishing… this takes a few seconds.");
+    const paired = await startSyncing(d, { serverUrl: "https://sync.example", deviceName: "Brave" });
+    expect(statusView({ ...paired, pendingPair }, now).finishing).toBe(false);
+  });
+
+  it("a session whose credentials cannot be stored is removed again", async () => {
+    for (const join of [false, true]) {
+      server = new FakeServer();
+      const inviter = join ? browser() : null;
+      const link = inviter ? (await startSyncing(inviter, { serverUrl: "https://sync.example", deviceName: "Mac" }), (await createPairingCode(inviter)).link) : "";
+      const d = browser();
+      const storage = d.adapter.storage;
+      const set = storage.set.bind(storage);
+      storage.set = async (items) => {
+        if ("cts.token" in items && items["cts.token"]) throw new Error("storage full");
+        return set(items);
+      };
+      const run = join ? pairWithLink(d, link, "Brave") : startSyncing(d, { serverUrl: "https://sync.example", deviceName: "Brave" });
+      await expect(run).rejects.toThrow("storage full");
+      const created = server.devices.at(-1)!;
+      expect(created).toMatchObject({ name: "Brave", revoked: true });
+      expect((await loadState(storage)).token).toBeNull();
+    }
+  });
+
+  it("refuses a join without a key before contacting the server", async () => {
+    const brave = browser();
+    await expect(pair(brave, { serverUrl: "https://sync.example", deviceName: "Brave", code: "GOODCODE" })).rejects.toThrow(/no encryption key/);
+    await saveState(brave.adapter.storage, { pendingPair: { serverUrl: "https://sync.example", deviceName: "Brave", code: "GOODCODE", createdAt: Date.now() } });
+    await expect(pairFromPending(brave)).rejects.toThrow(/no encryption key/);
+    expect(server.requests).toEqual([]);
+    expect(server.codes.has("GOODCODE")).toBe(true);
   });
 
   it("renames this device, round trip through the server", async () => {
     const mac = browser("safari");
     const brave = browser();
-    await pair(mac, { serverUrl: "https://sync.example", deviceName: "Safari on macOS", code: "GOODCODE" });
+    await startSyncing(mac, { serverUrl: "https://sync.example", deviceName: "Safari on macOS" });
     server.codes.add("SECOND22");
     const key = (await loadState(mac.adapter.storage)).syncKey!;
     await pair(brave, { serverUrl: "https://sync.example", deviceName: "Brave on Windows", code: "SECOND22", key });
@@ -187,7 +302,7 @@ describe("pairing from a link", () => {
 
   it("backfills pairedAt and the server's name from the device list", async () => {
     const mac = browser();
-    await pair(mac, { serverUrl: "https://sync.example", deviceName: "Mac", code: "GOODCODE" });
+    await startSyncing(mac, { serverUrl: "https://sync.example", deviceName: "Mac" });
     await saveState(mac.adapter.storage, { pairedAt: null, deviceName: "stale" });
     await listDevices(mac);
     const s = await loadState(mac.adapter.storage);
@@ -329,6 +444,8 @@ describe("hero view model", () => {
     nextRetryAt: null,
     paused: false,
     encrypted: true,
+    invitePending: false,
+    finishing: false,
     summary: "",
     lastError: null,
     errorKind: null,
@@ -403,14 +520,26 @@ describe("hero view model", () => {
     expect(primaryAction(base)).toMatchObject({ label: "Continue here", request: "continueHere" });
     expect(primaryAction({ ...base, paused: true, isOwner: true })).toMatchObject({ label: "Resume sync", request: "resume" });
 
-    expect(errorFix({ lastError: "x", errorKind: "permission" })).toBe("grant");
-    expect(errorFix({ lastError: "x", errorKind: "unreachable" })).toBe("retry");
-    expect(errorFix({ lastError: "x", errorKind: "server" })).toBe("retry");
-    expect(errorFix({ lastError: "x", errorKind: "device_revoked" })).toBeNull();
-    expect(errorFix({ lastError: null, errorKind: "server" })).toBeNull();
+    expect(errorFix({ paired: true, lastError: "x", errorKind: "permission" })).toBe("grant");
+    expect(errorFix({ paired: true, lastError: "x", errorKind: "unreachable" })).toBe("retry");
+    expect(errorFix({ paired: true, lastError: "x", errorKind: "server" })).toBe("retry");
+    expect(errorFix({ paired: true, lastError: "x", errorKind: "device_revoked" })).toBeNull();
+    expect(errorFix({ paired: true, lastError: null, errorKind: "server" })).toBeNull();
+    expect(errorFix({ paired: false, lastError: "x", errorKind: "unreachable" })).toBeNull();
 
     expect(activityLine({ lastActivityAt: null, lastActivityKind: null })).toBe("None yet");
     expect(activityLine({ lastActivityAt: new Date(2026, 9, 13, 10, 22).getTime(), lastActivityKind: "activated" })).toBe("Tab switch, 10:22");
+  });
+
+  it("picks the popup screen and the invite caption", () => {
+    expect(screenOf({ paired: false, invitePending: false })).toBe("pair");
+    expect(screenOf({ paired: false, invitePending: true })).toBe("pair");
+    expect(screenOf(base)).toBe("main");
+    expect(screenOf({ ...base, invitePending: true })).toBe("welcome");
+    expect(view({ paired: false, deviceId: null }).detail).toBe("Start syncing here, or paste an invite link from your other browser.");
+    expect(inviteNote(true)).toMatch(/^Install the extension in your other browser and paste this link there\. /);
+    expect(inviteNote(false)).toMatch(/do not open it as a page/);
+    for (const welcome of [true, false]) expect(inviteNote(welcome)).toMatch(/encryption key.*10 minutes/);
   });
 
   it("counts seconds for the saved line", () => {

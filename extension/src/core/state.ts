@@ -17,8 +17,9 @@ export interface State {
    */
   syncKey: string | null;
   /**
-   * The key's check matched the session's (`PUT /v2/session/key` answered 204 at pairing). Runs,
-   * takeovers and invites refuse without it; any decryption failure clears it.
+   * The key's check is the session's: this browser started the session with it, or compared it with
+   * `GET /v3/session` when joining. Runs, takeovers and invites refuse without it; any decryption
+   * failure clears it.
    */
   keyVerified: boolean;
   /** ISO time this device paired (backfilled from the device list for devices paired before it was kept). */
@@ -51,6 +52,8 @@ export interface State {
    * (permissions.onAdded) as well as from the popup's own message, whichever comes first.
    */
   pendingPair: PendingPair | null;
+  /** Start syncing just created the session: the popup opens Devices with a fresh invite once. */
+  invitePending: boolean;
   /** Persisted run flag so two sync runs never overlap, even across service worker restarts. */
   runLock: { action: string; startedAt: number } | null;
 
@@ -100,16 +103,19 @@ export interface State {
 /** Error classes the popup explains with an action (see status.ts). */
 export type ErrorKind = "unauthorized" | "device_revoked" | "permission" | "unreachable" | "server" | "key";
 
+/**
+ * Start syncing (no `code`: a new session on `serverUrl`) or joining with an invite link (`code`
+ * and `key` from `#CODE.KEY`).
+ */
 export interface PendingPair {
   serverUrl: string;
   deviceName: string;
-  code: string;
-  /** Encryption key from the pairing link (`#CODE.KEY`); absent for a keyless link. */
+  code?: string;
   key?: string;
   createdAt: number;
 }
 
-/** Pairing codes are valid 10 minutes; an older saved form is useless. */
+/** Pairing codes are valid 10 minutes; an older saved form is useless (Start syncing uses the same limit). */
 export const PENDING_PAIR_TTL_MS = 10 * 60 * 1000;
 
 export function defaultState(): State {
@@ -132,6 +138,7 @@ export function defaultState(): State {
     statusText: null,
     receivingWindowId: null,
     pendingPair: null,
+    invitePending: false,
     runLock: null,
     expected: [],
     detached: {},
@@ -180,7 +187,7 @@ export function isPaired(s: State): boolean {
   return Boolean(s.token && s.deviceId && s.serverUrl);
 }
 
-/** Fields reset when credentials are dropped (disconnect or `401 device_revoked`). */
+/** Fields reset when credentials are dropped (disconnect, `401 device_revoked`, or `401 unauthorized` while paired). */
 export function clearedCredentials(): Partial<State> {
   return {
     deviceId: null,
@@ -188,6 +195,7 @@ export function clearedCredentials(): Partial<State> {
     syncKey: null,
     keyVerified: false,
     pendingPair: null,
+    invitePending: false,
     pairedAt: null,
     lastRevision: 0,
     generation: null,

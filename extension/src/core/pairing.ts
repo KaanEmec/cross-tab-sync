@@ -1,20 +1,22 @@
-// Pairing links (PROTOCOL.md "Pairing"): the server URL with the code and the encryption key as
-// the fragment, https://tabs.example.com#ABCD2345.<key>; server-made links carry only the code.
-// Parsing of what the user pastes into the pairing form. Pure.
+// Invite links (PROTOCOL.md "Sessions and pairing"): the server URL with the code and the
+// encryption key as the fragment, https://tabs.example.com#ABCD2345.<key>. A link without the key
+// is invalid. Parsing of what the user pastes into the pairing form, and the server Start syncing
+// uses. Pure.
 
 import { normalizeServerUrl, type BrowserKind } from "./client.js";
+import { DEFAULT_SERVER_URL } from "./config.js";
 import { decodeKey } from "./crypto.js";
 
 export const CODE_LENGTH = 8;
 
-const EXAMPLE = "https://tabs.example.com#ABCD2345";
-const SHAPE = "#CODE.KEY (or #CODE for the first browser)";
+const SHAPE = "It ends with #CODE.KEY.";
+const COPY_AGAIN = "Copy the whole invite link from your other browser again.";
 
 export interface PairingTarget {
   serverUrl: string;
   code: string;
-  /** Encryption key carried by an invite link; absent for a keyless link or a bare code. */
-  key?: string;
+  /** Encryption key carried by the invite link. */
+  key: string;
 }
 
 /** Uppercase and drop spaces and dashes, as the server does. */
@@ -36,50 +38,49 @@ function isKey(text: string): boolean {
 function checkCode(raw: string): string {
   const code = normalizeCode(raw);
   if (!new RegExp(`^[A-Z0-9]{${CODE_LENGTH}}$`).test(code)) {
-    throw new Error(`A pairing code has ${CODE_LENGTH} letters and digits, e.g. ABCD2345`);
+    throw new Error(`This invite link is incomplete. ${COPY_AGAIN}`);
   }
   return code;
 }
 
-/** The link for a code on a server: `https://tabs.example.com#ABCD2345`, plus `.<key>` when given. */
-export function pairingLink(serverUrl: string, code: string, key?: string): string {
-  return key ? `${serverUrl}#${code}.${key}` : `${serverUrl}#${code}`;
+/** The invite link for a code on a server: `https://tabs.example.com#ABCD2345.<key>`. */
+export function pairingLink(serverUrl: string, code: string, key: string): string {
+  return `${serverUrl}#${code}.${key}`;
 }
 
-/**
- * Parse a pasted pairing link, or a bare code when the server is already known (`knownServerUrl`,
- * e.g. from a previous pairing or the Advanced field). Throws an Error with a message for the user.
- */
-export function parsePairingInput(input: string, knownServerUrl = ""): PairingTarget {
+/** Parse a pasted invite link. Throws an Error with a message for the user. */
+export function parsePairingInput(input: string): PairingTarget {
   const text = input.trim();
-  if (!text) throw new Error(`Paste the pairing link, e.g. ${EXAMPLE}`);
-  if (/^[A-Za-z0-9\s-]+$/.test(text)) {
-    // A bare code: no scheme, host or fragment.
-    const code = checkCode(text);
-    if (!knownServerUrl.trim()) {
-      throw new Error(`Paste the whole pairing link (server address and code, e.g. ${EXAMPLE}) or enter the server URL under Advanced`);
-    }
-    return { serverUrl: normalizeServerUrl(knownServerUrl), code };
-  }
+  if (!text) throw new Error(`Paste the invite link from your other browser. ${SHAPE}`);
   const hash = text.indexOf("#");
-  const fragment = hash < 0 ? "" : text.slice(hash + 1);
-  if (!fragment.trim()) throw new Error(`This link has no pairing code. A pairing link ends with ${SHAPE}, e.g. ${EXAMPLE}`);
-  let base = hash < 0 ? text : text.slice(0, hash);
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(base.trim())) base = `https://${base.trim()}`;
+  if (hash < 0) throw new Error(`This is not a whole invite link. ${SHAPE} ${COPY_AGAIN}`);
+  const fragment = text.slice(hash + 1).trim();
   const dot = fragment.indexOf(".");
-  const serverUrl = normalizeServerUrl(base);
-  const code = checkCode(dot < 0 ? fragment : fragment.slice(0, dot));
-  if (dot < 0) return { serverUrl, code };
-  const key = fragment.slice(dot + 1).trim();
-  if (!isKey(key)) {
-    throw new Error(`The encryption key in this link is incomplete or damaged. A pairing link ends with ${SHAPE}; copy the whole link again.`);
+  if (dot < 0) {
+    throw new Error(`This link has no encryption key, so it cannot be used. ${COPY_AGAIN}`);
   }
+  const base = text.slice(0, hash).trim();
+  if (!base) throw new Error(`This invite link has no server address. ${COPY_AGAIN}`);
+  const serverUrl = normalizeServerUrl(withScheme(base));
+  const code = checkCode(fragment.slice(0, dot));
+  const key = fragment.slice(dot + 1).trim();
+  if (!isKey(key)) throw new Error(`The encryption key in this link is incomplete or damaged. ${COPY_AGAIN}`);
   return { serverUrl, code, key };
 }
 
-/** The popup form: the link field wins; otherwise the Advanced code with the Advanced or known server URL. */
-export function resolvePairingForm(form: { link: string; serverUrl: string; code: string }, knownServerUrl = ""): PairingTarget {
-  return parsePairingInput(form.link.trim() ? form.link : form.code, form.serverUrl.trim() || knownServerUrl);
+/** A bare host (`tabs.example.com`) means https. */
+function withScheme(address: string): string {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(address) ? address : `https://${address}`;
+}
+
+/** The server Start syncing uses: Advanced › Server URL (a bare host means https), else the default server. */
+export function startServerUrl(advanced: string): string {
+  return normalizeServerUrl(withScheme(advanced.trim() || DEFAULT_SERVER_URL));
+}
+
+/** Which form action a pairing submit runs: an explicit button wins; otherwise Join once the invite field is shown. */
+export function pairSubmitAction(joinOpen: boolean, clicked: "start" | "join" | null): "start" | "join" {
+  return clicked ?? (joinOpen ? "join" : "start");
 }
 
 export function browserLabel(browser: string): string {

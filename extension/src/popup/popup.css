@@ -717,12 +717,24 @@ code {
   margin: -6px 0 12px;
 }
 
+.pair .hint.disclosure {
+  margin: 8px 0 14px;
+}
+
+#join-box {
+  margin-top: 14px;
+}
+
 .pair .fold {
   margin-top: 6px;
 }
 
 .pair .fold-body .field:last-child {
   margin-bottom: 0;
+}
+
+.pair .fold-body .hint {
+  margin: -6px 0 0;
 }
 
 input {

@@ -28,7 +28,7 @@ describe("ApiClient", () => {
       token: "cts_x",
     });
     const [url, init] = f.mock.calls[0]!;
-    expect(url).toBe("https://sync.example/v2/pair");
+    expect(url).toBe("https://sync.example/v3/pair");
     expect(init?.method).toBe("POST");
     expect((init?.headers as Record<string, string>)["Authorization"]).toBeUndefined();
     expect(JSON.parse(init?.body as string)).toEqual({ code: "ABCD2345", name: "Mac", browser: "safari" });
@@ -38,21 +38,21 @@ describe("ApiClient", () => {
     const f = mockFetch(200, { revision: 3, results: [], catchUp: { operations: [] } });
     await client(f).operations({ generation: 2, baseRevision: 1, operations: [] });
     const [url, init] = f.mock.calls[0]!;
-    expect(url).toBe("https://sync.example/v2/session/operations");
+    expect(url).toBe("https://sync.example/v3/session/operations");
     expect((init?.headers as Record<string, string>)["Authorization"]).toBe("Bearer cts_abc");
     expect(JSON.parse(init?.body as string)).toEqual({ generation: 2, baseRevision: 1, operations: [] });
   });
 
   it.each([
-    ["session", (c: ApiClient) => c.session(), "GET", "/v2/session"],
-    ["changes", (c: ApiClient) => c.changes(7), "GET", "/v2/session/changes?since=7"],
-    ["acquire", (c: ApiClient) => c.acquire(true), "POST", "/v2/session/acquire"],
-    ["pairingCodes", (c: ApiClient) => c.createPairingCode(), "POST", "/v2/pairing-codes"],
-    ["devices", (c: ApiClient) => c.devices(), "GET", "/v2/devices"],
-    ["renameDevice", (c: ApiClient) => c.renameDevice("a/b", "Mac"), "PATCH", "/v2/devices/a%2Fb"],
-    ["merge", (c: ApiClient) => c.merge([]), "POST", "/v2/session/merge"],
-    ["snapshots", (c: ApiClient) => c.snapshots(), "GET", "/v2/snapshots"],
-    ["restore", (c: ApiClient) => c.restoreSnapshot(4, 2), "POST", "/v2/snapshots/4/restore"],
+    ["session", (c: ApiClient) => c.session(), "GET", "/v3/session"],
+    ["changes", (c: ApiClient) => c.changes(7), "GET", "/v3/session/changes?since=7"],
+    ["acquire", (c: ApiClient) => c.acquire(true), "POST", "/v3/session/acquire"],
+    ["pairingCodes", (c: ApiClient) => c.createPairingCode(), "POST", "/v3/pairing-codes"],
+    ["devices", (c: ApiClient) => c.devices(), "GET", "/v3/devices"],
+    ["renameDevice", (c: ApiClient) => c.renameDevice("a/b", "Mac"), "PATCH", "/v3/devices/a%2Fb"],
+    ["merge", (c: ApiClient) => c.merge([]), "POST", "/v3/session/merge"],
+    ["snapshots", (c: ApiClient) => c.snapshots(), "GET", "/v3/snapshots"],
+    ["restore", (c: ApiClient) => c.restoreSnapshot(4, 2), "POST", "/v3/snapshots/4/restore"],
   ])("%s hits the right endpoint", async (_name, call, method, path) => {
     const f = mockFetch(200, { devices: [], snapshots: [], revision: 1, results: [], operations: [], entries: [], session: { entries: [] } });
     await call(client(f));
@@ -65,7 +65,7 @@ describe("ApiClient", () => {
     await expect(client(f).release(4)).resolves.toBeUndefined();
     await expect(client(f).heartbeat(4)).resolves.toBeUndefined();
     await expect(client(f).deleteDevice("a/b")).resolves.toBeUndefined();
-    expect(f.mock.calls[2]![0]).toBe("https://sync.example/v2/devices/a%2Fb");
+    expect(f.mock.calls[2]![0]).toBe("https://sync.example/v3/devices/a%2Fb");
   });
 
   it("maps error bodies to ApiError with code and owner", async () => {
@@ -153,17 +153,47 @@ describe("ApiClient encryption", () => {
     expect((await client(mockFetch(200, { revision: 3, owner: null, operations: [close] })).changes(2)).operations[0]!.op).toEqual(close.op);
   });
 
-  it("reads the key check without decrypting and stores one with PUT session/key", async () => {
-    const f = mockFetch(200, { revision: 5, keyCheck: null, owner: null, entries: [{ id: "e", urlKey: "x", urlEnc: "y" }] });
-    await expect(client(f, "cts_abc", null).sessionKeyCheck()).resolves.toBeNull();
-    expect(f.mock.calls[0]![0]).toBe("https://sync.example/v2/session");
-    const put = mockFetch(204);
-    await client(put, "cts_abc", null).putKeyCheck("k".repeat(43));
-    expect(put.mock.calls[0]![0]).toBe("https://sync.example/v2/session/key");
-    expect(put.mock.calls[0]![1]?.method).toBe("PUT");
-    expect(sentBody(put)).toEqual({ keyCheck: "k".repeat(43) });
-    const conflict = mockFetch(409, { error: "key_set", message: "set", owner: null });
-    await expect(client(conflict).putKeyCheck("k".repeat(43))).rejects.toMatchObject({ status: 409, code: "key_set" });
+  it("reads the key check without decrypting", async () => {
+    const f = mockFetch(200, { revision: 5, keyCheck: "k".repeat(43), owner: null, entries: [{ id: "e", urlKey: "x", urlEnc: "y" }] });
+    await expect(client(f, "cts_abc", null).sessionKeyCheck()).resolves.toBe("k".repeat(43));
+    expect(f.mock.calls[0]![0]).toBe("https://sync.example/v3/session");
+  });
+
+  it("creates a session without auth, carrying the key check", async () => {
+    const f = mockFetch(201, { deviceId: "d1", token: "cts_x", name: "Mac" });
+    await expect(client(f, null, null).createSession({ keyCheck: "k".repeat(43), name: "Mac", browser: "safari" })).resolves.toEqual({
+      deviceId: "d1",
+      token: "cts_x",
+      name: "Mac",
+    });
+    const [url, init] = f.mock.calls[0]!;
+    expect(url).toBe("https://sync.example/v3/sessions");
+    expect(init?.method).toBe("POST");
+    expect((init?.headers as Record<string, string>)["Authorization"]).toBeUndefined();
+    expect(sentBody(f)).toEqual({ keyCheck: "k".repeat(43), name: "Mac", browser: "safari" });
+  });
+
+  it("a 404 from a v3 route means an older server; unknown ids keep not_found", async () => {
+    const notFound = () => mockFetch(404, { error: "not_found", message: "not found" });
+    await expect(client(notFound(), null).createSession({ keyCheck: "k".repeat(43), name: "Mac", browser: "brave" })).rejects.toMatchObject({
+      status: 404,
+      code: "old_server",
+      message: "This server runs an older version.",
+    });
+    await expect(client(notFound()).changes(1)).rejects.toMatchObject({ code: "old_server" });
+    await expect(client(notFound()).deleteDevice("x")).rejects.toMatchObject({ status: 404, code: "not_found" });
+    await expect(client(notFound()).restoreSnapshot(1, 1)).rejects.toMatchObject({ status: 404, code: "not_found" });
+    await expect(client(notFound()).postDiag(["x"])).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("reads Retry-After of 429 rate_limited", async () => {
+    const f = vi.fn<FetchLike>(async () =>
+      new Response(JSON.stringify({ error: "rate_limited", message: "slow down" }), { status: 429, headers: { "Retry-After": "120" } }),
+    );
+    const e = await client(f, null).pair({ code: "ABCD2345", name: "Mac", browser: "brave" }).catch((x: unknown) => x);
+    expect(e).toMatchObject({ status: 429, code: "rate_limited" });
+    expect((e as ApiError).retryAfter).toBe(120);
+    expect(new ApiError(429, "rate_limited", "x").retryAfter).toBeNull();
   });
 
   it("never sends a url field: stray ones on close/update are stripped", async () => {
@@ -206,7 +236,7 @@ describe("ApiClient encryption", () => {
         : new Response(null, { status: 204 }),
     );
     await expect(client(f).acquire(true)).rejects.toMatchObject({ code: "key_mismatch" });
-    expect(f.mock.calls.map((c) => c[0])).toEqual(["https://sync.example/v2/session/acquire", "https://sync.example/v2/session/release"]);
+    expect(f.mock.calls.map((c) => c[0])).toEqual(["https://sync.example/v3/session/acquire", "https://sync.example/v3/session/release"]);
     expect(JSON.parse(f.mock.calls[1]![1]?.body as string)).toEqual({ generation: 7 });
   });
 

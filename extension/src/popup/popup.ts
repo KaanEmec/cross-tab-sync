@@ -6,14 +6,17 @@ import {
   devicesSummary,
   errorFix,
   heroView,
+  inviteNote,
   primaryAction,
+  screenOf,
   shortId,
   snapshotList,
   snapshotRows,
   snapshotsSummary,
 } from "../core/devices.js";
 import type { Request, Response, StatusView } from "../core/messages.js";
-import { browserLabel, resolvePairingForm, type PairingTarget } from "../core/pairing.js";
+import { DEFAULT_SERVER_URL } from "../core/config.js";
+import { browserLabel, pairSubmitAction, parsePairingInput, startServerUrl } from "../core/pairing.js";
 import { saveState } from "../core/state.js";
 import { APPLIED_ELSEWHERE_NOTE, clock } from "../core/status.js";
 
@@ -31,12 +34,15 @@ const idChip = $<HTMLButtonElement>("id-chip");
 const primaryBtn = $<HTMLButtonElement>("primary");
 const syncNowBtn = $<HTMLButtonElement>("sync-now");
 const pauseSwitch = $<HTMLButtonElement>("pause");
+const startBtn = $<HTMLButtonElement>("start");
+const showJoinBtn = $<HTMLButtonElement>("show-join");
+const joinBox = $("join-box");
+const joinBtn = $<HTMLButtonElement>("join");
 const pairLink = $<HTMLInputElement>("pair-link");
 const pairTarget = $("pair-target");
 const pairHint = Array.from(pairTarget.childNodes, (n) => n.cloneNode(true));
 const serverUrl = $<HTMLInputElement>("server-url");
 const deviceName = $<HTMLInputElement>("device-name");
-const pairCode = $<HTMLInputElement>("pair-code");
 const devicesSection = $<HTMLDetailsElement>("devices-section");
 const recoverSection = $<HTMLDetailsElement>("recover-section");
 const renameForm = $<HTMLFormElement>("rename-form");
@@ -54,6 +60,8 @@ let last: StatusView | null = null;
 /** Device list, fetched once when paired and again when Devices opens. */
 let devices: Device[] | null = null;
 let devicesRequested = false;
+/** The invite shown right after Start syncing was requested (once per popup). */
+let welcomeInviteRequested = false;
 /** Snapshot list, fetched when Recovery opens; the first SNAPSHOT_LIMIT are shown until "Show all". */
 let snapshots: Snapshot[] | null = null;
 let showAllSnapshots = false;
@@ -116,9 +124,10 @@ function render(s: StatusView): void {
     devicesRequested = false;
     snapshots = null;
     showAllSnapshots = false;
-    // Known from a previous pairing: a bare code is then enough.
-    if (!serverUrl.value) serverUrl.value = s.serverUrl;
+    welcomeInviteRequested = false;
     if (!deviceName.value) deviceName.value = s.deviceName;
+    // A Start syncing or join is saved or running in the worker: no second one meanwhile.
+    for (const b of [startBtn, showJoinBtn, joinBtn]) b.disabled = busy || s.finishing;
     return;
   }
 
@@ -140,6 +149,12 @@ function render(s: StatusView): void {
   if (!devicesRequested) {
     devicesRequested = true;
     void loadDevices(false);
+  }
+  // Right after Start syncing: Devices open, with an invite for the other browser.
+  if (screenOf(s) === "welcome" && !welcomeInviteRequested) {
+    welcomeInviteRequested = true;
+    devicesSection.open = true;
+    void createInvite(true);
   }
 }
 
@@ -356,8 +371,25 @@ async function revoke(id: string): Promise<void> {
   if ((await run({ type: "revokeDevice", id })).ok) await loadDevices();
 }
 
-function pairingTarget(): PairingTarget {
-  return resolvePairingForm({ link: pairLink.value, serverUrl: serverUrl.value, code: pairCode.value }, last?.serverUrl ?? "");
+/** Reveal the invite link field; Start syncing steps back to a secondary button. */
+function showJoin(): void {
+  joinBox.hidden = false;
+  showJoinBtn.hidden = true;
+  startBtn.classList.replace("primary", "secondary");
+  pairLink.focus();
+}
+
+async function createInvite(welcome: boolean): Promise<void> {
+  const res = await run({ type: "createPairingCode" });
+  if (!res.ok || !res.pairingCode) return;
+  const { link, expiresAt } = res.pairingCode;
+  inviteLink.value = link;
+  // The link carries the encryption key (`#CODE.KEY`).
+  $("invite-note").textContent = inviteNote(welcome);
+  $("invite-note").title = `Valid until ${clock(Date.parse(expiresAt))}, single use.`;
+  $("invite-box").hidden = false;
+  inviteLink.focus();
+  inviteLink.select();
 }
 
 function showRename(open: boolean): void {
@@ -378,26 +410,32 @@ function showRename(open: boolean): void {
 pairLink.addEventListener("input", () => {
   let host = "";
   try {
-    host = new URL(pairingTarget().serverUrl).host;
+    host = new URL(parsePairingInput(pairLink.value).serverUrl).host;
   } catch {
     /* not a complete link yet */
   }
-  if (host) pairTarget.textContent = `Pairs with ${host}`;
+  if (host) pairTarget.textContent = `Joins through ${host}`;
   else pairTarget.replaceChildren(...pairHint.map((n) => n.cloneNode(true)));
 });
 
-pairView.addEventListener("submit", (ev) => {
-  ev.preventDefault();
-  let target: PairingTarget;
+showJoinBtn.addEventListener("click", showJoin);
+
+/**
+ * Start syncing (a new session on the default or Advanced server) or Join (an invite link). Only
+ * a click on Start syncing starts a session once the invite field is shown; Enter and Join join.
+ */
+function submitPairing(action: "start" | "join"): void {
+  const joining = action === "join";
+  let target: { serverUrl: string; code?: string; key?: string };
   try {
-    target = pairingTarget();
+    target = joining ? parsePairingInput(pairLink.value) : { serverUrl: startServerUrl(serverUrl.value) };
   } catch (e) {
     showError(e instanceof Error ? e.message : String(e));
     return;
   }
   if (!deviceName.value.trim()) return showError("Enter a name for this browser.");
   showError(null);
-  // Save the form first (the prompt may close this popup; the worker then pairs on
+  // Save the form first (the prompt may close this popup; the worker then finishes on
   // permissions.onAdded), then request permission synchronously inside the user gesture.
   const saved = saveState(storageLocal, {
     pendingPair: { ...target, deviceName: deviceName.value, createdAt: Date.now() },
@@ -407,13 +445,23 @@ pairView.addEventListener("submit", (ev) => {
   void Promise.all([saved, granted]).then(async ([, ok]) => {
     if (!ok) {
       await saveState(storageLocal, { pendingPair: null });
-      showError("Pairing needs access to the server, and access was not granted for this address.");
+      showError("Syncing needs access to the server, and access was not granted for this address.");
       return;
     }
     const res = await run({ type: "pair" });
-    if (res.ok) pairLink.value = pairCode.value = "";
+    if (res.ok) pairLink.value = "";
   });
+}
+
+startBtn.addEventListener("click", () => submitPairing(pairSubmitAction(!joinBox.hidden, "start")));
+joinBtn.addEventListener("click", () => submitPairing(pairSubmitAction(!joinBox.hidden, "join")));
+// Enter in any field (a user gesture, so the permission prompt may open).
+pairView.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter" || !(ev.target instanceof HTMLInputElement)) return;
+  ev.preventDefault();
+  if (!startBtn.disabled) submitPairing(pairSubmitAction(!joinBox.hidden, null));
 });
+pairView.addEventListener("submit", (ev) => ev.preventDefault());
 
 primaryBtn.addEventListener("click", () => {
   if (last) void run({ type: primaryAction(last).request });
@@ -455,20 +503,7 @@ renameForm.addEventListener("submit", (ev) => {
   });
 });
 
-$("invite").addEventListener("click", async () => {
-  const res = await run({ type: "createPairingCode" });
-  if (!res.ok || !res.pairingCode) return;
-  const { link, expiresAt } = res.pairingCode;
-  inviteLink.value = link;
-  // The link carries the encryption key (`#CODE.KEY`).
-  $("invite-note").textContent =
-    "This link contains your encryption key. Share it privately. It is valid 10 minutes. " +
-    "Paste it into the other browser's extension; do not open it as a page.";
-  $("invite-note").title = `Valid until ${clock(Date.parse(expiresAt))}, single use.`;
-  $("invite-box").hidden = false;
-  inviteLink.focus();
-  inviteLink.select();
-});
+$("invite").addEventListener("click", () => void createInvite(false));
 
 confirmTwice(
   $<HTMLButtonElement>("disconnect"),
@@ -486,4 +521,10 @@ setInterval(() => {
   if (last && !busy) renderHero(last);
 }, 1000);
 
-void run({ type: "getStatus", refresh: true });
+serverUrl.placeholder = DEFAULT_SERVER_URL;
+
+// A form saved before the permission prompt closed this popup, and not finished since (e.g. access
+// was denied): finish it now so it either pairs or reports why.
+void run({ type: "getStatus", refresh: true }).then((res) => {
+  if (res.status?.finishing && !res.status.running) void run({ type: "pair" });
+});

@@ -94,7 +94,7 @@ export function heroTitle(s: StatusView): string {
 
 /** Where local work stands, in one short line. */
 export function heroDetail(s: StatusView, ctx: Pick<HeroContext, "now" | "offline" | "working">): string {
-  if (!s.paired) return "Paste a pairing link from another browser or your server.";
+  if (!s.paired) return s.finishing ? "Finishing… this takes a few seconds." : "Start syncing here, or paste an invite link from your other browser.";
   if (ctx.working) return "Syncing now";
   const n = s.pendingCount;
   const waiting = plural(n, "change") + " waiting";
@@ -146,9 +146,12 @@ export function primaryAction(s: StatusView): PrimaryAction {
   return { label: "Continue here", request: "continueHere", title: "Open the shared tabs here and drive from this browser" };
 }
 
-/** The single fix offered next to an error: grant host access, or retry a retryable failure. */
-export function errorFix(s: Pick<StatusView, "lastError" | "errorKind">): "grant" | "retry" | null {
-  if (!s.lastError) return null;
+/**
+ * The single fix offered next to an error while paired: grant host access, or retry a retryable
+ * failure. Unpaired, the form's own buttons are the fix.
+ */
+export function errorFix(s: Pick<StatusView, "lastError" | "errorKind" | "paired">): "grant" | "retry" | null {
+  if (!s.lastError || !s.paired) return null;
   if (s.errorKind === "permission") return "grant";
   if (s.errorKind === "unreachable" || s.errorKind === "server") return "retry";
   return null;
@@ -161,6 +164,28 @@ export function activityLine(s: Pick<StatusView, "lastActivityAt" | "lastActivit
   if (s.lastActivityAt === null) return "None yet";
   const time = clock(s.lastActivityAt);
   return s.lastActivityKind ? `${ACTIVITY_WORDS[s.lastActivityKind] ?? s.lastActivityKind}, ${time}` : time;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Screens
+
+/**
+ * What the popup shows: the pairing form (Start syncing, or an invite link), the main view, or,
+ * right after Start syncing, the main view with Devices open and a fresh invite.
+ */
+export type Screen = "pair" | "main" | "welcome";
+
+export function screenOf(s: Pick<StatusView, "paired" | "invitePending">): Screen {
+  if (!s.paired) return "pair";
+  return s.invitePending ? "welcome" : "main";
+}
+
+/** Caption of an invite link; `welcome`: the first invite, right after Start syncing. */
+export function inviteNote(welcome: boolean): string {
+  const lead = welcome
+    ? "Install the extension in your other browser and paste this link there."
+    : "Paste this link into the extension in your other browser; do not open it as a page.";
+  return `${lead} It contains your encryption key, so share it privately. It works once, for 10 minutes.`;
 }
 
 // ---------------------------------------------------------------------------------------------

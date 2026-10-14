@@ -51,10 +51,13 @@
     }
   }
 
+  // src/core/config.ts
+  var DEFAULT_SERVER_URL = "https://cts.kexperiments.com";
+
   // src/core/pairing.ts
   var CODE_LENGTH = 8;
-  var EXAMPLE = "https://tabs.example.com#ABCD2345";
-  var SHAPE = "#CODE.KEY (or #CODE for the first browser)";
+  var SHAPE = "It ends with #CODE.KEY.";
+  var COPY_AGAIN = "Copy the whole invite link from your other browser again.";
   function normalizeCode(input) {
     return input.toUpperCase().replace(/[\s-]+/g, "");
   }
@@ -69,37 +72,36 @@
   function checkCode(raw) {
     const code = normalizeCode(raw);
     if (!new RegExp(`^[A-Z0-9]{${CODE_LENGTH}}$`).test(code)) {
-      throw new Error(`A pairing code has ${CODE_LENGTH} letters and digits, e.g. ABCD2345`);
+      throw new Error(`This invite link is incomplete. ${COPY_AGAIN}`);
     }
     return code;
   }
-  function parsePairingInput(input, knownServerUrl = "") {
+  function parsePairingInput(input) {
     const text = input.trim();
-    if (!text) throw new Error(`Paste the pairing link, e.g. ${EXAMPLE}`);
-    if (/^[A-Za-z0-9\s-]+$/.test(text)) {
-      const code2 = checkCode(text);
-      if (!knownServerUrl.trim()) {
-        throw new Error(`Paste the whole pairing link (server address and code, e.g. ${EXAMPLE}) or enter the server URL under Advanced`);
-      }
-      return { serverUrl: normalizeServerUrl(knownServerUrl), code: code2 };
-    }
+    if (!text) throw new Error(`Paste the invite link from your other browser. ${SHAPE}`);
     const hash = text.indexOf("#");
-    const fragment = hash < 0 ? "" : text.slice(hash + 1);
-    if (!fragment.trim()) throw new Error(`This link has no pairing code. A pairing link ends with ${SHAPE}, e.g. ${EXAMPLE}`);
-    let base = hash < 0 ? text : text.slice(0, hash);
-    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(base.trim())) base = `https://${base.trim()}`;
+    if (hash < 0) throw new Error(`This is not a whole invite link. ${SHAPE} ${COPY_AGAIN}`);
+    const fragment = text.slice(hash + 1).trim();
     const dot = fragment.indexOf(".");
-    const serverUrl2 = normalizeServerUrl(base);
-    const code = checkCode(dot < 0 ? fragment : fragment.slice(0, dot));
-    if (dot < 0) return { serverUrl: serverUrl2, code };
-    const key = fragment.slice(dot + 1).trim();
-    if (!isKey(key)) {
-      throw new Error(`The encryption key in this link is incomplete or damaged. A pairing link ends with ${SHAPE}; copy the whole link again.`);
+    if (dot < 0) {
+      throw new Error(`This link has no encryption key, so it cannot be used. ${COPY_AGAIN}`);
     }
+    const base = text.slice(0, hash).trim();
+    if (!base) throw new Error(`This invite link has no server address. ${COPY_AGAIN}`);
+    const serverUrl2 = normalizeServerUrl(withScheme(base));
+    const code = checkCode(fragment.slice(0, dot));
+    const key = fragment.slice(dot + 1).trim();
+    if (!isKey(key)) throw new Error(`The encryption key in this link is incomplete or damaged. ${COPY_AGAIN}`);
     return { serverUrl: serverUrl2, code, key };
   }
-  function resolvePairingForm(form, knownServerUrl = "") {
-    return parsePairingInput(form.link.trim() ? form.link : form.code, form.serverUrl.trim() || knownServerUrl);
+  function withScheme(address) {
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(address) ? address : `https://${address}`;
+  }
+  function startServerUrl(advanced) {
+    return normalizeServerUrl(withScheme(advanced.trim() || DEFAULT_SERVER_URL));
+  }
+  function pairSubmitAction(joinOpen, clicked) {
+    return clicked ?? (joinOpen ? "join" : "start");
   }
   function browserLabel(browser) {
     if (browser === "safari") return "Safari";
@@ -156,7 +158,7 @@
     return s.owner ? `Following ${s.owner.name}` : "Nobody is driving";
   }
   function heroDetail(s, ctx) {
-    if (!s.paired) return "Paste a pairing link from another browser or your server.";
+    if (!s.paired) return s.finishing ? "Finishing\u2026 this takes a few seconds." : "Start syncing here, or paste an invite link from your other browser.";
     if (ctx.working) return "Syncing now";
     const n = s.pendingCount;
     const waiting = plural(n, "change") + " waiting";
@@ -194,7 +196,7 @@
     return { label: "Continue here", request: "continueHere", title: "Open the shared tabs here and drive from this browser" };
   }
   function errorFix(s) {
-    if (!s.lastError) return null;
+    if (!s.lastError || !s.paired) return null;
     if (s.errorKind === "permission") return "grant";
     if (s.errorKind === "unreachable" || s.errorKind === "server") return "retry";
     return null;
@@ -204,6 +206,14 @@
     if (s.lastActivityAt === null) return "None yet";
     const time = clock(s.lastActivityAt);
     return s.lastActivityKind ? `${ACTIVITY_WORDS[s.lastActivityKind] ?? s.lastActivityKind}, ${time}` : time;
+  }
+  function screenOf(s) {
+    if (!s.paired) return "pair";
+    return s.invitePending ? "welcome" : "main";
+  }
+  function inviteNote(welcome) {
+    const lead = welcome ? "Install the extension in your other browser and paste this link there." : "Paste this link into the extension in your other browser; do not open it as a page.";
+    return `${lead} It contains your encryption key, so share it privately. It works once, for 10 minutes.`;
   }
   function deviceRows(devices2, now) {
     return devices2.map((d) => {
@@ -271,6 +281,7 @@
       statusText: null,
       receivingWindowId: null,
       pendingPair: null,
+      invitePending: false,
       runLock: null,
       expected: [],
       detached: {},
@@ -315,12 +326,15 @@
   var primaryBtn = $("primary");
   var syncNowBtn = $("sync-now");
   var pauseSwitch = $("pause");
+  var startBtn = $("start");
+  var showJoinBtn = $("show-join");
+  var joinBox = $("join-box");
+  var joinBtn = $("join");
   var pairLink = $("pair-link");
   var pairTarget = $("pair-target");
   var pairHint = Array.from(pairTarget.childNodes, (n) => n.cloneNode(true));
   var serverUrl = $("server-url");
   var deviceName = $("device-name");
-  var pairCode = $("pair-code");
   var devicesSection = $("devices-section");
   var recoverSection = $("recover-section");
   var renameForm = $("rename-form");
@@ -332,6 +346,7 @@
   var last = null;
   var devices = null;
   var devicesRequested = false;
+  var welcomeInviteRequested = false;
   var snapshots = null;
   var showAllSnapshots = false;
   var errorKindShown = null;
@@ -383,8 +398,9 @@
       devicesRequested = false;
       snapshots = null;
       showAllSnapshots = false;
-      if (!serverUrl.value) serverUrl.value = s.serverUrl;
+      welcomeInviteRequested = false;
       if (!deviceName.value) deviceName.value = s.deviceName;
+      for (const b of [startBtn, showJoinBtn, joinBtn]) b.disabled = busy || s.finishing;
       return;
     }
     const id = s.deviceId ?? "";
@@ -403,6 +419,11 @@
     if (!devicesRequested) {
       devicesRequested = true;
       void loadDevices(false);
+    }
+    if (screenOf(s) === "welcome" && !welcomeInviteRequested) {
+      welcomeInviteRequested = true;
+      devicesSection.open = true;
+      void createInvite(true);
     }
   }
   function renderIdentity(s) {
@@ -592,8 +613,22 @@ Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from r
   async function revoke(id) {
     if ((await run({ type: "revokeDevice", id })).ok) await loadDevices();
   }
-  function pairingTarget() {
-    return resolvePairingForm({ link: pairLink.value, serverUrl: serverUrl.value, code: pairCode.value }, last?.serverUrl ?? "");
+  function showJoin() {
+    joinBox.hidden = false;
+    showJoinBtn.hidden = true;
+    startBtn.classList.replace("primary", "secondary");
+    pairLink.focus();
+  }
+  async function createInvite(welcome) {
+    const res = await run({ type: "createPairingCode" });
+    if (!res.ok || !res.pairingCode) return;
+    const { link, expiresAt } = res.pairingCode;
+    inviteLink.value = link;
+    $("invite-note").textContent = inviteNote(welcome);
+    $("invite-note").title = `Valid until ${clock(Date.parse(expiresAt))}, single use.`;
+    $("invite-box").hidden = false;
+    inviteLink.focus();
+    inviteLink.select();
   }
   function showRename(open) {
     renameForm.hidden = !open;
@@ -609,17 +644,18 @@ Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from r
   pairLink.addEventListener("input", () => {
     let host = "";
     try {
-      host = new URL(pairingTarget().serverUrl).host;
+      host = new URL(parsePairingInput(pairLink.value).serverUrl).host;
     } catch {
     }
-    if (host) pairTarget.textContent = `Pairs with ${host}`;
+    if (host) pairTarget.textContent = `Joins through ${host}`;
     else pairTarget.replaceChildren(...pairHint.map((n) => n.cloneNode(true)));
   });
-  pairView.addEventListener("submit", (ev) => {
-    ev.preventDefault();
+  showJoinBtn.addEventListener("click", showJoin);
+  function submitPairing(action) {
+    const joining = action === "join";
     let target;
     try {
-      target = pairingTarget();
+      target = joining ? parsePairingInput(pairLink.value) : { serverUrl: startServerUrl(serverUrl.value) };
     } catch (e) {
       showError(e instanceof Error ? e.message : String(e));
       return;
@@ -634,13 +670,21 @@ Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from r
     void Promise.all([saved, granted]).then(async ([, ok]) => {
       if (!ok) {
         await saveState(storageLocal, { pendingPair: null });
-        showError("Pairing needs access to the server, and access was not granted for this address.");
+        showError("Syncing needs access to the server, and access was not granted for this address.");
         return;
       }
       const res = await run({ type: "pair" });
-      if (res.ok) pairLink.value = pairCode.value = "";
+      if (res.ok) pairLink.value = "";
     });
+  }
+  startBtn.addEventListener("click", () => submitPairing(pairSubmitAction(!joinBox.hidden, "start")));
+  joinBtn.addEventListener("click", () => submitPairing(pairSubmitAction(!joinBox.hidden, "join")));
+  pairView.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || !(ev.target instanceof HTMLInputElement)) return;
+    ev.preventDefault();
+    if (!startBtn.disabled) submitPairing(pairSubmitAction(!joinBox.hidden, null));
   });
+  pairView.addEventListener("submit", (ev) => ev.preventDefault());
   primaryBtn.addEventListener("click", () => {
     if (last) void run({ type: primaryAction(last).request });
   });
@@ -675,17 +719,7 @@ Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from r
       await loadDevices();
     });
   });
-  $("invite").addEventListener("click", async () => {
-    const res = await run({ type: "createPairingCode" });
-    if (!res.ok || !res.pairingCode) return;
-    const { link, expiresAt } = res.pairingCode;
-    inviteLink.value = link;
-    $("invite-note").textContent = "This link contains your encryption key. Share it privately. It is valid 10 minutes. Paste it into the other browser's extension; do not open it as a page.";
-    $("invite-note").title = `Valid until ${clock(Date.parse(expiresAt))}, single use.`;
-    $("invite-box").hidden = false;
-    inviteLink.focus();
-    inviteLink.select();
-  });
+  $("invite").addEventListener("click", () => void createInvite(false));
   confirmTwice(
     $("disconnect"),
     "Click again to disconnect. Pairing again gives this browser a new identity.",
@@ -698,5 +732,8 @@ Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from r
   setInterval(() => {
     if (last && !busy) renderHero(last);
   }, 1e3);
-  void run({ type: "getStatus", refresh: true });
+  serverUrl.placeholder = DEFAULT_SERVER_URL;
+  void run({ type: "getStatus", refresh: true }).then((res) => {
+    if (res.status?.finishing && !res.status.running) void run({ type: "pair" });
+  });
 })();
