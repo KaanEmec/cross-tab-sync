@@ -25,7 +25,7 @@ Wire contract between the extensions and the Go service. Breaking changes bump t
 
 1. A pairing code is created with the CLI (`cross-tab-sync pair-code`) or by an already paired device (`POST /v2/pairing-codes`). Codes are 8 characters, single use, valid 10 minutes.
 2. The new device calls `POST /v2/pair` with `{code, name, browser}` and receives `{deviceId, token, name}`. Codes use the alphabet `ABCDEFGHJKMNPQRSTUVWXYZ23456789`; input is case-insensitive and spaces or dashes are ignored. `name` is 1–64 characters, `browser` 1–32.
-3. **Pairing link**: the server's public URL with the code and the encryption key as the fragment, `https://tabs.example.com#ABCD2345.<key>` (`http://127.0.0.1:8080#ABCD2345.<key>` in local development); `<key>` is the 43-character base64url root key. The fragment never reaches the server in a request. Server-made links (`POST /v2/pairing-codes`, the CLI) carry only the code; a paired browser's popup appends `.<key>`. A link without a key pairs only the first browser of an empty session (revision 0), which then generates the key. `POST /v2/pairing-codes` returns it as `link`, built from `CTS_PUBLIC_URL` when set, otherwise from the request: `https` when the request came over TLS or with `X-Forwarded-Proto: https`, else `http`, plus the `Host` header. Set `CTS_PUBLIC_URL` when the service is reached under a path prefix or another host than the proxy forwards. The CLI prints the link when `CTS_PUBLIC_URL` is set, otherwise the bare code plus a hint on stderr.
+3. **Pairing link**: the server's public URL with the code and the encryption key as the fragment, `https://tabs.example.com#ABCD2345.<key>` (`http://127.0.0.1:8080#ABCD2345.<key>` in local development); `<key>` is the 43-character base64url root key. The fragment never reaches the server in a request. Server-made links (`POST /v2/pairing-codes`, the CLI) carry only the code; a paired browser's popup appends `.<key>`. A link without a key pairs only the first browser of a session with no key check and no other active device; that browser generates the key and stores the key check (see Encryption). `POST /v2/pairing-codes` returns it as `link`, built from `CTS_PUBLIC_URL` when set, otherwise from the request: `https` when the request came over TLS or with `X-Forwarded-Proto: https`, else `http`, plus the `Host` header. Set `CTS_PUBLIC_URL` when the service is reached under a path prefix or another host than the proxy forwards. The CLI prints the link when `CTS_PUBLIC_URL` is set, otherwise the bare code plus a hint on stderr.
 4. **Duplicate names**: when another active device already has the name (ignoring case), the server appends the lowest free ` N` (N ≥ 2): `Brave on macOS 2`, `Brave on macOS 3`; the base is shortened so the result stays within 64 characters. Revoked devices do not hold names. The stored name is returned by `pair` and `PATCH /v2/devices/{id}`. Renaming to one's own current name keeps it.
 
 ## Session model
@@ -33,6 +33,7 @@ Wire contract between the extensions and the Go service. Breaking changes bump t
 ```jsonc
 {
   "revision": 42,
+  "keyCheck": "<43 base64url chars>" | null,
   "owner": { "deviceId": "…", "name": "MacBook Safari", "generation": 7, "lastSeenAt": "…" } | null,
   "entries": [
     { "id": "…", "urlKey": "<43 base64url chars>", "urlEnc": "<base64url ciphertext>", "pinned": false, "position": 0, "updatedRevision": 40 }
@@ -67,7 +68,8 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 | `GET /v2/devices` | device | | `200 {devices:[{id,name,browser,createdAt,lastSeenAt,isSelf,revokedAt?}]}`: active devices oldest first, then devices revoked within the last 7 days (most recent first) with `revokedAt` |
 | `PATCH /v2/devices/{id}` | device | `{name}` | `200 {id,name,browser,createdAt,lastSeenAt,isSelf}` with the stored (possibly suffixed) name · `403 forbidden` when `id` is not the caller (a device renames only itself) · `400 invalid_request` (name 1–64 characters) |
 | `DELETE /v2/devices/{id}` | device | | `204` · `404 not_found`. Revoking the owner clears ownership. |
-| `GET /v2/session` | device | | `200` session model |
+| `GET /v2/session` | device | | `200` session model (includes `keyCheck`) |
+| `PUT /v2/session/key` | device | `{keyCheck}` (43 base64url chars) | `204` when unset or equal · `409 key_set` when a different value is stored. Never cleared except by the v2 upgrade migration. |
 | `GET /v2/session/changes?since=R` | device | | `200 {revision, owner, operations:[{seq, deviceId, op, result}]}` · `410 history_expired` (full resync needed) |
 | `POST /v2/session/acquire` | device | `{force?: bool}` | `200 {generation, session}` · `409 owner_active {owner}` |
 | `POST /v2/session/release` | device | `{generation}` | `204` · `409 stale_owner {owner}` |
@@ -120,7 +122,7 @@ A batch is applied atomically in order inside one transaction. Before a batch th
 
 ## Errors
 
-`{ "error": "snake_case_code", "message": "human readable", ...details }`. Every `409` carries `owner` (possibly `null`). Timestamps are RFC 3339 UTC with milliseconds. Codes: `invalid_request`, `invalid_code`, `unauthorized`, `device_revoked`, `forbidden`, `not_found`, `owner_active`, `stale_owner`, `history_expired`, `payload_too_large`, `internal`.
+`{ "error": "snake_case_code", "message": "human readable", ...details }`. Every `409` carries `owner` (possibly `null`). Timestamps are RFC 3339 UTC with milliseconds. Codes: `invalid_request`, `invalid_code`, `unauthorized`, `device_revoked`, `forbidden`, `not_found`, `owner_active`, `stale_owner`, `history_expired`, `payload_too_large`, `key_set`, `internal`.
 
 ## Client behavior (v0.1 manual handover)
 
@@ -205,10 +207,13 @@ URLs are end-to-end encrypted; the server is blind. Clients derive everything fr
 - `HKDF-SHA256(K, salt = empty, info = "cts-url-mac")` → `K_mac`; `info = "cts-url-enc"` → `K_enc` (32 bytes each).
 - `urlKey = base64url(HMAC-SHA256(K_mac, url))`, 43 characters, deterministic: the server coalesces duplicates on it.
 - `urlEnc = base64url(0x01 ‖ nonce (12 random bytes) ‖ AES-256-GCM(K_enc, nonce, pad(url), aad = urlKey))`. `pad(url)` is a 2-byte big-endian length, the UTF-8 URL, then zero bytes up to a multiple of 64 bytes, so exact lengths are hidden. The leading byte is the format version. The AAD is `urlKey` (not the entry id) because restore and merge forks copy the URL fields to a fresh entry. A 2048-byte URL yields at most 2856 characters.
-- Any authentication failure on decrypt means a different key: the client reports `key_mismatch` and takes no local action.
+- **Key check**: `keyCheck = base64url(HMAC-SHA256(K_mac, "cts-key-check"))`. The first browser stores it with `PUT /v2/session/key`; every browser compares its own value with the session's `keyCheck` before it sends or applies anything, and keeps a local `keyVerified` flag. A browser whose value differs revokes itself, clears its credentials and key, and reports `key_mismatch`. A keyless link is accepted only while `keyCheck` is null and no other active device exists; the new browser then generates the key and stores the check, and a `409 key_set` answer (another first browser won the race) makes it revoke itself.
+- Any authentication failure on decrypt means a different key: the client reports `key_mismatch`, takes no local action, stops automatic runs and takeovers until the browser is paired again, and never moves ownership (Continue here decrypts `GET session` before `acquire`).
+- On the wire, `open` and `navigate` must carry `urlKey` and `urlEnc`; the client rejects any received operation that carries a plaintext `url` or lacks the two fields, and after decrypting it recomputes the HMAC of the URL and requires it to equal `urlKey`. The server rejects operations with unknown fields.
+- Invite links are built by the browser from its stored server URL (never from a server-supplied link) and are meant to be pasted into the extension, not opened: a page at the link's origin could read the fragment. Tabs on the server's own origin are not eligible for sync.
 - Key handling in the client: stored with the credentials; shown to the user only inside invite links; cleared by Disconnect. A browser that pairs with a keyless link against a non-empty session revokes itself and asks for an invite link.
 
-**What the server learns**: the number of open tabs, when they change and which device changed them, device names, pinned state and order, and whether two URLs are equal. It cannot read or forge a URL, cannot move a ciphertext to another URL, but can still withhold, delay or replay an older ciphertext of the same entry, and inject `close` operations. Operations are not signed. The server does no cryptography: it checks the two fields' length and alphabet, stores them verbatim and indexes `urlKey`.
+**What the server learns**: the number of open tabs, when they change and which device changed them, device names, pinned state and order, and whether two URLs are equal. It cannot read or forge a URL and cannot move a ciphertext to another URL (AEAD bound to `urlKey`), but because operations are not signed it can withhold or delay changes, replay any `(urlKey, urlEnc)` pair it has ever seen as an `open` or `navigate` of any entry, and inject `close` operations. The server does no cryptography: it checks the two fields' length and alphabet, stores them verbatim and indexes `urlKey`.
 
 ## Privacy
 
