@@ -73,7 +73,8 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("connecting to database: %w", err)
 	}
-	// The database holds URLs; keep it private to the service user.
+	// The database holds device tokens' hashes and encrypted URLs; keep it
+	// private to the service user.
 	if err := os.Chmod(dbPath, 0o600); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("restricting database permissions: %w", err)

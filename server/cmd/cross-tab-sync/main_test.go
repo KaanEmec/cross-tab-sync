@@ -25,6 +25,9 @@ func TestPairCodeOutput(t *testing.T) {
 	if !strings.Contains(errOut.String(), "CTS_PUBLIC_URL") {
 		t.Fatalf("stderr lacks the CTS_PUBLIC_URL hint: %q", errOut.String())
 	}
+	if !strings.Contains(errOut.String(), "first browser only") {
+		t.Fatalf("stderr lacks the first-browser hint: %q", errOut.String())
+	}
 
 	cfg.PublicURL = "https://tabs.example.com"
 	out.Reset()

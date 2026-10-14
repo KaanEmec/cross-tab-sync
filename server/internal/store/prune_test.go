@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -81,12 +80,12 @@ func TestPruneKeepsOpenEntriesAndAdvancesMinRevision(t *testing.T) {
 	keep, gone, late := f.id(), f.id(), f.id()
 
 	f.apply(t0,
-		session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: keep, URL: "https://keep.example/"}, // 1
-		session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: gone, URL: "https://gone.example/"}, // 2
-		session.Op{OpID: f.id(), Type: session.TypeClose, EntryID: gone},                              // 3
-		session.Op{OpID: f.id(), Type: session.TypeClose, EntryID: f.id()},                            // ignored
+		session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: keep, URLKey: key("https://keep.example/"), URLEnc: enc("https://keep.example/")}, // 1
+		session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: gone, URLKey: key("https://gone.example/"), URLEnc: enc("https://gone.example/")}, // 2
+		session.Op{OpID: f.id(), Type: session.TypeClose, EntryID: gone},                                                                            // 3
+		session.Op{OpID: f.id(), Type: session.TypeClose, EntryID: f.id()},                                                                          // ignored
 	)
-	f.apply(t0.Add(20*day), session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: late, URL: "https://late.example/"}) // 4
+	f.apply(t0.Add(20*day), session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: late, URLKey: key("https://late.example/"), URLEnc: enc("https://late.example/")}) // 4
 
 	if sess, err := f.st.GetSession(ctx); err != nil || sess.MinRevision != 1 {
 		t.Fatalf("before pruning: minRevision %d %v", sess.MinRevision, err)
@@ -137,10 +136,10 @@ func TestPruneKeepsLogContiguous(t *testing.T) {
 	ctx := context.Background()
 	f := newHistoryFixture(t)
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	f.apply(t0, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URL: "https://a.example/"})             // 1
-	f.apply(t0.Add(40*day), session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URL: "https://b.example/"}) // 2
+	f.apply(t0, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/")})             // 1
+	f.apply(t0.Add(40*day), session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URLKey: key("https://b.example/"), URLEnc: enc("https://b.example/")}) // 2
 	// The clock went backwards: revision 3 looks older than revision 2.
-	f.apply(t0, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URL: "https://c.example/"}) // 3
+	f.apply(t0, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URLKey: key("https://c.example/"), URLEnc: enc("https://c.example/")}) // 3
 
 	res, err := f.st.Prune(ctx, t0.Add(45*day), 30*day)
 	if err != nil || res.MinRevision != 2 || res.Operations != 1 {
@@ -155,7 +154,7 @@ func TestRunPrunerStopsOnCancel(t *testing.T) {
 	t.Parallel()
 	f := newHistoryFixture(t)
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	f.apply(t0, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URL: "https://a.example/"})
+	f.apply(t0, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/")})
 
 	var (
 		mu  sync.Mutex
@@ -203,49 +202,24 @@ func TestRunPrunerStopsOnCancel(t *testing.T) {
 func TestMigration0002Backfill(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "cts.db")
-
 	// A v0.x database: only migration 1 applied, one entry updated at revision 7.
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := migrationFS.ReadFile("migrations/0001_init.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, q := range []string{
-		`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`,
-		string(body),
-		`INSERT INTO schema_migrations VALUES (1, 0)`,
+	db := legacyDB(t, filepath.Join(t.TempDir(), "cts.db"))
+	migrateTo(t, db, 1,
 		`INSERT INTO entries (id, url, opened_by, created_revision, updated_revision) VALUES ('e', 'https://a.example/', 'd', 3, 7)`,
-		`UPDATE session SET revision = 7`,
-	} {
-		if _, err := db.ExecContext(ctx, q); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	st, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+		`UPDATE session SET revision = 7`)
+	migrateTo(t, db, 2)
 	var (
-		urlRev int64
-		urlDev string
+		urlRev, minRev int64
+		urlDev         string
 	)
-	if err := st.db.QueryRowContext(ctx, `SELECT url_revision, url_device FROM entries WHERE id = 'e'`).Scan(&urlRev, &urlDev); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT url_revision, url_device FROM entries WHERE id = 'e'`).Scan(&urlRev, &urlDev); err != nil {
 		t.Fatal(err)
 	}
 	if urlRev != 7 || urlDev != "" {
 		t.Fatalf("backfill: url_revision %d url_device %q", urlRev, urlDev)
 	}
-	if sess, err := st.GetSession(ctx); err != nil || sess.MinRevision != 1 || sess.Revision != 7 {
-		t.Fatalf("session after migration: %+v %v", sess, err)
+	if err := db.QueryRowContext(ctx, `SELECT min_revision FROM session`).Scan(&minRev); err != nil || minRev != 1 {
+		t.Fatalf("min_revision %d %v", minRev, err)
 	}
 }
 
@@ -256,24 +230,24 @@ func TestMergeFailureRollsBack(t *testing.T) {
 	f := newHistoryFixture(t)
 	now := time.Now()
 	e1 := f.id()
-	f.apply(now, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: e1, URL: "https://a.example/"}) // 1
+	f.apply(now, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: e1, URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/")}) // 1
 
 	// Valid at the API level, rejected by the database on the third op.
 	if _, err := f.st.db.ExecContext(ctx, `CREATE TRIGGER fail_merge BEFORE INSERT ON entries
-		WHEN NEW.url = 'https://fail.example/' BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		WHEN NEW.url_enc = 'FAIL' BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
 		t.Fatal(err)
 	}
 	base := func(v int64) *int64 { return &v }
 	ops := []session.MergeOp{
-		{Op: session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URL: "https://b.example/"}, BaseRevision: base(1)},
-		{Op: session.Op{OpID: f.id(), Type: session.TypeNavigate, EntryID: e1, URL: "https://a2.example/"}, BaseRevision: base(1)},
-		{Op: session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URL: "https://fail.example/"}, BaseRevision: base(1)},
+		{Op: session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URLKey: key("https://b.example/"), URLEnc: enc("https://b.example/")}, BaseRevision: base(1)},
+		{Op: session.Op{OpID: f.id(), Type: session.TypeNavigate, EntryID: e1, URLKey: key("https://a2.example/"), URLEnc: enc("https://a2.example/")}, BaseRevision: base(1)},
+		{Op: session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URLKey: key("https://fail.example/"), URLEnc: "FAIL"}, BaseRevision: base(1)},
 	}
 	if _, err := f.st.Merge(ctx, f.dev, ops, now, 5); err == nil {
 		t.Fatal("merge succeeded despite the injected failure")
 	}
 	sess, err := f.st.GetSession(ctx)
-	if err != nil || sess.Revision != 1 || len(sess.Entries) != 1 || sess.Entries[0].URL != "https://a.example/" {
+	if err != nil || sess.Revision != 1 || len(sess.Entries) != 1 || sess.Entries[0].URLKey != key("https://a.example/") {
 		t.Fatalf("session after failed merge: %+v %v", sess, err)
 	}
 	for query, want := range map[string]int{

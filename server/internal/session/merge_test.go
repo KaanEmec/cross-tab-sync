@@ -16,16 +16,16 @@ const (
 // 2 (metadata later, at 6), e3 is a tombstone.
 func mergeFixture() []Entry {
 	return []Entry{
-		{ID: e1, URL: "https://a.example/", URLRevision: 5, URLDevice: "other", UpdatedRevision: 5},
-		{ID: e2, URL: "https://b.example/", Position: 1, URLRevision: 2, URLDevice: "other", UpdatedRevision: 6},
-		{ID: e3, URL: "https://t.example/", Position: 2, URLRevision: 1, UpdatedRevision: 4, ClosedRevision: ptr(int64(4))},
+		{ID: e1, URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/"), URLRevision: 5, URLDevice: "other", UpdatedRevision: 5},
+		{ID: e2, URLKey: key("https://b.example/"), URLEnc: enc("https://b.example/"), Position: 1, URLRevision: 2, URLDevice: "other", UpdatedRevision: 6},
+		{ID: e3, URLKey: key("https://t.example/"), URLEnc: enc("https://t.example/"), Position: 2, URLRevision: 1, UpdatedRevision: 4, ClosedRevision: ptr(int64(4))},
 	}
 }
 
 func openURLs(s *State) []string {
 	var out []string
 	for _, e := range s.OpenEntries() {
-		out = append(out, e.URL)
+		out = append(out, unseal(e.URLEnc))
 	}
 	slices.Sort(out)
 	return out
@@ -49,19 +49,19 @@ func TestMergeRules(t *testing.T) {
 		entryID string
 		urls    []string // open URLs afterwards
 	}{
-		{"open fresh/unchanged", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URL: c}, 5, false, StatusApplied, e4, []string{a, b, c}},
-		{"open fresh/navigated", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URL: c}, 4, false, StatusApplied, e4, []string{a, b, c}},
-		{"open fresh/expired", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URL: c}, 5, true, StatusApplied, e4, []string{a, b, c}},
-		{"open same url/unchanged", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URL: a}, 5, false, StatusCoalesced, e1, []string{a, b}},
-		{"open same url/navigated", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URL: a}, 4, false, StatusCoalesced, e1, []string{a, b}},
-		{"open tombstone/unchanged", Op{OpID: op1, Type: TypeOpen, EntryID: e3, URL: x}, 5, false, StatusIgnored, "", []string{a, b}},
-		{"open tombstone/expired", Op{OpID: op1, Type: TypeOpen, EntryID: e3, URL: x}, 0, true, StatusIgnored, "", []string{a, b}},
+		{"open fresh/unchanged", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URLKey: key(c), URLEnc: enc(c)}, 5, false, StatusApplied, e4, []string{a, b, c}},
+		{"open fresh/navigated", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URLKey: key(c), URLEnc: enc(c)}, 4, false, StatusApplied, e4, []string{a, b, c}},
+		{"open fresh/expired", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URLKey: key(c), URLEnc: enc(c)}, 5, true, StatusApplied, e4, []string{a, b, c}},
+		{"open same url/unchanged", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URLKey: key(a), URLEnc: enc(a)}, 5, false, StatusCoalesced, e1, []string{a, b}},
+		{"open same url/navigated", Op{OpID: op1, Type: TypeOpen, EntryID: e4, URLKey: key(a), URLEnc: enc(a)}, 4, false, StatusCoalesced, e1, []string{a, b}},
+		{"open tombstone/unchanged", Op{OpID: op1, Type: TypeOpen, EntryID: e3, URLKey: key(x), URLEnc: enc(x)}, 5, false, StatusIgnored, "", []string{a, b}},
+		{"open tombstone/expired", Op{OpID: op1, Type: TypeOpen, EntryID: e3, URLKey: key(x), URLEnc: enc(x)}, 0, true, StatusIgnored, "", []string{a, b}},
 
-		{"navigate/unchanged", Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URL: c}, 5, false, StatusApplied, e1, []string{b, c}},
-		{"navigate/navigated", Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URL: c}, 4, false, StatusForked, forked, []string{a, b, c}},
-		{"navigate/expired", Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URL: c}, 5, true, StatusForked, forked, []string{a, b, c}},
-		{"navigate/navigated onto open url", Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URL: b}, 4, false, StatusCoalesced, e2, []string{a, b}},
-		{"navigate/tombstone", Op{OpID: op1, Type: TypeNavigate, EntryID: e3, URL: c}, 0, true, StatusIgnored, "", []string{a, b}},
+		{"navigate/unchanged", Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URLKey: key(c), URLEnc: enc(c)}, 5, false, StatusApplied, e1, []string{b, c}},
+		{"navigate/navigated", Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URLKey: key(c), URLEnc: enc(c)}, 4, false, StatusForked, forked, []string{a, b, c}},
+		{"navigate/expired", Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URLKey: key(c), URLEnc: enc(c)}, 5, true, StatusForked, forked, []string{a, b, c}},
+		{"navigate/navigated onto open url", Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URLKey: key(b), URLEnc: enc(b)}, 4, false, StatusCoalesced, e2, []string{a, b}},
+		{"navigate/tombstone", Op{OpID: op1, Type: TypeNavigate, EntryID: e3, URLKey: key(c), URLEnc: enc(c)}, 0, true, StatusIgnored, "", []string{a, b}},
 
 		{"close/unchanged", Op{OpID: op1, Type: TypeClose, EntryID: e1}, 5, false, StatusApplied, e1, []string{b}},
 		{"close/navigated", Op{OpID: op1, Type: TypeClose, EntryID: e1}, 4, false, StatusIgnored, "", []string{a, b}},
@@ -90,12 +90,13 @@ func TestMergeRules(t *testing.T) {
 			wantLogged := tt.op
 			if tt.op.Type == TypeNavigate && (tt.expired || tt.base < 5) && tt.status != StatusIgnored {
 				// Converted to an open of the fork, logged as such.
-				wantLogged = Op{OpID: op1, Type: TypeOpen, EntryID: forked, URL: tt.op.URL}
+				wantLogged = Op{OpID: op1, Type: TypeOpen, EntryID: forked, URLKey: tt.op.URLKey, URLEnc: tt.op.URLEnc}
 			}
 			if tt.status == StatusForked && (changed.ID != forked || changed.URLRevision != 10 || changed.URLDevice != "dev") {
 				t.Fatalf("forked entry %+v", changed)
 			}
-			if logged.OpID != wantLogged.OpID || logged.Type != wantLogged.Type || logged.EntryID != wantLogged.EntryID || logged.URL != wantLogged.URL {
+			if logged.OpID != wantLogged.OpID || logged.Type != wantLogged.Type || logged.EntryID != wantLogged.EntryID ||
+				logged.URLKey != wantLogged.URLKey || logged.URLEnc != wantLogged.URLEnc {
 				t.Fatalf("logged op %+v, want %+v", logged, wantLogged)
 			}
 		})
@@ -106,8 +107,8 @@ func TestMergeOwnURLChangesDoNotBlock(t *testing.T) {
 	t.Parallel()
 	// e1's URL changed at 5 by this very device (an earlier batch of its
 	// journal); its later operations recorded at base 2 still apply.
-	s := NewState([]Entry{{ID: e1, URL: "https://a.example/", URLRevision: 5, URLDevice: "dev"}})
-	r, _, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URL: "https://b.example/"}, 2, false, "dev", 6)
+	s := NewState([]Entry{{ID: e1, URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/"), URLRevision: 5, URLDevice: "dev"}})
+	r, _, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URLKey: key("https://b.example/"), URLEnc: enc("https://b.example/")}, 2, false, "dev", 6)
 	if r.Status != StatusApplied || r.EntryID != e1 {
 		t.Fatalf("own navigate: %+v", r)
 	}
@@ -116,7 +117,7 @@ func TestMergeOwnURLChangesDoNotBlock(t *testing.T) {
 		t.Fatalf("own close: %+v", r)
 	}
 	// Expired history wins over ownership of the change.
-	s = NewState([]Entry{{ID: e1, URL: "https://a.example/", URLRevision: 5, URLDevice: "dev"}})
+	s = NewState([]Entry{{ID: e1, URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/"), URLRevision: 5, URLDevice: "dev"}})
 	if r, _, _ := s.Merge(Op{OpID: op1, Type: TypeClose, EntryID: e1}, 2, true, "dev", 6); r.Status != StatusIgnored {
 		t.Fatalf("expired close: %+v", r)
 	}
@@ -124,15 +125,15 @@ func TestMergeOwnURLChangesDoNotBlock(t *testing.T) {
 
 func TestMergeRedirectsLaterOpsToFork(t *testing.T) {
 	t.Parallel()
-	s := NewState([]Entry{{ID: e1, URL: "https://a.example/", Pinned: true, URLRevision: 5, URLDevice: "other"}})
+	s := NewState([]Entry{{ID: e1, URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/"), Pinned: true, URLRevision: 5, URLDevice: "other"}})
 	forked := ForkedEntryID(op1)
 
-	r, ch, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URL: "https://b.example/"}, 4, false, "dev", 6)
+	r, ch, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URLKey: key("https://b.example/"), URLEnc: enc("https://b.example/")}, 4, false, "dev", 6)
 	if r.Status != StatusForked || r.EntryID != forked || !ch.Pinned {
 		t.Fatalf("fork: %+v %+v", r, ch)
 	}
 	// The same journal keeps addressing e1; those ops now mean the fork.
-	r, _, logged := s.Merge(Op{OpID: op2, Type: TypeNavigate, EntryID: e1, URL: "https://c.example/"}, 4, false, "dev", 7)
+	r, _, logged := s.Merge(Op{OpID: op2, Type: TypeNavigate, EntryID: e1, URLKey: key("https://c.example/"), URLEnc: enc("https://c.example/")}, 4, false, "dev", 7)
 	if r.Status != StatusApplied || r.EntryID != forked || logged.EntryID != forked {
 		t.Fatalf("redirected navigate: %+v %+v", r, logged)
 	}
@@ -159,10 +160,10 @@ func TestForkedEntryID(t *testing.T) {
 	}
 	// A fork that already exists as a tombstone (opId pruned and resent) stays closed.
 	s := NewState([]Entry{
-		{ID: e1, URL: "https://a.example/", URLRevision: 5, URLDevice: "other"},
-		{ID: id, URL: "https://b.example/", ClosedRevision: ptr(int64(3))},
+		{ID: e1, URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/"), URLRevision: 5, URLDevice: "other"},
+		{ID: id, URLKey: key("https://b.example/"), URLEnc: enc("https://b.example/"), ClosedRevision: ptr(int64(3))},
 	})
-	if r, _, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URL: "https://b.example/"}, 1, false, "dev", 6); r.Status != StatusIgnored {
+	if r, _, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URLKey: key("https://b.example/"), URLEnc: enc("https://b.example/")}, 1, false, "dev", 6); r.Status != StatusIgnored {
 		t.Fatalf("tombstoned fork reopened: %+v", r)
 	}
 }
@@ -173,8 +174,8 @@ func TestMergeExpiredBaseKeepsOwnBatchChanges(t *testing.T) {
 	t.Parallel()
 	s := NewState(nil)
 	for i, op := range []Op{
-		{OpID: op1, Type: TypeOpen, EntryID: e1, URL: "https://a.example/"},
-		{OpID: op2, Type: TypeNavigate, EntryID: e1, URL: "https://b.example/"},
+		{OpID: op1, Type: TypeOpen, EntryID: e1, URLKey: key("https://a.example/"), URLEnc: enc("https://a.example/")},
+		{OpID: op2, Type: TypeNavigate, EntryID: e1, URLKey: key("https://b.example/"), URLEnc: enc("https://b.example/")},
 		{OpID: op3, Type: TypeClose, EntryID: e1},
 	} {
 		if r, _, _ := s.Merge(op, 0, true, "dev", int64(i+1)); r.Status != StatusApplied || r.EntryID != e1 {
@@ -187,11 +188,11 @@ func TestMergeExpiredBaseKeepsOwnBatchChanges(t *testing.T) {
 
 	// Fork, then close on the fork (addressed through the original id), in one batch.
 	s = NewState([]Entry{
-		{ID: e2, URL: "https://x.example/", URLRevision: 3, URLDevice: "other"},
-		{ID: e3, URL: "https://z.example/", Position: 1, URLRevision: 3, URLDevice: "other"},
+		{ID: e2, URLKey: key("https://x.example/"), URLEnc: enc("https://x.example/"), URLRevision: 3, URLDevice: "other"},
+		{ID: e3, URLKey: key("https://z.example/"), URLEnc: enc("https://z.example/"), Position: 1, URLRevision: 3, URLDevice: "other"},
 	})
 	forked := ForkedEntryID(op1)
-	if r, _, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e2, URL: "https://y.example/"}, 0, true, "dev", 10); r.Status != StatusForked {
+	if r, _, _ := s.Merge(Op{OpID: op1, Type: TypeNavigate, EntryID: e2, URLKey: key("https://y.example/"), URLEnc: enc("https://y.example/")}, 0, true, "dev", 10); r.Status != StatusForked {
 		t.Fatalf("fork: %+v", r)
 	}
 	if r, _, _ := s.Merge(Op{OpID: op2, Type: TypeClose, EntryID: e2}, 0, true, "dev", 11); r.Status != StatusApplied || r.EntryID != forked {
@@ -203,5 +204,22 @@ func TestMergeExpiredBaseKeepsOwnBatchChanges(t *testing.T) {
 	// Entries the batch did not touch stay protected by the expired rule.
 	if r, _, _ := s.Merge(Op{OpID: op3, Type: TypeClose, EntryID: e3}, 0, true, "dev", 12); r.Status != StatusIgnored {
 		t.Fatalf("close on untouched entry: %+v", r)
+	}
+}
+
+// Navigating to the same urlKey (the URL sealed again, new ciphertext) only
+// refreshes urlEnc: it is not a URL change, so it never makes another
+// device's journal stale.
+func TestNavigateSameKeyIsNotAURLChange(t *testing.T) {
+	t.Parallel()
+	const a = "https://a.example/"
+	s := NewState([]Entry{{ID: e1, URLKey: key(a), URLEnc: enc(a), URLRevision: 2, URLDevice: "dev"}})
+	resealed := enc(a) + "AAAA"
+	r, ch := s.Apply(Op{OpID: op1, Type: TypeNavigate, EntryID: e1, URLKey: key(a), URLEnc: resealed}, "other", 5)
+	if r.Status != StatusApplied || ch.URLEnc != resealed || ch.URLRevision != 2 || ch.URLDevice != "dev" || ch.UpdatedRevision != 5 {
+		t.Fatalf("same-key navigate: %+v %+v", r, ch)
+	}
+	if r, _, _ := s.Merge(Op{OpID: op2, Type: TypeClose, EntryID: e1}, 3, false, "third", 6); r.Status != StatusApplied {
+		t.Fatalf("close after a same-key navigate: %+v", r)
 	}
 }

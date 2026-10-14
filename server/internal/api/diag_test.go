@@ -14,7 +14,7 @@ func TestDiagDisabledByDefault(t *testing.T) {
 	e := newEnv(t, nil)
 	a := e.pair("A")
 	var er errorJSON
-	e.expect(http.StatusNotFound, "POST", "/v1/diag", a.Token, map[string]any{"lines": []string{"x"}}, &er)
+	e.expect(http.StatusNotFound, "POST", "/v2/diag", a.Token, map[string]any{"lines": []string{"x"}}, &er)
 	if er.Error != "not_found" {
 		t.Fatalf("disabled: %+v", er)
 	}
@@ -27,8 +27,8 @@ func TestDiagLogsLinesWithDebug(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, func(c *config.Config) { c.Debug = true })
 	a := e.pair("A")
-	e.expect(http.StatusUnauthorized, "POST", "/v1/diag", "", map[string]any{"lines": []string{"x"}}, nil)
-	e.expect(http.StatusNoContent, "POST", "/v1/diag", a.Token, map[string]any{"lines": []string{"run alarm start", "task release end 3ms"}}, nil)
+	e.expect(http.StatusUnauthorized, "POST", "/v2/diag", "", map[string]any{"lines": []string{"x"}}, nil)
+	e.expect(http.StatusNoContent, "POST", "/v2/diag", a.Token, map[string]any{"lines": []string{"run alarm start", "task release end 3ms"}}, nil)
 
 	var got []string
 	for _, line := range strings.Split(strings.TrimSpace(e.logs.String()), "\n") {
@@ -55,10 +55,10 @@ func TestDiagLogsLinesWithDebug(t *testing.T) {
 
 	var er errorJSON
 	tooMany := make([]string, maxDiagLines+1)
-	e.expect(http.StatusBadRequest, "POST", "/v1/diag", a.Token, map[string]any{"lines": tooMany}, &er)
+	e.expect(http.StatusBadRequest, "POST", "/v2/diag", a.Token, map[string]any{"lines": tooMany}, &er)
 	if er.Error != "invalid_request" {
 		t.Fatalf("too many lines: %+v", er)
 	}
-	e.expect(http.StatusBadRequest, "POST", "/v1/diag", a.Token, map[string]any{"lines": []string{strings.Repeat("é", maxDiagLineRune+1)}}, &er)
-	e.expect(http.StatusNoContent, "POST", "/v1/diag", a.Token, map[string]any{"lines": []string{strings.Repeat("é", maxDiagLineRune)}}, nil)
+	e.expect(http.StatusBadRequest, "POST", "/v2/diag", a.Token, map[string]any{"lines": []string{strings.Repeat("é", maxDiagLineRune+1)}}, &er)
+	e.expect(http.StatusNoContent, "POST", "/v2/diag", a.Token, map[string]any{"lines": []string{strings.Repeat("é", maxDiagLineRune)}}, nil)
 }

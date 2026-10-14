@@ -23,7 +23,9 @@ const usage = `Usage: cross-tab-sync <command>
 Commands:
   serve       run the HTTP service
   pair-code   create a single-use pairing code (valid 10 minutes); prints the
-              pairing link (CTS_PUBLIC_URL#CODE) when CTS_PUBLIC_URL is set
+              pairing link (CTS_PUBLIC_URL#CODE) when CTS_PUBLIC_URL is set.
+              For the first browser only: further browsers are invited from a
+              paired browser's popup, whose link carries the encryption key
 
 Configuration (environment):
   CTS_ADDR                listen address (default :8080)
@@ -146,5 +148,6 @@ func pairCode(cfg config.Config, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "set CTS_PUBLIC_URL (e.g. https://tabs.example.com) to print a pairing link to paste instead")
 	}
 	fmt.Fprintf(stderr, "single use, valid until %s\n", expires.Local().Format(time.DateTime))
+	fmt.Fprintln(stderr, "Use this link for the first browser only; invite further browsers from a paired browser's popup (its link carries the encryption key).")
 	return nil
 }

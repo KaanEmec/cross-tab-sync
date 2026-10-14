@@ -71,7 +71,8 @@ type Snapshot struct {
 
 type snapshotEntry struct {
 	ID       string `json:"id"`
-	URL      string `json:"url"`
+	URLKey   string `json:"urlKey"`
+	URLEnc   string `json:"urlEnc"`
 	Pinned   bool   `json:"pinned"`
 	Position int64  `json:"position"`
 }
@@ -137,7 +138,7 @@ func touchOwner(ctx context.Context, tx *sql.Tx, now time.Time) error {
 	return nil
 }
 
-const entryColumns = `id, url, pinned, position, opened_by, created_revision, updated_revision, closed_revision,
+const entryColumns = `id, url_key, url_enc, pinned, position, opened_by, created_revision, updated_revision, closed_revision,
 	url_revision, url_device`
 
 func queryEntries(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]session.Entry, error) {
@@ -152,7 +153,7 @@ func queryEntries(ctx context.Context, tx *sql.Tx, query string, args ...any) ([
 			e      session.Entry
 			closed sql.NullInt64
 		)
-		if err := rows.Scan(&e.ID, &e.URL, &e.Pinned, &e.Position, &e.OpenedBy, &e.CreatedRevision, &e.UpdatedRevision, &closed,
+		if err := rows.Scan(&e.ID, &e.URLKey, &e.URLEnc, &e.Pinned, &e.Position, &e.OpenedBy, &e.CreatedRevision, &e.UpdatedRevision, &closed,
 			&e.URLRevision, &e.URLDevice); err != nil {
 			return nil, fmt.Errorf("scanning entry: %w", err)
 		}
@@ -520,11 +521,11 @@ func upsertEntry(ctx context.Context, tx *sql.Tx, e *session.Entry) error {
 	if e.ClosedRevision != nil {
 		closed = *e.ClosedRevision
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO entries (`+entryColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET url = excluded.url, pinned = excluded.pinned, position = excluded.position,
+	_, err := tx.ExecContext(ctx, `INSERT INTO entries (`+entryColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET url_key = excluded.url_key, url_enc = excluded.url_enc, pinned = excluded.pinned, position = excluded.position,
 			updated_revision = excluded.updated_revision, closed_revision = excluded.closed_revision,
 			url_revision = excluded.url_revision, url_device = excluded.url_device`,
-		e.ID, e.URL, e.Pinned, e.Position, e.OpenedBy, e.CreatedRevision, e.UpdatedRevision, closed, e.URLRevision, e.URLDevice)
+		e.ID, e.URLKey, e.URLEnc, e.Pinned, e.Position, e.OpenedBy, e.CreatedRevision, e.UpdatedRevision, closed, e.URLRevision, e.URLDevice)
 	if err != nil {
 		return fmt.Errorf("writing entry: %w", err)
 	}
@@ -539,7 +540,7 @@ func saveSnapshot(ctx context.Context, tx *sql.Tx, b batch, open []session.Entry
 	}
 	items := make([]snapshotEntry, len(open))
 	for i, e := range open {
-		items[i] = snapshotEntry{ID: e.ID, URL: e.URL, Pinned: e.Pinned, Position: e.Position}
+		items[i] = snapshotEntry{ID: e.ID, URLKey: e.URLKey, URLEnc: e.URLEnc, Pinned: e.Pinned, Position: e.Position}
 	}
 	data, err := json.Marshal(items)
 	if err != nil {
@@ -591,10 +592,11 @@ func restoreID(kind string, snapshotID, gen int64, index int) string {
 	return uuid.NewSHA1(restoreNamespace, fmt.Appendf(nil, "%s:%d:%d:%d", kind, snapshotID, gen, index)).String()
 }
 
-// RestoreSnapshot re-opens a snapshot's URLs as ordinary open operations
-// under the caller's generation, after saving a pre-restore snapshot. Open
-// URLs coalesce; nothing is closed or rewound. Op and entry ids derive from
-// (snapshot, generation, index), so a retry in the same generation is a replay.
+// RestoreSnapshot re-opens a snapshot's URLs (urlKey and urlEnc) as ordinary
+// open operations under the caller's generation, after saving a pre-restore
+// snapshot. Open URLs coalesce on urlKey; nothing is closed or rewound. Op
+// and entry ids derive from (snapshot, generation, index), so a retry in the
+// same generation is a replay.
 func (s *Store) RestoreSnapshot(ctx context.Context, deviceID string, gen, id int64, now time.Time, retention int) (BatchResult, error) {
 	var out BatchResult
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -624,7 +626,7 @@ func (s *Store) RestoreSnapshot(ctx context.Context, deviceID string, gen, id in
 		for i, it := range items {
 			ops[i] = session.Op{
 				OpID: restoreID("op", id, gen, i), Type: session.TypeOpen, EntryID: restoreID("entry", id, gen, i),
-				URL: it.URL, Pinned: &it.Pinned, Position: &it.Position,
+				URLKey: it.URLKey, URLEnc: it.URLEnc, Pinned: &it.Pinned, Position: &it.Position,
 			}
 		}
 		if err := touchOwner(ctx, tx, now); err != nil {

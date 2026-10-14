@@ -33,24 +33,25 @@ func New(st *store.Store, cfg config.Config, log *slog.Logger, now func() time.T
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
-	mux.HandleFunc("POST /v1/pair", s.pair)
-	mux.Handle("POST /v1/pairing-codes", s.auth(s.createPairingCode))
-	mux.Handle("GET /v1/devices", s.auth(s.listDevices))
-	mux.Handle("PATCH /v1/devices/{id}", s.auth(s.renameDevice))
-	mux.Handle("DELETE /v1/devices/{id}", s.auth(s.revokeDevice))
-	mux.Handle("GET /v1/session", s.auth(s.getSession))
-	mux.Handle("GET /v1/session/changes", s.auth(s.changes))
-	mux.Handle("POST /v1/session/acquire", s.auth(s.acquire))
-	mux.Handle("POST /v1/session/release", s.auth(s.release))
-	mux.Handle("POST /v1/session/heartbeat", s.auth(s.heartbeat))
-	mux.Handle("POST /v1/session/operations", s.auth(s.operations))
-	mux.Handle("POST /v1/session/merge", s.auth(s.merge))
-	mux.Handle("GET /v1/snapshots", s.auth(s.listSnapshots))
-	mux.Handle("POST /v1/snapshots/{id}/restore", s.auth(s.restore))
+	mux.HandleFunc("POST /v2/pair", s.pair)
+	mux.Handle("POST /v2/pairing-codes", s.auth(s.createPairingCode))
+	mux.Handle("GET /v2/devices", s.auth(s.listDevices))
+	mux.Handle("PATCH /v2/devices/{id}", s.auth(s.renameDevice))
+	mux.Handle("DELETE /v2/devices/{id}", s.auth(s.revokeDevice))
+	mux.Handle("GET /v2/session", s.auth(s.getSession))
+	mux.Handle("GET /v2/session/changes", s.auth(s.changes))
+	mux.Handle("POST /v2/session/acquire", s.auth(s.acquire))
+	mux.Handle("POST /v2/session/release", s.auth(s.release))
+	mux.Handle("POST /v2/session/heartbeat", s.auth(s.heartbeat))
+	mux.Handle("POST /v2/session/operations", s.auth(s.operations))
+	mux.Handle("POST /v2/session/merge", s.auth(s.merge))
+	mux.Handle("GET /v2/snapshots", s.auth(s.listSnapshots))
+	mux.Handle("POST /v2/snapshots/{id}/restore", s.auth(s.restore))
 	if cfg.Debug {
 		// Development aid only; without CTS_DEBUG the path falls through to 404 not_found.
-		mux.Handle("POST /v1/diag", s.auth(s.diag))
+		mux.Handle("POST /v2/diag", s.auth(s.diag))
 	}
+	// Everything else, including the retired /v1 routes, is 404 not_found.
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint", nil)
 	})
@@ -252,7 +253,7 @@ func decode(w http.ResponseWriter, r *http.Request, dst any, allowEmpty bool) bo
 	}
 	var mbe *http.MaxBytesError
 	if errors.As(err, &mbe) {
-		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds 64 KiB", nil)
+		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds 256 KiB", nil)
 		return false
 	}
 	writeError(w, http.StatusBadRequest, "invalid_request", "body must be a single JSON object", nil)

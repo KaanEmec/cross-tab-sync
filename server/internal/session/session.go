@@ -6,7 +6,6 @@ package session
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"sort"
 
 	"github.com/google/uuid"
@@ -30,9 +29,10 @@ const (
 
 // Limits from PROTOCOL.md.
 const (
-	MaxURLBytes   = 2048
+	URLKeyLength  = 43 // base64url HMAC-SHA256, unpadded
+	MaxURLEncLen  = 4096
 	MaxBatchOps   = 500
-	MaxBodyBytes  = 64 << 10
+	MaxBodyBytes  = 256 << 10
 	MaxNameLength = 64
 	MaxPosition   = 1<<53 - 1 // largest integer JavaScript represents exactly
 )
@@ -42,7 +42,8 @@ type Op struct {
 	OpID     string `json:"opId"`
 	Type     string `json:"type"`
 	EntryID  string `json:"entryId"`
-	URL      string `json:"url,omitempty"`
+	URLKey   string `json:"urlKey,omitempty"`
+	URLEnc   string `json:"urlEnc,omitempty"`
 	Pinned   *bool  `json:"pinned,omitempty"`
 	Position *int64 `json:"position,omitempty"`
 }
@@ -62,10 +63,13 @@ type Result struct {
 	Replayed bool   `json:"replayed,omitempty"`
 }
 
-// Entry is one shared tab, open or closed (tombstone).
+// Entry is one shared tab, open or closed (tombstone). The URL is end-to-end
+// encrypted: URLKey is its keyed hash (identity for coalescing) and URLEnc
+// its ciphertext, both opaque to the server.
 type Entry struct {
 	ID              string
-	URL             string
+	URLKey          string
+	URLEnc          string
 	Pinned          bool
 	Position        int64
 	OpenedBy        string
@@ -95,7 +99,7 @@ func Validate(op Op) error {
 	}
 	switch op.Type {
 	case TypeOpen, TypeNavigate:
-		if err := ValidateURL(op.URL); err != nil {
+		if err := ValidateURLFields(op.URLKey, op.URLEnc); err != nil {
 			return err
 		}
 	case TypeClose:
@@ -109,17 +113,28 @@ func Validate(op Op) error {
 	return nil
 }
 
-// ValidateURL accepts absolute http and https URLs up to MaxURLBytes.
-// The string is never normalized: identity is the exact string.
-func ValidateURL(raw string) error {
-	if raw == "" || len(raw) > MaxURLBytes {
-		return fmt.Errorf("%w: url must be 1..%d bytes", ErrInvalid, MaxURLBytes)
+// ValidateURLFields checks the shape of an encrypted URL: urlKey exactly
+// URLKeyLength and urlEnc 1..MaxURLEncLen base64url characters. Neither is
+// decoded; the server does no cryptography.
+func ValidateURLFields(key, enc string) error {
+	if len(key) != URLKeyLength || !isBase64URL(key) {
+		return fmt.Errorf("%w: urlKey must be %d base64url characters", ErrInvalid, URLKeyLength)
 	}
-	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("%w: url must be an absolute http or https URL", ErrInvalid)
+	if enc == "" || len(enc) > MaxURLEncLen || !isBase64URL(enc) {
+		return fmt.Errorf("%w: urlEnc must be 1..%d base64url characters", ErrInvalid, MaxURLEncLen)
 	}
 	return nil
+}
+
+// isBase64URL reports whether s uses only the unpadded base64url alphabet.
+func isBase64URL(s string) bool {
+	for i := range len(s) {
+		c := s[i]
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // IsUUID reports whether s is a canonical lowercase UUID (8-4-4-4-12 hex).
@@ -147,7 +162,7 @@ func IsUUID(s string) bool {
 // built from every open entry plus any entry referenced by the batch.
 type State struct {
 	byID      map[string]*Entry
-	openByURL map[string]string
+	openByKey map[string]string // urlKey -> open entry id
 	forks     map[string]string // merge: entry id -> entry forked from it in this batch
 	ownURLs   map[string]bool   // entries whose URL this batch set (open or navigate)
 	nextPos   int64
@@ -155,13 +170,13 @@ type State struct {
 
 // NewState builds a state from entries; it copies them.
 func NewState(entries []Entry) *State {
-	s := &State{byID: make(map[string]*Entry, len(entries)), openByURL: make(map[string]string),
+	s := &State{byID: make(map[string]*Entry, len(entries)), openByKey: make(map[string]string),
 		forks: make(map[string]string), ownURLs: make(map[string]bool)}
 	for i := range entries {
 		e := entries[i]
 		s.byID[e.ID] = &e
 		if e.Open() {
-			s.openByURL[e.URL] = e.ID
+			s.openByKey[e.URLKey] = e.ID
 			s.nextPos = min(max(s.nextPos, e.Position+1), MaxPosition)
 		}
 	}
@@ -183,12 +198,12 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 			res.Status, res.EntryID = StatusCoalesced, e.ID
 			return res, nil
 		}
-		if id, ok := s.openByURL[op.URL]; ok {
+		if id, ok := s.openByKey[op.URLKey]; ok {
 			res.Status, res.EntryID = StatusCoalesced, id
 			return res, nil
 		}
 		ne := &Entry{
-			ID: op.EntryID, URL: op.URL, OpenedBy: deviceID,
+			ID: op.EntryID, URLKey: op.URLKey, URLEnc: op.URLEnc, OpenedBy: deviceID,
 			CreatedRevision: rev, UpdatedRevision: rev, Position: s.nextPos,
 			URLRevision: rev, URLDevice: deviceID,
 		}
@@ -199,7 +214,7 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 			ne.Position = *op.Position
 		}
 		s.byID[ne.ID] = ne
-		s.openByURL[ne.URL] = ne.ID
+		s.openByKey[ne.URLKey] = ne.ID
 		s.ownURLs[ne.ID] = true
 		s.nextPos = min(max(s.nextPos, ne.Position+1), MaxPosition)
 		res.Status, res.EntryID = StatusApplied, ne.ID
@@ -209,16 +224,21 @@ func (s *State) Apply(op Op, deviceID string, rev int64) (Result, *Entry) {
 		if e == nil || !e.Open() {
 			return res, nil
 		}
-		if other, ok := s.openByURL[op.URL]; ok && other != e.ID {
+		if other, ok := s.openByKey[op.URLKey]; ok && other != e.ID {
 			s.closeEntry(e, rev)
 			res.Status, res.EntryID = StatusCoalesced, other
 			return res, copyEntry(e)
 		}
-		delete(s.openByURL, e.URL)
-		e.URL = op.URL
+		// Only a key change moves the entry ("navigated since"); the same
+		// URL sealed again just refreshes the ciphertext.
+		if e.URLKey != op.URLKey {
+			delete(s.openByKey, e.URLKey)
+			e.URLKey = op.URLKey
+			e.URLRevision, e.URLDevice = rev, deviceID
+			s.openByKey[e.URLKey] = e.ID
+		}
+		e.URLEnc = op.URLEnc
 		e.UpdatedRevision = rev
-		e.URLRevision, e.URLDevice = rev, deviceID
-		s.openByURL[e.URL] = e.ID
 		s.ownURLs[e.ID] = true
 		res.Status, res.EntryID = StatusApplied, e.ID
 		return res, copyEntry(e)
@@ -263,7 +283,7 @@ func ForkedEntryID(opID string) string {
 // after baseRevision through another device, or always when expired is set
 // (baseRevision outside the retained history), except entries whose URL this
 // batch itself set: the journal's own opens, navigates and forks. A navigate on a moved entry
-// opens a fresh entry (StatusForked, coalescing on URL); close and update on a
+// opens a fresh entry (StatusForked, coalescing on urlKey); close and update on a
 // moved entry are ignored; open behaves as in Apply. Later operations of the
 // same batch on a forked entry are redirected to its fork.
 //
@@ -290,7 +310,8 @@ func (s *State) Merge(op Op, baseRevision int64, expired bool, deviceID string, 
 		return Result{OpID: op.OpID, Status: StatusIgnored}, nil, op
 	}
 	pinned := e.Pinned
-	fork := Op{OpID: op.OpID, Type: TypeOpen, EntryID: ForkedEntryID(op.OpID), URL: op.URL, Pinned: &pinned}
+	fork := Op{OpID: op.OpID, Type: TypeOpen, EntryID: ForkedEntryID(op.OpID),
+		URLKey: op.URLKey, URLEnc: op.URLEnc, Pinned: &pinned}
 	res, changed := s.Apply(fork, deviceID, rev)
 	if res.Status == StatusApplied {
 		res.Status = StatusForked
@@ -300,7 +321,7 @@ func (s *State) Merge(op Op, baseRevision int64, expired bool, deviceID string, 
 }
 
 func (s *State) closeEntry(e *Entry, rev int64) {
-	delete(s.openByURL, e.URL)
+	delete(s.openByKey, e.URLKey)
 	r := rev
 	e.ClosedRevision = &r
 	e.UpdatedRevision = rev
@@ -308,8 +329,8 @@ func (s *State) closeEntry(e *Entry, rev int64) {
 
 // OpenEntries returns the open entries sorted by position then id.
 func (s *State) OpenEntries() []Entry {
-	out := make([]Entry, 0, len(s.openByURL))
-	for _, id := range s.openByURL {
+	out := make([]Entry, 0, len(s.openByKey))
+	for _, id := range s.openByKey {
 		out = append(out, *s.byID[id])
 	}
 	SortEntries(out)

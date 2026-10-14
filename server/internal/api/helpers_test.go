@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -143,7 +146,7 @@ func (e *env) pair(name string) testDevice {
 		e.t.Fatal(err)
 	}
 	var d testDevice
-	e.expect(http.StatusCreated, "POST", "/v1/pair", "", map[string]string{"code": code, "name": name, "browser": "brave"}, &d)
+	e.expect(http.StatusCreated, "POST", "/v2/pair", "", map[string]string{"code": code, "name": name, "browser": "brave"}, &d)
 	return d
 }
 
@@ -162,11 +165,15 @@ type errorJSON struct {
 
 type entry struct {
 	ID              string `json:"id"`
-	URL             string `json:"url"`
+	URLKey          string `json:"urlKey"`
+	URLEnc          string `json:"urlEnc"`
 	Pinned          bool   `json:"pinned"`
 	Position        int64  `json:"position"`
 	UpdatedRevision int64  `json:"updatedRevision"`
 }
+
+// URL is the plaintext behind the test stand-in ciphertext (see sealed).
+func (en entry) URL() string { return unseal(en.URLEnc) }
 
 type sessionResp struct {
 	Revision int64      `json:"revision"`
@@ -210,21 +217,46 @@ func uid() string {
 	return fmt.Sprintf("00000000-0000-4000-8000-%012x", idSeq.Add(1))
 }
 
-func openOp(entryID, url string) op {
-	return op{"opId": uid(), "type": "open", "entryId": entryID, "url": url}
+// sealed derives deterministic stand-ins for a client's urlKey and urlEnc
+// (the server only checks their shape): key is base64url(SHA-256(url)), enc
+// the URL zero-padded to a multiple of 64 bytes, base64url-encoded.
+func sealed(url string) (key, enc string) {
+	sum := sha256.Sum256([]byte(url))
+	padded := make([]byte, (len(url)+63)/64*64)
+	copy(padded, url)
+	return base64.RawURLEncoding.EncodeToString(sum[:]), base64.RawURLEncoding.EncodeToString(padded)
 }
+
+func urlKey(url string) string { k, _ := sealed(url); return k }
+
+// unseal reverses sealed's enc; "" for anything else.
+func unseal(enc any) string {
+	s, _ := enc.(string)
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(b), "\x00")
+}
+
+func urlOp(typ, entryID, url string) op {
+	k, e := sealed(url)
+	return op{"opId": uid(), "type": typ, "entryId": entryID, "urlKey": k, "urlEnc": e}
+}
+
+func openOp(entryID, url string) op { return urlOp("open", entryID, url) }
 
 func (e *env) acquire(d testDevice, force bool) int64 {
 	e.t.Helper()
 	var r acquireResp
-	e.expect(http.StatusOK, "POST", "/v1/session/acquire", d.Token, map[string]bool{"force": force}, &r)
+	e.expect(http.StatusOK, "POST", "/v2/session/acquire", d.Token, map[string]bool{"force": force}, &r)
 	return r.Generation
 }
 
 func (e *env) ops(d testDevice, gen, base int64, ops ...op) opsResp {
 	e.t.Helper()
 	var r opsResp
-	e.expect(http.StatusOK, "POST", "/v1/session/operations", d.Token,
+	e.expect(http.StatusOK, "POST", "/v2/session/operations", d.Token,
 		map[string]any{"generation": gen, "baseRevision": base, "operations": ops}, &r)
 	return r
 }
@@ -232,6 +264,6 @@ func (e *env) ops(d testDevice, gen, base int64, ops ...op) opsResp {
 func (e *env) session(d testDevice) sessionResp {
 	e.t.Helper()
 	var s sessionResp
-	e.expect(http.StatusOK, "GET", "/v1/session", d.Token, nil, &s)
+	e.expect(http.StatusOK, "GET", "/v2/session", d.Token, nil, &s)
 	return s
 }

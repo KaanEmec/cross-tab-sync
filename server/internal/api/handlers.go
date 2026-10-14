@@ -16,7 +16,8 @@ import (
 
 type entryJSON struct {
 	ID              string `json:"id"`
-	URL             string `json:"url"`
+	URLKey          string `json:"urlKey"`
+	URLEnc          string `json:"urlEnc"`
 	Pinned          bool   `json:"pinned"`
 	Position        int64  `json:"position"`
 	UpdatedRevision int64  `json:"updatedRevision"`
@@ -32,7 +33,7 @@ type sessionJSON struct {
 func toSessionJSON(s store.Session) sessionJSON {
 	out := sessionJSON{Revision: s.Revision, MinRevision: s.MinRevision, Owner: s.Owner, Entries: make([]entryJSON, len(s.Entries))}
 	for i, e := range s.Entries {
-		out.Entries[i] = entryJSON{ID: e.ID, URL: e.URL, Pinned: e.Pinned, Position: e.Position, UpdatedRevision: e.UpdatedRevision}
+		out.Entries[i] = entryJSON{ID: e.ID, URLKey: e.URLKey, URLEnc: e.URLEnc, Pinned: e.Pinned, Position: e.Position, UpdatedRevision: e.UpdatedRevision}
 	}
 	return out
 }
@@ -380,7 +381,7 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"revision": res.Revision, "results": results(res.Results)})
 }
 
-// Limits for POST /v1/diag.
+// Limits for POST /v2/diag.
 const (
 	maxDiagLines    = 200
 	maxDiagLineRune = 300
