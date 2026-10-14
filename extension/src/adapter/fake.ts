@@ -53,6 +53,11 @@ export class FakeBrowser implements BrowserAdapter {
   hostPermission = true;
   /** When set, createTab rejects for these URLs. */
   failCreateFor = new Set<string>();
+  /**
+   * Remove like a real browser: `removeTab` resolves at once, the tab disappears on a later tick and
+   * `onRemoved` fires after that (see `flush`). Off by default.
+   */
+  asyncRemove = false;
   readonly calls: { method: string; args: unknown[] }[] = [];
 
   readonly events = {
@@ -144,10 +149,22 @@ export class FakeBrowser implements BrowserAdapter {
 
   async removeTab(tabId: number): Promise<void> {
     this.calls.push({ method: "removeTab", args: [tabId] });
-    const tab = this.tabs.find((t) => t.id === tabId);
-    if (!tab) return;
-    this.tabs = this.tabs.filter((t) => t.id !== tabId);
-    this.events.tabRemoved.emit(tabId, false, tab.windowId);
+    const remove = () => {
+      const tab = this.tabs.find((t) => t.id === tabId);
+      if (!tab) return null;
+      this.tabs = this.tabs.filter((t) => t.id !== tabId);
+      return () => this.events.tabRemoved.emit(tabId, false, tab.windowId);
+    };
+    if (!this.asyncRemove) return remove()?.();
+    setTimeout(() => {
+      const emit = remove();
+      if (emit) setTimeout(emit, 0);
+    }, 0);
+  }
+
+  /** Let asynchronous removals finish (tab gone, then `onRemoved`). */
+  async flush(): Promise<void> {
+    for (let i = 0; i < 2; i++) await new Promise((r) => setTimeout(r, 0));
   }
 
   /**

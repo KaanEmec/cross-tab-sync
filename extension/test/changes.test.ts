@@ -225,6 +225,12 @@ describe("echo suppression", () => {
     expect(next(after, user).pending[0]?.base).toBe("https://x/");
   });
 
+  it("a tab the extension is removing (still listed, removal is asynchronous) is never an addition", () => {
+    const s = state({ expected: [{ kind: "remove", tabId: 1, until: T0 + 1 }] });
+    expect(recordCreated(s, tab(1, "https://x/"), ctx())).toEqual({ patch: {}, ops: [], activity: false });
+    expect(recordUpdated(s, tab(1, "https://x/"), ctx())).toEqual({ patch: {}, ops: [], activity: false });
+  });
+
   it("a removal by the extension does not close the entry", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"]]), expected: [{ kind: "remove", tabId: 1, until: T0 + 1 }] });
     const o = recordRemoved(s, 1, false, W, ctx());

@@ -221,6 +221,11 @@ function addition(d: Draft, tab: TabEvent & { url: string }): boolean {
   return false;
 }
 
+/** The extension asked the browser to remove this tab; it may still report events meanwhile. */
+function removing(d: Draft, tabId: number): boolean {
+  return d.s.expected.some((e) => e.kind === "remove" && e.tabId === tabId);
+}
+
 /**
  * `tabs.onCreated`. Activity only for a tab the user created with an eligible URL: not one the
  * extension created, not a restored tab, not a blank or browser page (new tab page, extension page).
@@ -228,7 +233,7 @@ function addition(d: Draft, tab: TabEvent & { url: string }): boolean {
 export function recordCreated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
   const d = new Draft(s, ctx);
   // Created by a sync run: the run mapped it before this event was processed.
-  if (d.s.mappings.tabs[String(tab.id)]) return d.done(false);
+  if (d.s.mappings.tabs[String(tab.id)] || removing(d, tab.id)) return d.done(false);
   if (!tab.eligible || !tab.url) return d.done(false); // URL arrives with tabs.onUpdated
   const withUrl = { ...tab, url: tab.url };
   if (takeCreate(d, withUrl)) return d.done(false);
@@ -243,6 +248,8 @@ export function recordUpdated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
   const d = new Draft(s, ctx);
   const key = String(tab.id);
   const mapped = d.s.mappings.tabs[key];
+  // Being removed by the extension (removal is asynchronous): never an addition or navigation.
+  if (removing(d, tab.id)) return d.done(false);
 
   // Loads started by the extension, including redirects and post-load URL rewrites, are not user
   // navigation. The expectation only expires by time.

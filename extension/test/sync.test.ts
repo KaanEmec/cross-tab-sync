@@ -510,6 +510,47 @@ describe("live testing fixes", () => {
     expect(mac.acquires()).toBe(1);
   });
 
+  it("a takeover during the close hold does not recreate the closed tab; the close is sent after the hold", async () => {
+    await owner("Brave", ["https://a/", "https://b/"]);
+    const mac = await follower("Mac Safari");
+    clock.advance(15_000);
+    mac.b.userCloseTab(mac.tab("https://a/"));
+    await mac.engine.idle();
+    expect((await mac.state()).heldCloses.filter((h) => !h.done)).toHaveLength(1);
+
+    await mac.engine.takeover(); // before the hold releases (its timer has not fired)
+    await mac.engine.idle();
+    expect(await mac.urls()).toEqual(["https://b/"]);
+    expect(server.openUrls().sort()).toEqual(["https://a/", "https://b/"]);
+
+    await mac.settle(); // release: the entry has no local copy, so the close goes out
+    expect(mac.sent().filter((o) => o.type === "close")).toHaveLength(1);
+    expect(server.openUrls()).toEqual(["https://b/"]);
+    expect(await mac.urls()).toEqual(["https://b/"]);
+  });
+
+  it("tabs being removed asynchronously are not republished by the materialize in the same run", async () => {
+    const brave = await owner("Brave", ["https://a/", "https://b/", "https://c/"]);
+    const mac = await follower("Mac Safari", { tabs: [{ url: "https://mine/", active: true }] });
+    mac.b.asyncRemove = true;
+    // A remote close, and a navigate onto a URL open locally (the background copy is closed).
+    brave.b.userCloseTab(brave.tab("https://c/"));
+    brave.b.userNavigate(brave.tab("https://a/"), "https://b/");
+    await brave.settle();
+
+    await mac.engine.takeover(); // catch-up applies both, then materializes while the tabs are still listed
+    await mac.settle();
+    await mac.b.flush();
+    await mac.settle();
+    expect(removals(mac)).toBe(2);
+    expect(mac.sent().filter((o) => o.type === "open").map((o) => o.type === "open" && o.url)).toEqual(["https://mine/"]);
+    expect(server.openUrls().sort()).toEqual(["https://b/", "https://mine/"]);
+    expect(await mac.urls()).toEqual(["https://b/", "https://mine/"]);
+    const s = await mac.state();
+    expect(s.pending).toEqual([]);
+    expect(s.detached).toEqual({});
+  });
+
   it("closing a Safari pinned tab, reported once per window, closes its entry once", async () => {
     const mac = await device(server, clock, "Mac Safari", { tabs: [{ url: "https://pinned/", pinned: true }, { url: "https://keep/" }] });
     mac.b.addWindow({ tabs: [{ url: "https://pinned/", pinned: true }] });

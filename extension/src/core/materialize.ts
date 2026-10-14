@@ -6,12 +6,13 @@ import { append, pendingChanges, pendingEntryIds } from "./journal.js";
 import { remapEntry, removeMappings, serverUrl, setMapping, tabsForEntry } from "./mapping.js";
 import { plan, type OpenOp } from "./plan.js";
 import { idGen, nowDate, nowMs, type Store } from "./store.js";
-import { captureTabs, createTabs, currentMappings, expiry, forkEntry, pendingBase, pendingClosedIds } from "./apply.js";
+import { captureLive, createTabs, currentMappings, expiry, forkEntry, pendingBase, pendingClosedIds } from "./apply.js";
 
 /**
  * Bring local tabs in line with a full session (Continue here, Hand over with `entries` null, and
  * the follower full resync with `publish` false). Reuses tabs by URL, creates missing entries in the
- * background, never closes. Entries this device closed (journaled `close`) are not recreated.
+ * background, never closes. Entries this device closed (journaled `close`, or a held removal not yet
+ * released) are not recreated. Tabs the extension is removing are not captured.
  * Mapped copies whose entry moved on the server are navigated to it, unless this device has a
  * pending change for the entry based on another URL: then both survive (forkEntry). Tabs mapped to
  * entries that left the session are detached, never republished, unless they carry an unsent
@@ -24,7 +25,7 @@ export async function materialize(
   entries: Entry[] | null,
   publish: boolean,
 ): Promise<{ open: OpenOp[]; failed: number }> {
-  const { all, eligible } = await captureTabs(store.deps.adapter);
+  const { all, eligible } = await captureLive(store);
   let before = await currentMappings(store, all, eligible);
   let pending = store.s.pending;
   const newId = idGen(store.deps);
@@ -42,7 +43,7 @@ export async function materialize(
   }
 
   const pendingIds = pendingEntryIds(pending);
-  const closed = pendingClosedIds(pending);
+  const closed = pendingClosedIds(pending, store.s.heldCloses, before);
   const detached = { ...store.s.detached };
   const urlOf = new Map(eligible.map((t) => [String(t.id), t.url]));
   const orphan = (key: string) => {

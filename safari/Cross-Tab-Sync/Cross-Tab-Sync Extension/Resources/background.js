@@ -511,9 +511,12 @@
     d.map(tab.id, entryId, tab.url);
     return false;
   }
+  function removing(d, tabId) {
+    return d.s.expected.some((e) => e.kind === "remove" && e.tabId === tabId);
+  }
   function recordCreated(s, tab, ctx) {
     const d = new Draft(s, ctx);
-    if (d.s.mappings.tabs[String(tab.id)]) return d.done(false);
+    if (d.s.mappings.tabs[String(tab.id)] || removing(d, tab.id)) return d.done(false);
     if (!tab.eligible || !tab.url) return d.done(false);
     const withUrl = { ...tab, url: tab.url };
     if (takeCreate(d, withUrl)) return d.done(false);
@@ -523,6 +526,7 @@
     const d = new Draft(s, ctx);
     const key = String(tab.id);
     const mapped = d.s.mappings.tabs[key];
+    if (removing(d, tab.id)) return d.done(false);
     const load = d.s.expected.find((e) => e.kind === "load" && e.tabId === tab.id);
     if (load) {
       if (load.kind === "load" && !load.completed) {
@@ -860,12 +864,21 @@
   }
 
   // src/core/apply.ts
-  async function captureTabs(adapter2) {
-    const [all, windows] = await Promise.all([adapter2.queryTabs(), adapter2.getWindows()]);
+  function removingTabIds(expected, now) {
+    return new Set(expected.flatMap((e) => e.kind === "remove" && e.until > now ? [e.tabId] : []));
+  }
+  async function captureTabs(adapter2, removing2 = /* @__PURE__ */ new Set()) {
+    const [tabs, windows] = await Promise.all([adapter2.queryTabs(), adapter2.getWindows()]);
+    const all = removing2.size > 0 ? tabs.filter((t) => !removing2.has(t.id)) : tabs;
     return { all, eligible: eligibleTabs(all, windows) };
   }
-  function pendingClosedIds(journal) {
-    return new Set(journal.filter((p) => p.op.type === "close").map((p) => p.op.entryId));
+  function captureLive(store) {
+    return captureTabs(store.deps.adapter, removingTabIds(store.s.expected, nowMs(store.deps)));
+  }
+  function pendingClosedIds(journal, held = [], mappings) {
+    const ids = new Set(journal.filter((p) => p.op.type === "close").map((p) => p.op.entryId));
+    for (const h of held) if (!h.done && (!mappings || tabsForEntry(mappings, h.entryId).length === 0)) ids.add(h.entryId);
+    return ids;
   }
   function reconcileDetached(detached, all, eligible, mappings, live) {
     const present = new Set(all.map((t) => String(t.id)));
@@ -940,7 +953,7 @@
     let failed = 0;
     for (const item of items) {
       const others = (e) => !(e.kind === "create" && e.entryId === item.entryId);
-      const { eligible } = await captureTabs(adapter2);
+      const { eligible } = await captureLive(store);
       const same = eligible.filter((t) => t.url === item.url);
       if (same.length > 0) {
         let mappings = store.s.mappings;
@@ -990,7 +1003,7 @@
     const foreign = ops.filter((l) => l.deviceId !== store.s.deviceId && l.result.status !== "ignored").sort((a, b) => a.seq - b.seq);
     if (foreign.length === 0) return;
     const { adapter: adapter2 } = store.deps;
-    const { all, eligible } = await captureTabs(adapter2);
+    const { all, eligible } = await captureLive(store);
     let mappings = await currentMappings(store, all, eligible);
     let pending = store.s.pending;
     const newId = idGen(store.deps);
@@ -1038,6 +1051,7 @@
         case "open": {
           if (target !== op.entryId) mappings = remapEntry(mappings, op.entryId, target);
           if (tabsForEntry(mappings, target).length > 0 || toCreate.some((c) => c.entryId === target)) break;
+          if (pendingClosedIds(pending, store.s.heldCloses, mappings).has(target)) break;
           const local = localWithUrl(op.url);
           if (local.length > 0) adopt(local, target, op.url);
           else toCreate.push({ entryId: target, url: op.url, pinned: op.pinned ?? false });
@@ -1177,7 +1191,7 @@
 
   // src/core/materialize.ts
   async function materialize(store, entries, publish) {
-    const { all, eligible } = await captureTabs(store.deps.adapter);
+    const { all, eligible } = await captureLive(store);
     let before = await currentMappings(store, all, eligible);
     let pending = store.s.pending;
     const newId = idGen(store.deps);
@@ -1192,7 +1206,7 @@
       }
     }
     const pendingIds = pendingEntryIds(pending);
-    const closed = pendingClosedIds(pending);
+    const closed = pendingClosedIds(pending, store.s.heldCloses, before);
     const detached = { ...store.s.detached };
     const urlOf = new Map(eligible.map((t) => [String(t.id), t.url]));
     const orphan = (key) => {

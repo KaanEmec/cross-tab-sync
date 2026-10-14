@@ -4,7 +4,15 @@
 
 import type { BrowserAdapter, TabInfo } from "../adapter/types.js";
 import type { LoggedOperation, OpResult, Operation } from "./client.js";
-import { expectLoads, EXPECT_TTL_MS, inStartupGrace, pruneExpected, STALE_MAPPINGS_TTL_MS, type Expectation } from "./changes.js";
+import {
+  expectLoads,
+  EXPECT_TTL_MS,
+  inStartupGrace,
+  pruneExpected,
+  STALE_MAPPINGS_TTL_MS,
+  type Expectation,
+  type HeldClose,
+} from "./changes.js";
 import { eligibleTabs, type EligibleTab } from "./eligibility.js";
 import { append, pendingChanges, type Journal } from "./journal.js";
 import {
@@ -19,14 +27,39 @@ import {
 import type { TabToCreate } from "./plan.js";
 import { idGen, nowDate, nowMs, type Store } from "./store.js";
 
-export async function captureTabs(adapter: BrowserAdapter): Promise<{ all: TabInfo[]; eligible: EligibleTab[] }> {
-  const [all, windows] = await Promise.all([adapter.queryTabs(), adapter.getWindows()]);
+/** Tabs the extension is removing (live `remove` expectation). */
+export function removingTabIds(expected: Expectation[], now: number): Set<number> {
+  return new Set(expected.flatMap((e) => (e.kind === "remove" && e.until > now ? [e.tabId] : [])));
+}
+
+/**
+ * Current tabs and the eligible ones among them. Tabs the extension is removing are left out:
+ * browsers remove asynchronously, and a tab still listed after its removal was requested must not
+ * be matched, adopted or published (it would become an entry with no tab anywhere).
+ */
+export async function captureTabs(
+  adapter: BrowserAdapter,
+  removing: Set<number> = new Set(),
+): Promise<{ all: TabInfo[]; eligible: EligibleTab[] }> {
+  const [tabs, windows] = await Promise.all([adapter.queryTabs(), adapter.getWindows()]);
+  const all = removing.size > 0 ? tabs.filter((t) => !removing.has(t.id)) : tabs;
   return { all, eligible: eligibleTabs(all, windows) };
 }
 
-/** Entries with a journaled `close`: this device closed them, so they are never recreated locally. */
-export function pendingClosedIds(journal: Journal): Set<string> {
-  return new Set(journal.filter((p) => p.op.type === "close").map((p) => p.op.entryId));
+/** `captureTabs` without the tabs this store's expectations say are being removed. */
+export function captureLive(store: Store): Promise<{ all: TabInfo[]; eligible: EligibleTab[] }> {
+  return captureTabs(store.deps.adapter, removingTabIds(store.s.expected, nowMs(store.deps)));
+}
+
+/**
+ * Entries this device closed, so they are never recreated locally: a journaled `close`, or a held
+ * removal of the last local copy that is not released yet (it may still become a `close`; if the
+ * hold is dropped later, nothing else changes).
+ */
+export function pendingClosedIds(journal: Journal, held: HeldClose[] = [], mappings?: Mappings): Set<string> {
+  const ids = new Set(journal.filter((p) => p.op.type === "close").map((p) => p.op.entryId));
+  for (const h of held) if (!h.done && (!mappings || tabsForEntry(mappings, h.entryId).length === 0)) ids.add(h.entryId);
+  return ids;
 }
 
 /**
@@ -145,7 +178,7 @@ export async function createTabs(store: Store, items: TabToCreate[]): Promise<{ 
   let failed = 0;
   for (const item of items) {
     const others = (e: Expectation) => !(e.kind === "create" && e.entryId === item.entryId);
-    const { eligible } = await captureTabs(adapter);
+    const { eligible } = await captureLive(store);
     const same = eligible.filter((t) => t.url === item.url);
     if (same.length > 0) {
       let mappings = store.s.mappings;
@@ -219,7 +252,7 @@ export async function applyRemote(
     .sort((a, b) => a.seq - b.seq);
   if (foreign.length === 0) return;
   const { adapter } = store.deps;
-  const { all, eligible } = await captureTabs(adapter);
+  const { all, eligible } = await captureLive(store);
   let mappings = await currentMappings(store, all, eligible);
   let pending = store.s.pending;
   const newId = idGen(store.deps);
@@ -271,6 +304,8 @@ export async function applyRemote(
       case "open": {
         if (target !== op.entryId) mappings = remapEntry(mappings, op.entryId, target);
         if (tabsForEntry(mappings, target).length > 0 || toCreate.some((c) => c.entryId === target)) break;
+        // Coalesced into an entry this device closed (journaled or still held): not recreated.
+        if (pendingClosedIds(pending, store.s.heldCloses, mappings).has(target)) break;
         const local = localWithUrl(op.url);
         // Already open locally (possibly under a not yet published local entry): never duplicate.
         if (local.length > 0) adopt(local, target, op.url);

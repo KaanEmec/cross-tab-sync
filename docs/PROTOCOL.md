@@ -174,7 +174,8 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 - Continue here first applies `changes?since=lastRevision` (410 → full session), then materializes. Materializing navigates mapped tabs whose entry URL moved when nothing local is pending for that entry.
 - Divergence: when a remote navigate or close meets a local pending navigate for the same entry, local copies are forked to a fresh entry (`open` of the local URL) and the remote URL gets its own background tab; nothing is overwritten.
 - `close` operations are held for 2 s and dropped (unmap only) if the window disappeared, `windows.onRemoved` fired, three or more removals of more than one entry came from that window, or a new browser session started. Removals that are all copies of one entry are one closure (Safari reports a pinned tab once per window).
-- Tabs mapped to entries that are no longer in the session are detached, not republished. Continue here never recreates entries this device has a pending `close` for.
+- Tabs mapped to entries that are no longer in the session are detached, not republished. Continue here, a full resync and applying a coalesced `open` never recreate entries this device has a pending `close` for, including a removal still held (not yet released or dropped).
+- Browsers remove tabs asynchronously: a tab the extension is removing (live `remove` expectation) is left out of every capture (materialize, application, creates) and its events never journal an addition.
 - Previous-session mappings and the detached set survive a restart for 60 s so late-restored tabs still match.
 - Local pin changes are not published in v0.2.
 - The superseded owner learns of the change from `409 stale_owner` on its next run, keeps its journal, and follows; its pending work goes through `merge` on that run. The cadence bounds the window in which the prior owner's unpublished changes are invisible to the new owner.
