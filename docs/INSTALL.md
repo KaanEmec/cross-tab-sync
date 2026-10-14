@@ -15,6 +15,8 @@ If Brave is your second browser, click **I have an invite link** instead, paste 
 
 **Without the store:** download `cross-tab-sync-brave-<version>.zip` from the [latest release](https://github.com/KaanEmec/cross-tab-sync/releases/latest), extract it to a folder you keep, open `brave://extensions`, turn on **Developer mode**, click **Load unpacked** and pick that folder. This copy does not update itself.
 
+**Profiles:** an extension belongs to one browser profile and can only see that profile's tabs, so install and pair Cross-Tab-Sync in the single profile you want synced. A second profile with the extension would pair as another device and compete for control. Chrome or Brave account sync may copy the install to another computer, but never the pairing or the key: that copy shows up unpaired. Also works in Chrome: the Brave build is plain Chromium.
+
 ## 2. Safari on macOS
 
 Needs Safari 18.4 or newer (macOS 13+).
