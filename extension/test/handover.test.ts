@@ -7,6 +7,7 @@ import {
   disconnect,
   handOver,
   pair,
+  KEY_REQUIRED_MESSAGE,
   pairFromPending,
   refreshOwner,
   resetForBrowserStartup,
@@ -15,8 +16,11 @@ import {
 import { list } from "../src/core/journal.js";
 import { setMapping } from "../src/core/mapping.js";
 import { syncRun } from "../src/core/sync.js";
+import { errorFix } from "../src/core/devices.js";
+import { statusView } from "../src/core/messages.js";
+import { KEY_MISMATCH_MESSAGE } from "../src/core/status.js";
 import { loadState, saveState } from "../src/core/state.js";
-import { FakeServer } from "./support/fakeServer.js";
+import { FakeServer, TEST_KEY } from "./support/fakeServer.js";
 
 let server: FakeServer;
 let codeSeq = 0;
@@ -37,7 +41,7 @@ async function device(name: string, setup: (b: FakeBrowser) => void = () => {}):
   const deps: Deps = { adapter: b, api: server.api, browser: name.includes("Safari") ? "safari" : "brave" };
   const code = `PAIR${++codeSeq}`.padEnd(8, "0");
   server.codes.add(code);
-  await pair(deps, { serverUrl: "https://sync.example/", deviceName: name, code });
+  await pair(deps, { serverUrl: "https://sync.example/", deviceName: name, code, key: TEST_KEY });
   return { b, deps, state: () => loadState(b.storage) };
 }
 
@@ -78,6 +82,91 @@ describe("pairing", () => {
     const d = await device("Mac Safari");
     const { code } = await createPairingCode(d.deps);
     expect(server.codes.has(code)).toBe(true);
+  });
+});
+
+describe("encryption keys at pairing", () => {
+  const keyless = async (code: string) => {
+    const b = new FakeBrowser();
+    b.addWindow({ focused: true, tabs: [{ url: "https://mine/" }] });
+    const deps: Deps = { adapter: b, api: server.api, browser: "brave" };
+    server.codes.add(code);
+    return { b, deps, run: () => pair(deps, { serverUrl: "https://sync.example", deviceName: "Brave", code }) };
+  };
+
+  it("the first browser of an empty session generates the key", async () => {
+    const first = await keyless("FIRST234");
+    const s = await first.run();
+    expect(s.syncKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(s.token).toMatch(/^cts_/);
+    expect(server.requests.map((r) => r.path)).toEqual(["pair", "session"]);
+    // It can publish and read back its own tabs with that key.
+    const owner = await continueHere(first.deps);
+    expect(owner.lastError).toBeNull();
+    expect(server.openUrls()).toEqual(["https://mine/"]);
+    expect(JSON.stringify(server.wireSession())).not.toContain("mine");
+  });
+
+  it("a keyless link on a non-empty session is refused and the new device revokes itself", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
+    await continueHere(mac.deps);
+    const late = await keyless("LATE2345");
+    await expect(late.run()).rejects.toThrow(KEY_REQUIRED_MESSAGE);
+    const s = await loadState(late.b.storage);
+    expect(s).toMatchObject({ token: null, deviceId: null, syncKey: null, errorKind: "key", lastError: KEY_REQUIRED_MESSAGE });
+    expect(statusView(s).paired).toBe(false);
+    expect(errorFix(statusView(s))).toBeNull();
+    expect(server.devices.at(-1)).toMatchObject({ name: "Brave", revoked: true });
+    expect(late.b.calls.some((c) => c.method === "createTab")).toBe(false);
+  });
+
+  it("a key from the invite link is stored without looking at the session", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
+    await continueHere(mac.deps);
+    const before = server.requests.length;
+    const brave = await device("Brave", (b) => b.addWindow({ focused: true }));
+    expect((await brave.state()).syncKey).toBe(TEST_KEY);
+    expect(server.requests.slice(before).map((r) => r.path)).toEqual(["pair"]);
+    await continueHere(brave.deps);
+    expect(urls(brave.b)).toEqual(["https://a/"]);
+  });
+
+  it("pairFromPending passes the link's key through", async () => {
+    const b = new FakeBrowser();
+    const deps: Deps = { adapter: b, api: server.api, browser: "brave" };
+    await saveState(b.storage, {
+      pendingPair: { serverUrl: "https://sync.example", deviceName: "Brave", code: "GOODCODE", key: TEST_KEY, createdAt: Date.now() },
+    });
+    expect((await pairFromPending(deps))?.syncKey).toBe(TEST_KEY);
+  });
+
+  it("a different key is reported as key_mismatch and nothing is applied locally", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
+    await continueHere(mac.deps);
+    const wrong = await device("Brave", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://b/" }] }));
+    await saveState(wrong.b.storage, { syncKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
+
+    await expect(continueHere(wrong.deps)).rejects.toMatchObject({ code: "key_mismatch" });
+    let s = await wrong.state();
+    expect(s).toMatchObject({ errorKind: "key", lastError: KEY_MISMATCH_MESSAGE, online: true, nextRetryAt: null });
+    expect(errorFix(statusView(s))).toBeNull();
+    expect(urls(wrong.b)).toEqual(["https://b/"]);
+    expect(createCalls(wrong.b)).toEqual([]);
+
+    // A follower run hits it too (on changes or the session), with the same class.
+    await saveState(wrong.b.storage, { errorKind: null, lastError: null });
+    await expect(syncRun(wrong.deps)).rejects.toMatchObject({ code: "key_mismatch" });
+    s = await wrong.state();
+    expect(s.errorKind).toBe("key");
+    expect(urls(wrong.b)).toEqual(["https://b/"]);
+  });
+
+  it("disconnect forgets the key", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
+    expect((await mac.state()).syncKey).toBe(TEST_KEY);
+    const s = await disconnect(mac.deps);
+    expect(s.syncKey).toBeNull();
+    expect(statusView(s).encrypted).toBe(false);
   });
 });
 
@@ -298,7 +387,7 @@ describe("journal replay", () => {
     const brave = await device("Brave", (b) => b.addWindow({ focused: true }));
     await continueHere(brave.deps);
     const entryId = "11111111-1111-4111-8111-111111111111";
-    server.inject("dev-x", [{ opId: "o1", type: "open", entryId, url: "https://dup/" }]);
+    await server.inject("dev-x", [{ opId: "o1", type: "open", entryId, url: "https://dup/" }]);
     brave.b.addTab(brave.b.windows[0]!.id, { url: "https://dup/" });
     // brave's lastRevision predates the injected op, so it also arrives as catchUp.
     const s = await handOver(brave.deps);
@@ -316,7 +405,7 @@ describe("catchUp", () => {
     const keepEntry = (await mac.state()).mappings.tabs[String(mac.b.tabs[0]!.id)]!.entryId;
     const activeBefore = mac.b.activeTabs();
 
-    server.inject("dev-other", [
+    await server.inject("dev-other", [
       { opId: "c1", type: "open", entryId: "E-new", url: "https://remote/" },
       { opId: "c2", type: "open", entryId: "E-match", url: "https://elsewhere/" },
       { opId: "c3", type: "close", entryId: keepEntry },
@@ -338,7 +427,7 @@ describe("catchUp", () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
     await continueHere(mac.deps);
     mac.b.addTab(mac.b.windows[0]!.id, { url: "https://same/" });
-    server.inject("dev-other", [{ opId: "c1", type: "open", entryId: "E1", url: "https://same/" }]);
+    await server.inject("dev-other", [{ opId: "c1", type: "open", entryId: "E1", url: "https://same/" }]);
     const s = await handOver(mac.deps);
     expect(urls(mac.b)).toEqual(["https://same/"]);
     expect(Object.values(s.mappings.tabs).map((m) => m.entryId)).toEqual(["E1"]);
@@ -349,7 +438,7 @@ describe("catchUp", () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
     await continueHere(mac.deps);
     const sentBefore = server.requests.filter((r) => r.path === "operations").length;
-    server.inject("dev-other", [{ opId: "c1", type: "open", entryId: "E1", url: "https://remote/" }]);
+    await server.inject("dev-other", [{ opId: "c1", type: "open", entryId: "E1", url: "https://remote/" }]);
     const s = await handOver(mac.deps);
     const sent = server.requests.filter((r) => r.path === "operations");
     expect(sent.length).toBe(sentBefore + 1);
@@ -388,12 +477,13 @@ describe("review fixes", () => {
   it("drops a batch the server rejects as invalid, unmaps its tabs, and the next run succeeds", async () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
     await continueHere(mac.deps);
-    // A journaled op from an older build with a URL the server cannot parse.
-    const bad = mac.b.addTab(mac.b.windows[0]!.id, { url: "https://example.com/%zz" });
+    // A journaled op from an older build with a URL too long for the server once sealed (urlEnc > 4096).
+    const tooLong = `https://example.com/${"x".repeat(3500)}`;
+    const bad = mac.b.addTab(mac.b.windows[0]!.id, { url: tooLong });
     const entryId = crypto.randomUUID();
     await saveState(mac.b.storage, {
-      pending: [{ op: { opId: crypto.randomUUID(), type: "open", entryId, url: "https://example.com/%zz" }, queuedAt: "" }],
-      mappings: { tabs: { [String(bad.id)]: { entryId, url: "https://example.com/%zz" } }, urlCounts: {} },
+      pending: [{ op: { opId: crypto.randomUUID(), type: "open", entryId, url: tooLong }, queuedAt: "" }],
+      mappings: { tabs: { [String(bad.id)]: { entryId, url: tooLong } }, urlCounts: {} },
     });
 
     const s = await handOver(mac.deps);
@@ -419,12 +509,12 @@ describe("review fixes", () => {
     const s = await handOver(mac.deps);
     const sent = server.requests
       .filter((r) => r.path === "operations")
-      .map((r) => r.body as { baseRevision: number; operations: unknown[] });
+      .map((r) => ({ ...(r.body as { baseRevision: number; operations: unknown[] }), bytes: r.bytes! }));
     expect(sent.length).toBeGreaterThan(1);
     expect(sent.reduce((n, b) => n + b.operations.length, 0)).toBe(620);
     for (const b of sent) {
       expect(b.operations.length).toBeLessThanOrEqual(500);
-      expect(new TextEncoder().encode(JSON.stringify(b)).length).toBeLessThan(64 * 1024);
+      expect(b.bytes).toBeLessThanOrEqual(256 * 1024);
     }
     // Each batch's baseRevision is the revision returned for the previous one.
     let expected = 0;
@@ -435,6 +525,24 @@ describe("review fixes", () => {
     expect(s.lastRevision).toBe(620);
     expect(s.pending).toEqual([]);
     expect(server.openUrls()).toHaveLength(620);
+  });
+
+  it("sealed batches of the longest eligible URLs stay within the 256 KiB body limit", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
+    await continueHere(mac.deps);
+    const win = mac.b.windows[0]!.id;
+    const longest = (i: number) => {
+      const prefix = `https://site.example/${i}/`;
+      return prefix + "x".repeat(2048 - prefix.length);
+    };
+    for (let i = 0; i < 200; i++) mac.b.addTab(win, { url: longest(i), pinned: true });
+
+    const s = await handOver(mac.deps);
+    expect(s.lastError).toBeNull();
+    const sent = server.requests.filter((r) => r.path === "operations" && (r.body as { operations: unknown[] }).operations.length > 0);
+    expect(sent.length).toBeGreaterThan(2);
+    for (const r of sent) expect(r.bytes).toBeLessThanOrEqual(256 * 1024);
+    expect(server.openUrls()).toHaveLength(200);
   });
 
   it("a late stale_owner reply does not drop an ownership acquired since", async () => {

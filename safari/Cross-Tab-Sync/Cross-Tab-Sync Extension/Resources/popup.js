@@ -7,6 +7,26 @@
     remove: (keys) => chrome.storage.local.remove(keys)
   };
 
+  // src/core/crypto.ts
+  var KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+  var encoder = new TextEncoder();
+  var decoder = new TextDecoder("utf-8", { fatal: true });
+  function base64url(bytes) {
+    let s = "";
+    for (const b of bytes) s += String.fromCharCode(b);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function fromBase64url(text) {
+    if (!/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1) throw new Error("Invalid base64url");
+    const s = atob(text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4));
+    return Uint8Array.from(s, (c) => c.charCodeAt(0));
+  }
+  function decodeKey(key) {
+    const bytes = KEY_PATTERN.test(key) ? fromBase64url(key) : null;
+    if (!bytes || bytes.length !== 32 || base64url(bytes) !== key) throw new Error("Invalid encryption key");
+    return bytes;
+  }
+
   // src/core/client.ts
   function normalizeServerUrl(input) {
     let url;
@@ -34,8 +54,17 @@
   // src/core/pairing.ts
   var CODE_LENGTH = 8;
   var EXAMPLE = "https://tabs.example.com#ABCD2345";
+  var SHAPE = "#CODE.KEY (or #CODE for the first browser)";
   function normalizeCode(input) {
     return input.toUpperCase().replace(/[\s-]+/g, "");
+  }
+  function isKey(text) {
+    try {
+      decodeKey(text);
+      return true;
+    } catch {
+      return false;
+    }
   }
   function checkCode(raw) {
     const code = normalizeCode(raw);
@@ -48,18 +77,26 @@
     const text = input.trim();
     if (!text) throw new Error(`Paste the pairing link, e.g. ${EXAMPLE}`);
     if (/^[A-Za-z0-9\s-]+$/.test(text)) {
-      const code = checkCode(text);
+      const code2 = checkCode(text);
       if (!knownServerUrl.trim()) {
         throw new Error(`Paste the whole pairing link (server address and code, e.g. ${EXAMPLE}) or enter the server URL under Advanced`);
       }
-      return { serverUrl: normalizeServerUrl(knownServerUrl), code };
+      return { serverUrl: normalizeServerUrl(knownServerUrl), code: code2 };
     }
     const hash = text.indexOf("#");
     const fragment = hash < 0 ? "" : text.slice(hash + 1);
-    if (!fragment.trim()) throw new Error(`This link has no pairing code. A pairing link ends with #CODE, e.g. ${EXAMPLE}`);
+    if (!fragment.trim()) throw new Error(`This link has no pairing code. A pairing link ends with ${SHAPE}, e.g. ${EXAMPLE}`);
     let base = hash < 0 ? text : text.slice(0, hash);
     if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(base.trim())) base = `https://${base.trim()}`;
-    return { serverUrl: normalizeServerUrl(base), code: checkCode(fragment) };
+    const dot = fragment.indexOf(".");
+    const serverUrl2 = normalizeServerUrl(base);
+    const code = checkCode(dot < 0 ? fragment : fragment.slice(0, dot));
+    if (dot < 0) return { serverUrl: serverUrl2, code };
+    const key = fragment.slice(dot + 1).trim();
+    if (!isKey(key)) {
+      throw new Error(`The encryption key in this link is incomplete or damaged. A pairing link ends with ${SHAPE}; copy the whole link again.`);
+    }
+    return { serverUrl: serverUrl2, code, key };
   }
   function resolvePairingForm(form, knownServerUrl = "") {
     return parsePairingInput(form.link.trim() ? form.link : form.code, form.serverUrl.trim() || knownServerUrl);
@@ -220,6 +257,7 @@
       deviceName: "",
       deviceId: null,
       token: null,
+      syncKey: null,
       pairedAt: null,
       lastRevision: 0,
       generation: null,
@@ -388,6 +426,7 @@
     server.textContent = s.serverUrl;
     server.title = `${s.serverUrl}
 Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from revision ${s.minRevision}` : "");
+    $("encryption-row").hidden = !s.encrypted;
     $("last-activity").textContent = activityLine(s);
     $("last-result-row").hidden = !s.statusText;
     $("last-result").textContent = s.statusText ?? "";
@@ -587,7 +626,7 @@ Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from r
     if (!deviceName.value.trim()) return showError("Enter a name for this browser.");
     showError(null);
     const saved = saveState(storageLocal, {
-      pendingPair: { serverUrl: target.serverUrl, deviceName: deviceName.value, code: target.code, createdAt: Date.now() },
+      pendingPair: { ...target, deviceName: deviceName.value, createdAt: Date.now() },
       lastError: null
     });
     const granted = requestOrigin(target.serverUrl);
@@ -640,7 +679,8 @@ Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from r
     if (!res.ok || !res.pairingCode) return;
     const { link, expiresAt } = res.pairingCode;
     inviteLink.value = link;
-    $("invite-note").textContent = `Valid until ${clock(Date.parse(expiresAt))}, single use. Paste it into Cross-Tab-Sync in the other browser.`;
+    $("invite-note").textContent = "This link contains your encryption key. Share it privately. It is valid 10 minutes.";
+    $("invite-note").title = `Valid until ${clock(Date.parse(expiresAt))}, single use.`;
     $("invite-box").hidden = false;
     inviteLink.focus();
     inviteLink.select();

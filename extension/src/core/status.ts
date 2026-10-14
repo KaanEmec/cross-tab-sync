@@ -27,6 +27,7 @@ export function isRetryable(e: unknown): boolean {
 export function classify(e: unknown, hasPermission: boolean): ErrorKind | null {
   if (!(e instanceof ApiError)) return null;
   if (e.code === "device_revoked") return "device_revoked";
+  if (e.code === "key_mismatch") return "key";
   if (e.code === "unauthorized" && e.status === 401) return "unauthorized";
   if (e.code === "network_error") return hasPermission ? "unreachable" : "permission";
   if (e.status >= 500) return "server";
@@ -54,8 +55,12 @@ export function errorMessage(kind: ErrorKind, serverUrl: string, status = 0): st
       return `Cannot reach ${hostOf(serverUrl)}. Check the connection or the server; changes are kept and retried.`;
     case "server":
       return `The server failed${status ? ` (HTTP ${status})` : ""}. Changes are kept and retried.`;
+    case "key":
+      return KEY_MISMATCH_MESSAGE;
   }
 }
+
+export const KEY_MISMATCH_MESSAGE = "Different encryption key. Disconnect and pair again with an invite link.";
 
 /** Local wall-clock time as HH:MM. */
 export function clock(ms: number): string {

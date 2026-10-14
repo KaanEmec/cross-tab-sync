@@ -1,4 +1,8 @@
-// Typed client for the endpoints in docs/PROTOCOL.md. No logging: requests carry URLs and tokens.
+// Typed client for the endpoints in docs/PROTOCOL.md (v2). No logging: requests carry tokens.
+// URLs are end-to-end encrypted here, at the HTTP boundary: callers and the rest of the core see
+// plaintext `url` fields, the wire carries only `urlKey`/`urlEnc` (core/crypto.ts).
+
+import { KeyMismatchError, type Cipher, type UrlFields } from "./crypto.js";
 
 export type BrowserKind = "safari" | "brave";
 
@@ -30,6 +34,14 @@ export type Operation =
   | { opId: string; type: "navigate"; entryId: string; url: string }
   | { opId: string; type: "close"; entryId: string }
   | { opId: string; type: "update"; entryId: string; pinned?: boolean; position?: number };
+
+/** Operations and entries as they travel: the URL sealed into `urlKey`/`urlEnc`. */
+type Sealed<T> = T extends { url: string } ? Omit<T, "url"> & UrlFields : T;
+export type WireOperation = Sealed<Operation>;
+export type WireEntry = Sealed<Entry>;
+
+export type WireLoggedOperation = Omit<LoggedOperation, "op"> & { op: WireOperation };
+type WireSession = Omit<Session, "entries"> & { entries: WireEntry[] };
 
 /** `forked` only in `merge` results: a navigate on a moved entry opened a fresh entry (`entryId`). */
 export type OpStatus = "applied" | "coalesced" | "ignored" | "forked";
@@ -95,14 +107,17 @@ export interface Device {
   revokedAt?: string;
 }
 
-/** `POST /v1/pairing-codes`. `link` is the server URL with the code as fragment (absent on older servers). */
+/** `POST /v2/pairing-codes`. `link` is the server URL with the code as fragment (absent on older servers). */
 export interface PairingCode {
   code: string;
   expiresAt: string;
   link?: string;
 }
 
-/** Error codes from PROTOCOL.md plus `network_error` (no HTTP response) and `http_<status>`. */
+/**
+ * Error codes from PROTOCOL.md plus client-only ones: `network_error` (no HTTP response),
+ * `http_<status>`, and `key_mismatch` (a URL could not be decrypted: another key, or no key).
+ */
 export type ErrorCode =
   | "invalid_request"
   | "invalid_code"
@@ -116,6 +131,7 @@ export type ErrorCode =
   | "payload_too_large"
   | "internal"
   | "network_error"
+  | "key_mismatch"
   | (string & {});
 
 export class ApiError extends Error {
@@ -145,6 +161,8 @@ export interface ClientOptions {
   token?: string | null;
   fetch?: FetchLike;
   timeoutMs?: number;
+  /** Seals and opens URLs. Absent before pairing: only calls that carry no URLs work then. */
+  cipher?: Cipher;
 }
 
 /**
@@ -182,77 +200,143 @@ export class ApiClient {
   private readonly token: string | null;
   private readonly fetchImpl: FetchLike;
   private readonly timeoutMs: number;
+  private readonly cipher: Cipher | null;
 
   constructor(opts: ClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.token = opts.token ?? null;
     this.fetchImpl = opts.fetch ?? ((input, init) => fetch(input, init));
     this.timeoutMs = opts.timeoutMs ?? 15_000;
+    this.cipher = opts.cipher ?? null;
   }
 
   /** `name` in the response is the stored name, suffixed when another device uses it (absent on older servers). */
   pair(body: { code: string; name: string; browser: BrowserKind }): Promise<{ deviceId: string; token: string; name?: string }> {
-    return this.request("POST", "/v1/pair", body, false);
+    return this.request("POST", "/v2/pair", body, false);
   }
 
   createPairingCode(): Promise<PairingCode> {
-    return this.request("POST", "/v1/pairing-codes");
+    return this.request("POST", "/v2/pairing-codes");
   }
 
   /** Rename this device (self only); the response carries the stored, possibly suffixed, name. */
   renameDevice(id: string, name: string): Promise<Device> {
-    return this.request("PATCH", `/v1/devices/${encodeURIComponent(id)}`, { name });
+    return this.request("PATCH", `/v2/devices/${encodeURIComponent(id)}`, { name });
   }
 
   async devices(): Promise<Device[]> {
-    const res = await this.request<{ devices: Device[] }>("GET", "/v1/devices");
+    const res = await this.request<{ devices: Device[] }>("GET", "/v2/devices");
     return res.devices;
   }
 
   async deleteDevice(id: string): Promise<void> {
-    await this.request("DELETE", `/v1/devices/${encodeURIComponent(id)}`);
+    await this.request("DELETE", `/v2/devices/${encodeURIComponent(id)}`);
   }
 
-  session(): Promise<Session> {
-    return this.request("GET", "/v1/session");
+  async session(): Promise<Session> {
+    return this.openSession(await this.request<WireSession>("GET", "/v2/session"));
   }
 
-  changes(since: number): Promise<ChangesResponse> {
-    return this.request("GET", `/v1/session/changes?since=${encodeURIComponent(String(since))}`);
+  /** The session revision only, without decrypting entries (pairing checks whether the session is empty). */
+  async sessionRevision(): Promise<number> {
+    return (await this.request<{ revision: number }>("GET", "/v2/session")).revision;
   }
 
-  acquire(force: boolean): Promise<{ generation: number; session: Session }> {
-    return this.request("POST", "/v1/session/acquire", { force });
+  async changes(since: number): Promise<ChangesResponse> {
+    const res = await this.request<Omit<ChangesResponse, "operations"> & { operations: WireLoggedOperation[] }>("GET", `/v2/session/changes?since=${encodeURIComponent(String(since))}`);
+    return { ...res, operations: await this.openLogged(res.operations) };
+  }
+
+  async acquire(force: boolean): Promise<{ generation: number; session: Session }> {
+    const res = await this.request<{ generation: number; session: WireSession }>("POST", "/v2/session/acquire", { force });
+    return { ...res, session: await this.openSession(res.session) };
   }
 
   async release(generation: number): Promise<void> {
-    await this.request("POST", "/v1/session/release", { generation });
+    await this.request("POST", "/v2/session/release", { generation });
   }
 
   async heartbeat(generation: number): Promise<void> {
-    await this.request("POST", "/v1/session/heartbeat", { generation });
+    await this.request("POST", "/v2/session/heartbeat", { generation });
   }
 
-  operations(body: { generation: number; baseRevision: number; operations: Operation[] }): Promise<OperationsResponse> {
-    return this.request("POST", "/v1/session/operations", body);
+  async operations(body: { generation: number; baseRevision: number; operations: Operation[] }): Promise<OperationsResponse> {
+    const sealed = { ...body, operations: await this.sealAll(body.operations) };
+    type Wire = Omit<OperationsResponse, "catchUp"> & { catchUp?: { operations: WireLoggedOperation[] } };
+    const { catchUp, ...res } = await this.request<Wire>("POST", "/v2/session/operations", sealed);
+    return catchUp ? { ...res, catchUp: { operations: await this.openLogged(catchUp.operations) } } : res;
   }
 
-  merge(operations: MergeOperation[]): Promise<BatchResponse> {
-    return this.request("POST", "/v1/session/merge", { operations });
+  async merge(operations: MergeOperation[]): Promise<BatchResponse> {
+    return this.request("POST", "/v2/session/merge", { operations: await this.sealAll(operations) });
   }
 
   /** Diagnostics trace lines (core/diag.ts); the server accepts them only with CTS_DEBUG (else 404). */
   async postDiag(lines: string[]): Promise<void> {
-    await this.request("POST", "/v1/diag", { lines });
+    await this.request("POST", "/v2/diag", { lines });
   }
 
   async snapshots(): Promise<Snapshot[]> {
-    const res = await this.request<{ snapshots: Snapshot[] }>("GET", "/v1/snapshots");
+    const res = await this.request<{ snapshots: Snapshot[] }>("GET", "/v2/snapshots");
     return res.snapshots;
   }
 
   restoreSnapshot(id: number, generation: number): Promise<BatchResponse> {
-    return this.request("POST", `/v1/snapshots/${encodeURIComponent(String(id))}/restore`, { generation });
+    return this.request("POST", `/v2/snapshots/${encodeURIComponent(String(id))}/restore`, { generation });
+  }
+
+  private requireCipher(): Cipher {
+    if (!this.cipher) throw new ApiError(0, "key_mismatch", "This device has no encryption key");
+    return this.cipher;
+  }
+
+  /** Seal the URL of every `open`/`navigate`; other fields (e.g. `baseRevision`) pass through. */
+  private sealAll<T extends Operation>(ops: T[]): Promise<Sealed<T>[]> {
+    return Promise.all(
+      ops.map(async (op) => {
+        if (!("url" in op)) return op as Sealed<T>;
+        const { url, ...rest } = op;
+        return { ...rest, ...(await this.sealUrl(url)) } as Sealed<T>;
+      }),
+    );
+  }
+
+  /** Sealing fails only for a missing or malformed key: nothing is sent. */
+  private async sealUrl(url: string): Promise<UrlFields> {
+    try {
+      return await this.requireCipher().seal(url);
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw new ApiError(0, "key_mismatch", "The encryption key is not valid");
+    }
+  }
+
+  /** A decryption failure is `key_mismatch` (status 200: the server answered); nothing is applied. */
+  private async openUrl(fields: UrlFields): Promise<string> {
+    try {
+      return await this.requireCipher().open(fields);
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      const why = e instanceof KeyMismatchError ? e.message : "The encryption key is not valid";
+      throw new ApiError(200, "key_mismatch", why);
+    }
+  }
+
+  private openOp(op: WireOperation): Promise<Operation> {
+    if (!("urlKey" in op)) return Promise.resolve(op);
+    const { urlKey, urlEnc, ...rest } = op;
+    return this.openUrl({ urlKey, urlEnc }).then((url) => ({ ...rest, url }) as Operation);
+  }
+
+  private openLogged(items: WireLoggedOperation[]): Promise<LoggedOperation[]> {
+    return Promise.all(items.map(async (l) => ({ ...l, op: await this.openOp(l.op) })));
+  }
+
+  private async openSession(s: WireSession): Promise<Session> {
+    const entries = await Promise.all(
+      s.entries.map(async ({ urlKey, urlEnc, ...rest }) => ({ ...rest, url: await this.openUrl({ urlKey, urlEnc }) })),
+    );
+    return { ...s, entries };
   }
 
   private async request<T>(method: string, path: string, body?: unknown, auth = true): Promise<T> {

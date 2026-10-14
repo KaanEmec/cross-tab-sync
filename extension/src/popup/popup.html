@@ -89,11 +89,12 @@
     <form id="pair-view" class="pair" novalidate hidden>
       <label class="field">
         <span class="field-label">Pairing link</span>
-        <input id="pair-link" type="text" placeholder="https://your-server#CODE" autocomplete="off" spellcheck="false"
+        <input id="pair-link" type="text" placeholder="https://your-server#CODE.KEY" autocomplete="off" spellcheck="false"
           autocapitalize="off" />
       </label>
-      <p id="pair-target" class="hint">Get one from <b>Invite another browser</b> on a paired browser, or run
-        <code>cross-tab-sync pair-code</code> on the server.</p>
+      <p id="pair-target" class="hint">Get one from <b>Invite another browser</b> on a paired browser; it ends
+        with <code>#CODE.KEY</code>. For the first browser only, run <code>cross-tab-sync pair-code</code> on the
+        server.</p>
       <label class="field">
         <span class="field-label">This browser's name</span>
         <input id="device-name" type="text" maxlength="64" />
@@ -204,6 +205,10 @@
             <div class="setting">
               <span class="setting-label">Server</span>
               <span id="self-server" class="setting-value"></span>
+            </div>
+            <div id="encryption-row" class="setting" hidden>
+              <span class="setting-label">Encryption</span>
+              <span class="setting-value" title="Tab URLs are encrypted in this browser; the server cannot read them.">on</span>
             </div>
             <div class="setting">
               <span class="setting-label">Last activity</span>

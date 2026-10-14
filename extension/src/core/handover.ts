@@ -5,6 +5,7 @@
 import { applyRemote, captureTabs, currentMappings } from "./apply.js";
 import { materialize } from "./materialize.js";
 import { ApiError, normalizeServerUrl, type Owner } from "./client.js";
+import { generateKey } from "./crypto.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 import { pairingLink } from "./pairing.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
@@ -105,9 +106,18 @@ export async function continueHere(deps: Deps): Promise<State> {
   }
 }
 
+/** A keyless link was used against a session that already has (encrypted) history. */
+export const KEY_REQUIRED_MESSAGE =
+  "This server already holds encrypted tabs. Pair with an invite link from a browser that is already paired.";
+
+/**
+ * Pair with a code. `key` comes from an invite link (`#CODE.KEY`). Without one, this browser may
+ * only start an empty session (revision 0), for which it generates the key; otherwise it revokes
+ * itself again and asks for an invite link.
+ */
 export async function pair(
   deps: Deps,
-  input: { serverUrl: string; deviceName: string; code: string },
+  input: { serverUrl: string; deviceName: string; code: string; key?: string },
 ): Promise<State> {
   const store = await Store.open(deps);
   try {
@@ -118,6 +128,7 @@ export async function pair(
     if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
     if (!code) throw new Error("Pairing code is required");
     const res = await deps.api({ baseUrl: serverUrl, token: null }).pair({ code, name: deviceName, browser: deps.browser });
+    const syncKey = input.key || (await keyForFirstBrowser(store, deps, serverUrl, res));
     // The server suffixes the name when another active device uses it ("Brave on macOS 2").
     const name = res.name ?? deviceName;
     const renamed = name !== deviceName ? ` as "${name}" (another device is named "${deviceName}")` : "";
@@ -127,6 +138,7 @@ export async function pair(
       deviceName: name,
       deviceId: res.deviceId,
       token: res.token,
+      syncKey,
       pairedAt: nowIso(deps),
       mappings: emptyMappings(),
       ...succeeded(deps),
@@ -137,6 +149,27 @@ export async function pair(
   } catch (e) {
     return fail(store, e);
   }
+}
+
+/**
+ * Keyless pairing: a new key for an empty session. A session with history was encrypted with a key
+ * this browser cannot know: the fresh device is revoked again (best effort) and the error has its
+ * own class. A failed check also revokes, since the device would have no key.
+ */
+async function keyForFirstBrowser(store: Store, deps: Deps, baseUrl: string, paired: { deviceId: string; token: string }): Promise<string> {
+  const api = deps.api({ baseUrl, token: paired.token });
+  const revoke = () => api.deleteDevice(paired.deviceId).catch(() => undefined);
+  let revision: number;
+  try {
+    revision = await api.sessionRevision();
+  } catch (e) {
+    await revoke();
+    throw e;
+  }
+  if (revision === 0) return generateKey();
+  await revoke();
+  await store.set({ ...clearedCredentials(), errorKind: "key", statusText: null });
+  throw new Error(KEY_REQUIRED_MESSAGE);
 }
 
 /**
@@ -152,13 +185,17 @@ export async function pairFromPending(deps: Deps, now = Date.now()): Promise<Sta
   return pair(deps, pending);
 }
 
-/** A single-use code for another browser, with its pairing link (built locally for older servers). */
+/**
+ * A single-use code for another browser, with its invite link: the server's link (built locally
+ * for older servers) plus `.<key>`. The only place the key is shown.
+ */
 export async function createPairingCode(deps: Deps): Promise<{ code: string; expiresAt: string; link: string }> {
   const store = await Store.open(deps);
   try {
     requirePaired(store.s);
     const res = await apiFor(deps, store.s).createPairingCode();
-    return { code: res.code, expiresAt: res.expiresAt, link: res.link ?? pairingLink(store.s.serverUrl, res.code) };
+    const link = res.link ?? pairingLink(store.s.serverUrl, res.code);
+    return { code: res.code, expiresAt: res.expiresAt, link: store.s.syncKey ? `${link}.${store.s.syncKey}` : link };
   } catch (e) {
     return fail(store, e);
   }

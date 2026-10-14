@@ -1,6 +1,6 @@
 // Diagnostics trace readable outside the browser. Off unless enabled (by default: the server is a
 // loopback address, i.e. local development). When on, each line goes to the console, in Safari to
-// the native host (os_log, "CTS-DIAG:" prefix), and to the server's `POST /v1/diag` (logged only
+// the native host (os_log, "CTS-DIAG:" prefix), and to the server's `POST /v2/diag` (logged only
 // with CTS_DEBUG=1; batched about every second and after each queued task). Never pass URLs or tokens:
 // event kinds, tab ids, entry id prefixes, op types, run names, status codes and error messages
 // only. Anything that looks like a URL is masked anyway.
@@ -9,7 +9,7 @@ import type { KeyValueStorage } from "../adapter/types.js";
 
 let enabled = false;
 
-/** Lines per `POST /v1/diag` (the server accepts 200 of 300 characters, bodies up to 64 KiB). */
+/** Lines per `POST /v2/diag` (the server accepts 200 of 300 characters, bodies up to 64 KiB). */
 const POST_LINES = 100;
 const LINE_CHARS = 300;
 /** Lines kept while the server cannot be reached; the oldest are dropped. */

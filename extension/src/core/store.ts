@@ -15,6 +15,7 @@ export type Api = Pick<
   | "renameDevice"
   | "deleteDevice"
   | "session"
+  | "sessionRevision"
   | "changes"
   | "acquire"
   | "release"
@@ -28,7 +29,8 @@ export type Api = Pick<
 
 export interface Deps {
   adapter: BrowserAdapter;
-  api: (cfg: { baseUrl: string; token: string | null }) => Api;
+  /** `key`: the encryption root key; without it only calls that carry no URLs work (pairing). */
+  api: (cfg: { baseUrl: string; token: string | null; key?: string | null }) => Api;
   browser: BrowserKind;
   now?: () => Date;
   newId?: () => string;
@@ -57,7 +59,7 @@ export const nowMs = (deps: Deps) => nowDate(deps).getTime();
 export const idGen = (deps: Deps) => deps.newId ?? newOpId;
 
 export function apiFor(deps: Deps, s: State): Api {
-  return deps.api({ baseUrl: s.serverUrl, token: s.token });
+  return deps.api({ baseUrl: s.serverUrl, token: s.token, key: s.syncKey });
 }
 
 export function requirePaired(s: State): void {
@@ -127,8 +129,8 @@ export async function fail(store: Store, e: unknown, sentGeneration?: number | n
       errorKind: kind,
       lastError: message,
     });
-  } else if (e instanceof ApiError && e.status > 0) {
-    // The server answered: reachable, and retrying the same request would fail the same way.
+  } else if (e instanceof ApiError && (e.status > 0 || kind === "key")) {
+    // The server answered (or no key: no request): retrying the same request would fail the same way.
     await store.set({ online: true, nextRetryAt: null, retryAttempts: 0, errorKind: kind, lastError: message ?? e.message });
   } else {
     // A local precondition (e.g. not the owner): the backoff state is left as it is.

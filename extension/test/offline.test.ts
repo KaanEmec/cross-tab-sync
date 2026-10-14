@@ -71,7 +71,7 @@ describe("follower journal through merge", () => {
     const mac = await follower("Mac Safari");
     const a = entryOf("https://a/");
     mac.b.userNavigate(mac.tab("https://a/"), "https://a/mac");
-    for (let i = 0; i < 40; i++) mac.b.userOpenTab(mac.win, long(i)); // pushes the next op into a later batch
+    for (let i = 0; i < 100; i++) mac.b.userOpenTab(mac.win, long(i)); // pushes the next op into a later batch
     await mac.settle();
     const pinOp = { opId: crypto.randomUUID(), type: "update" as const, entryId: a, pinned: true };
     const s0 = await mac.state();
@@ -164,10 +164,10 @@ describe("offline and reconnect", () => {
     const b = entryOf("https://b/");
     server.unreachable = true;
     await mac.quiet();
-    for (let i = 0; i < 40; i++) mac.b.userOpenTab(mac.win, long(i));
+    for (let i = 0; i < 100; i++) mac.b.userOpenTab(mac.win, long(i));
     await mac.settle();
-    expect((await mac.state()).pending).toHaveLength(40);
-    server.inject("dev-x", [{ opId: crypto.randomUUID(), type: "close", entryId: b }]);
+    expect((await mac.state()).pending).toHaveLength(100);
+    await server.inject("dev-x", [{ opId: crypto.randomUUID(), type: "close", entryId: b }]);
     server.historyStart = server.revision; // mac's lastRevision is now outside the history
     server.unreachable = false;
 
@@ -181,7 +181,7 @@ describe("offline and reconnect", () => {
     expect(Object.values(s.detached)).toEqual(["https://b/"]);
     expect(s.pending).toEqual([]);
     expect(s.lastRevision).toBe(server.session().revision - mac.merged().length);
-    expect(server.openUrls()).toHaveLength(41);
+    expect(server.openUrls()).toHaveLength(101);
     expect(server.openUrls()).not.toContain("https://b/");
   });
 });

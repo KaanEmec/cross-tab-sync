@@ -38,6 +38,30 @@ describe("parsePairingInput", () => {
     expect(parsePairingInput(input)).toEqual({ serverUrl, code });
   });
 
+  const KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+  it.each([
+    [`https://tabs.example.com#ABCD2345.${KEY}`, "https://tabs.example.com"],
+    [`https://tabs.example.com/cts/#abcd-2345.${KEY}`, "https://tabs.example.com/cts"],
+    [`  http://127.0.0.1:8080#ABCD2345.${KEY} \n`, "http://127.0.0.1:8080"],
+  ])("invite link with a key %j", (input, serverUrl) => {
+    expect(parsePairingInput(input)).toEqual({ serverUrl, code: "ABCD2345", key: KEY });
+  });
+
+  it.each([
+    [`https://tabs.example.com#ABCD2345.`],
+    [`https://tabs.example.com#ABCD2345.${KEY.slice(0, 42)}`],
+    [`https://tabs.example.com#ABCD2345.${KEY}x`],
+    [`https://tabs.example.com#ABCD2345.${KEY.slice(0, 42)}+`],
+    [`https://tabs.example.com#ABCD2345.${KEY.slice(0, 42)}9`], // not canonical
+  ])("rejects a damaged key %j, naming the #CODE.KEY format", (input) => {
+    expect(() => parsePairingInput(input)).toThrow(/#CODE\.KEY/);
+  });
+
+  it("checks the code before the key", () => {
+    expect(() => parsePairingInput(`https://tabs.example.com#ABC.${KEY}`)).toThrow(/8 letters and digits/);
+  });
+
   it("accepts a bare code when the server is known", () => {
     expect(parsePairingInput(" abcd-2345 ", "https://tabs.example.com/")).toEqual({ serverUrl: "https://tabs.example.com", code: "ABCD2345" });
     expect(() => parsePairingInput("ABCD2345")).toThrow(/whole pairing link/);
@@ -74,6 +98,7 @@ describe("parsePairingInput", () => {
 
   it("builds links and default names", () => {
     expect(pairingLink("https://tabs.example.com", "ABCD2345")).toBe("https://tabs.example.com#ABCD2345");
+    expect(pairingLink("https://tabs.example.com", "ABCD2345", "k".repeat(43))).toBe(`https://tabs.example.com#ABCD2345.${"k".repeat(43)}`);
     expect(normalizeCode("ab cd-23 45")).toBe("ABCD2345");
     expect(defaultDeviceName("brave", "mac")).toBe("Brave on macOS");
     expect(defaultDeviceName("safari", "mac")).toBe("Safari on macOS");
@@ -103,14 +128,20 @@ describe("pairing from a link", () => {
     expect(s?.pairedAt).toEqual(expect.any(String));
     expect(server.requests.find((r) => r.path === "pair")?.body).toEqual({ code: "GOODCODE", name: "Brave on macOS", browser: "brave" });
 
-    // Invite another browser: the link carries the server URL and the new code.
+    // First browser of an empty session: it generated the key.
+    const key = s!.syncKey!;
+    expect(key).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(statusView(s!).encrypted).toBe(true);
+    expect(JSON.stringify(statusView(s!))).not.toContain(key);
+
+    // Invite another browser: the link carries the server URL, the new code and the key.
     const invite = await createPairingCode(mac);
-    expect(invite.link).toBe(`https://sync.example#${invite.code}`);
+    expect(invite.link).toBe(`https://sync.example#${invite.code}.${key}`);
     expect(server.codes.has(invite.code)).toBe(true);
 
     const other = browser();
     const t = await pairWithLink(other, invite.link, "Brave on macOS");
-    expect(t).toMatchObject({ deviceName: "Brave on macOS 2", deviceId: "dev-2" });
+    expect(t).toMatchObject({ deviceName: "Brave on macOS 2", deviceId: "dev-2", syncKey: key });
     expect(t?.statusText).toMatch(/^Paired as "Brave on macOS 2" \(another device is named "Brave on macOS"\)/);
     expect(server.codes.has(invite.code)).toBe(false); // single use
   });
@@ -121,9 +152,10 @@ describe("pairing from a link", () => {
     const api = server.api;
     const noLink: Deps = {
       ...mac,
-      api: (cfg) => ({ ...api(cfg), createPairingCode: async () => ({ code: "ABCD2345", expiresAt: "2026-01-01T00:00:00.000Z" }) }),
+      api: (cfg) => Object.assign(api(cfg), { createPairingCode: async () => ({ code: "ABCD2345", expiresAt: "2026-01-01T00:00:00.000Z" }) }),
     };
-    expect((await createPairingCode(noLink)).link).toBe("https://sync.example#ABCD2345");
+    const key = (await loadState(mac.adapter.storage)).syncKey;
+    expect((await createPairingCode(noLink)).link).toBe(`https://sync.example#ABCD2345.${key}`);
   });
 
   it("renames this device, round trip through the server", async () => {
@@ -295,6 +327,7 @@ describe("hero view model", () => {
     online: true,
     nextRetryAt: null,
     paused: false,
+    encrypted: true,
     summary: "",
     lastError: null,
     errorKind: null,

@@ -6,7 +6,7 @@ import { eligibleTabs } from "../../src/core/eligibility.js";
 import { SESSION_MARKER, SyncEngine, type Scheduler } from "../../src/core/engine.js";
 import { pair, type Deps } from "../../src/core/handover.js";
 import { loadState, saveState, type State } from "../../src/core/state.js";
-import type { FakeServer } from "./fakeServer.js";
+import { TEST_KEY, type FakeServer } from "./fakeServer.js";
 
 export class Clock {
   t = Date.parse("2026-10-13T10:00:00.000Z");
@@ -78,7 +78,8 @@ export async function device(
   const deps: Deps = { adapter: b, api: server.api, browser: name.includes("Safari") ? "safari" : "brave", now: clock.now };
   const code = `DEV${++codeSeq}`.padEnd(8, "0");
   server.codes.add(code);
-  const s = await pair(deps, { serverUrl: "https://sync.example", deviceName: name, code });
+  // Every device shares one encryption key, as if paired from invite links.
+  const s = await pair(deps, { serverUrl: "https://sync.example", deviceName: name, code, key: TEST_KEY });
   const id = s.deviceId!;
   // The browser session is already running (a restart() clears this marker).
   await b.sessionStorage?.set({ [SESSION_MARKER]: clock.t });

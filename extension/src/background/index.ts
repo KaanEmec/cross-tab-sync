@@ -3,6 +3,7 @@
 
 import { createWebExtAdapter } from "../adapter/webext.js";
 import { ApiClient } from "../core/client.js";
+import { cipherFor } from "../core/crypto.js";
 import { diag, refreshDiagnostics } from "../core/diag.js";
 import { SyncEngine } from "../core/engine.js";
 import { createPairingCode, disconnect, pairFromPending, refreshOwner, type Deps } from "../core/handover.js";
@@ -19,7 +20,8 @@ const SYNC_MINUTES = 5;
 const adapter = createWebExtAdapter();
 const deps: Deps = {
   adapter,
-  api: (cfg) => new ApiClient(cfg),
+  // The cipher is derived once per key (cipherFor memoizes); unpaired calls carry no URLs.
+  api: ({ key, ...cfg }) => new ApiClient({ ...cfg, cipher: key ? cipherFor(key) : undefined }),
   browser: __BROWSER__,
 };
 

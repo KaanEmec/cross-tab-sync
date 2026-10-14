@@ -54,7 +54,7 @@ describe("owner run", () => {
 
   it("flushes, then applies catchUp from other devices", async () => {
     const mac = await owner("Mac Safari", ["https://a/"]);
-    server.inject("dev-x", [{ opId: crypto.randomUUID(), type: "open", entryId: crypto.randomUUID(), url: "https://remote/" }]);
+    await server.inject("dev-x", [{ opId: crypto.randomUUID(), type: "open", entryId: crypto.randomUUID(), url: "https://remote/" }]);
     mac.b.userOpenTab(mac.win, "https://mine/");
     await mac.settle();
 
@@ -138,7 +138,7 @@ describe("follower application", () => {
     brave.b.userCloseTab(brave.tab("https://b/"));
     brave.b.userOpenTab(brave.win, "https://d/");
     await brave.settle();
-    server.inject(brave.id, [{ opId: crypto.randomUUID(), type: "update", entryId: entryOf("https://c/"), pinned: true }]);
+    await server.inject(brave.id, [{ opId: crypto.randomUUID(), type: "update", entryId: entryOf("https://c/"), pinned: true }]);
 
     await mac.engine.runNow();
     await mac.settle();
@@ -231,7 +231,7 @@ describe("follower application", () => {
     const activeBefore = mac.b.activeTabs();
     const x = entryOf("https://x/");
     const y = entryOf("https://y/");
-    server.inject("dev-1", [{ opId: crypto.randomUUID(), type: "navigate", entryId: x, url: "https://y/" }]);
+    await server.inject("dev-1", [{ opId: crypto.randomUUID(), type: "navigate", entryId: x, url: "https://y/" }]);
 
     await mac.engine.runNow();
     await mac.settle();

@@ -38,6 +38,8 @@ export interface StatusView {
   online: boolean;
   nextRetryAt: number | null;
   paused: boolean;
+  /** URLs are end-to-end encrypted (an encryption key is stored). The key itself is never in the view. */
+  encrypted: boolean;
   /** "Saved to server", "3 changes waiting (offline, retrying at 10:05)", … (status.syncSummary). */
   summary: string;
   lastError: string | null;
@@ -79,6 +81,7 @@ export function statusView(s: State, now = Date.now()): StatusView {
     online: s.online,
     nextRetryAt: s.nextRetryAt,
     paused: s.paused,
+    encrypted: s.syncKey !== null,
     summary: syncSummary({ ...s, pendingCount }),
     lastError: s.lastError,
     errorKind: s.errorKind,

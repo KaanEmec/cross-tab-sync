@@ -113,6 +113,91 @@
     };
   }
 
+  // src/core/crypto.ts
+  var KeyMismatchError = class extends Error {
+    constructor(message = "This URL was encrypted with a different key") {
+      super(message);
+      this.name = "KeyMismatchError";
+    }
+  };
+  var KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+  var VERSION = 1;
+  var NONCE_BYTES = 12;
+  var TAG_BYTES = 16;
+  var BLOCK = 64;
+  var encoder = new TextEncoder();
+  var decoder = new TextDecoder("utf-8", { fatal: true });
+  function base64url(bytes) {
+    let s = "";
+    for (const b of bytes) s += String.fromCharCode(b);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function fromBase64url(text) {
+    if (!/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1) throw new Error("Invalid base64url");
+    const s = atob(text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4));
+    return Uint8Array.from(s, (c) => c.charCodeAt(0));
+  }
+  function generateKey() {
+    return base64url(crypto.getRandomValues(new Uint8Array(32)));
+  }
+  function decodeKey(key) {
+    const bytes = KEY_PATTERN.test(key) ? fromBase64url(key) : null;
+    if (!bytes || bytes.length !== 32 || base64url(bytes) !== key) throw new Error("Invalid encryption key");
+    return bytes;
+  }
+  function pad(url) {
+    const bytes = encoder.encode(url);
+    if (bytes.length > 65535) throw new Error("URL too long");
+    const out = new Uint8Array(Math.ceil((bytes.length + 2) / BLOCK) * BLOCK);
+    out[0] = bytes.length >> 8;
+    out[1] = bytes.length & 255;
+    out.set(bytes, 2);
+    return out;
+  }
+  async function createCipher(key) {
+    const root = await crypto.subtle.importKey("raw", decodeKey(key), "HKDF", false, ["deriveKey"]);
+    const hkdf = (info) => ({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: encoder.encode(info) });
+    const mac = await crypto.subtle.deriveKey(hkdf("cts-url-mac"), root, { name: "HMAC", hash: "SHA-256", length: 256 }, false, ["sign"]);
+    const enc = await crypto.subtle.deriveKey(hkdf("cts-url-enc"), root, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    return {
+      async seal(url) {
+        const urlKey = base64url(new Uint8Array(await crypto.subtle.sign("HMAC", mac, encoder.encode(url))));
+        const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
+        const params = { name: "AES-GCM", iv: nonce, additionalData: encoder.encode(urlKey) };
+        const sealed = new Uint8Array(await crypto.subtle.encrypt(params, enc, pad(url)));
+        const out = new Uint8Array(1 + NONCE_BYTES + sealed.length);
+        out[0] = VERSION;
+        out.set(nonce, 1);
+        out.set(sealed, 1 + NONCE_BYTES);
+        return { urlKey, urlEnc: base64url(out) };
+      },
+      async open({ urlKey, urlEnc }) {
+        try {
+          const raw = fromBase64url(urlEnc);
+          if (raw.length < 1 + NONCE_BYTES + TAG_BYTES || raw[0] !== VERSION) throw new Error("format");
+          const params = { name: "AES-GCM", iv: raw.slice(1, 1 + NONCE_BYTES), additionalData: encoder.encode(urlKey) };
+          const plain = new Uint8Array(await crypto.subtle.decrypt(params, enc, raw.slice(1 + NONCE_BYTES)));
+          const length = plain[0] << 8 | plain[1];
+          if (plain.length % BLOCK !== 0 || length + 2 > plain.length) throw new Error("length");
+          return decoder.decode(plain.subarray(2, 2 + length));
+        } catch {
+          throw new KeyMismatchError();
+        }
+      }
+    };
+  }
+  var ciphers = /* @__PURE__ */ new Map();
+  function cipherFor(key) {
+    let c = ciphers.get(key);
+    if (!c) {
+      const ready = createCipher(key);
+      ready.catch(() => void 0);
+      c = { seal: async (url) => (await ready).seal(url), open: async (f) => (await ready).open(f) };
+      ciphers.set(key, c);
+    }
+    return c;
+  }
+
   // src/core/client.ts
   var ApiError = class extends Error {
     status;
@@ -158,61 +243,118 @@
     token;
     fetchImpl;
     timeoutMs;
+    cipher;
     constructor(opts) {
       this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
       this.token = opts.token ?? null;
       this.fetchImpl = opts.fetch ?? ((input, init) => fetch(input, init));
       this.timeoutMs = opts.timeoutMs ?? 15e3;
+      this.cipher = opts.cipher ?? null;
     }
     /** `name` in the response is the stored name, suffixed when another device uses it (absent on older servers). */
     pair(body) {
-      return this.request("POST", "/v1/pair", body, false);
+      return this.request("POST", "/v2/pair", body, false);
     }
     createPairingCode() {
-      return this.request("POST", "/v1/pairing-codes");
+      return this.request("POST", "/v2/pairing-codes");
     }
     /** Rename this device (self only); the response carries the stored, possibly suffixed, name. */
     renameDevice(id, name) {
-      return this.request("PATCH", `/v1/devices/${encodeURIComponent(id)}`, { name });
+      return this.request("PATCH", `/v2/devices/${encodeURIComponent(id)}`, { name });
     }
     async devices() {
-      const res = await this.request("GET", "/v1/devices");
+      const res = await this.request("GET", "/v2/devices");
       return res.devices;
     }
     async deleteDevice(id) {
-      await this.request("DELETE", `/v1/devices/${encodeURIComponent(id)}`);
+      await this.request("DELETE", `/v2/devices/${encodeURIComponent(id)}`);
     }
-    session() {
-      return this.request("GET", "/v1/session");
+    async session() {
+      return this.openSession(await this.request("GET", "/v2/session"));
     }
-    changes(since) {
-      return this.request("GET", `/v1/session/changes?since=${encodeURIComponent(String(since))}`);
+    /** The session revision only, without decrypting entries (pairing checks whether the session is empty). */
+    async sessionRevision() {
+      return (await this.request("GET", "/v2/session")).revision;
     }
-    acquire(force) {
-      return this.request("POST", "/v1/session/acquire", { force });
+    async changes(since) {
+      const res = await this.request("GET", `/v2/session/changes?since=${encodeURIComponent(String(since))}`);
+      return { ...res, operations: await this.openLogged(res.operations) };
+    }
+    async acquire(force) {
+      const res = await this.request("POST", "/v2/session/acquire", { force });
+      return { ...res, session: await this.openSession(res.session) };
     }
     async release(generation) {
-      await this.request("POST", "/v1/session/release", { generation });
+      await this.request("POST", "/v2/session/release", { generation });
     }
     async heartbeat(generation) {
-      await this.request("POST", "/v1/session/heartbeat", { generation });
+      await this.request("POST", "/v2/session/heartbeat", { generation });
     }
-    operations(body) {
-      return this.request("POST", "/v1/session/operations", body);
+    async operations(body) {
+      const sealed = { ...body, operations: await this.sealAll(body.operations) };
+      const { catchUp, ...res } = await this.request("POST", "/v2/session/operations", sealed);
+      return catchUp ? { ...res, catchUp: { operations: await this.openLogged(catchUp.operations) } } : res;
     }
-    merge(operations) {
-      return this.request("POST", "/v1/session/merge", { operations });
+    async merge(operations) {
+      return this.request("POST", "/v2/session/merge", { operations: await this.sealAll(operations) });
     }
     /** Diagnostics trace lines (core/diag.ts); the server accepts them only with CTS_DEBUG (else 404). */
     async postDiag(lines) {
-      await this.request("POST", "/v1/diag", { lines });
+      await this.request("POST", "/v2/diag", { lines });
     }
     async snapshots() {
-      const res = await this.request("GET", "/v1/snapshots");
+      const res = await this.request("GET", "/v2/snapshots");
       return res.snapshots;
     }
     restoreSnapshot(id, generation) {
-      return this.request("POST", `/v1/snapshots/${encodeURIComponent(String(id))}/restore`, { generation });
+      return this.request("POST", `/v2/snapshots/${encodeURIComponent(String(id))}/restore`, { generation });
+    }
+    requireCipher() {
+      if (!this.cipher) throw new ApiError(0, "key_mismatch", "This device has no encryption key");
+      return this.cipher;
+    }
+    /** Seal the URL of every `open`/`navigate`; other fields (e.g. `baseRevision`) pass through. */
+    sealAll(ops) {
+      return Promise.all(
+        ops.map(async (op) => {
+          if (!("url" in op)) return op;
+          const { url, ...rest } = op;
+          return { ...rest, ...await this.sealUrl(url) };
+        })
+      );
+    }
+    /** Sealing fails only for a missing or malformed key: nothing is sent. */
+    async sealUrl(url) {
+      try {
+        return await this.requireCipher().seal(url);
+      } catch (e) {
+        if (e instanceof ApiError) throw e;
+        throw new ApiError(0, "key_mismatch", "The encryption key is not valid");
+      }
+    }
+    /** A decryption failure is `key_mismatch` (status 200: the server answered); nothing is applied. */
+    async openUrl(fields) {
+      try {
+        return await this.requireCipher().open(fields);
+      } catch (e) {
+        if (e instanceof ApiError) throw e;
+        const why = e instanceof KeyMismatchError ? e.message : "The encryption key is not valid";
+        throw new ApiError(200, "key_mismatch", why);
+      }
+    }
+    openOp(op) {
+      if (!("urlKey" in op)) return Promise.resolve(op);
+      const { urlKey, urlEnc, ...rest } = op;
+      return this.openUrl({ urlKey, urlEnc }).then((url) => ({ ...rest, url }));
+    }
+    openLogged(items) {
+      return Promise.all(items.map(async (l) => ({ ...l, op: await this.openOp(l.op) })));
+    }
+    async openSession(s) {
+      const entries = await Promise.all(
+        s.entries.map(async ({ urlKey, urlEnc, ...rest }) => ({ ...rest, url: await this.openUrl({ urlKey, urlEnc }) }))
+      );
+      return { ...s, entries };
     }
     async request(method, path, body, auth = true) {
       const headers = { Accept: "application/json" };
@@ -404,14 +546,18 @@
     return new Set(journal.filter((p) => p.op.type === "open").map((p) => p.op.entryId));
   }
   var MAX_BATCH_OPS = 500;
-  var MAX_BATCH_BYTES = 60 * 1024;
-  var encoder = new TextEncoder();
+  var MAX_BATCH_BYTES = 240 * 1024;
+  var encoder2 = new TextEncoder();
+  function wireSize(op) {
+    if (op.type !== "open" && op.type !== "navigate") return encoder2.encode(JSON.stringify(op)).length;
+    return 43 + Math.ceil((encoder2.encode(op.url).length + 2) / 64) * 64 * 4 / 3 + 80;
+  }
   function batches(ops, maxOps = MAX_BATCH_OPS, maxBytes = MAX_BATCH_BYTES) {
     const out = [];
     let current = [];
     let bytes = 0;
     for (const op of ops) {
-      const size = encoder.encode(JSON.stringify(op)).length + 1;
+      const size = wireSize(op) + 1;
       if (current.length > 0 && (current.length >= maxOps || bytes + size > maxBytes)) {
         out.push(current);
         current = [];
@@ -705,7 +851,7 @@
 
   // src/core/eligibility.ts
   var MAX_URL_BYTES = 2048;
-  var encoder2 = new TextEncoder();
+  var encoder3 = new TextEncoder();
   var BAD_ESCAPE = /%(?![0-9A-Fa-f]{2})/;
   function isShareableUrl(url) {
     if (!url) return false;
@@ -718,7 +864,7 @@
     } catch {
       return false;
     }
-    return encoder2.encode(url).length <= MAX_URL_BYTES;
+    return encoder3.encode(url).length <= MAX_URL_BYTES;
   }
   function eligibleTabs(tabs, windows) {
     const normal = new Set(windows.filter((w) => w.type === "normal" && !w.incognito).map((w) => w.id));
@@ -733,6 +879,7 @@
       deviceName: "",
       deviceId: null,
       token: null,
+      syncKey: null,
       pairedAt: null,
       lastRevision: 0,
       generation: null,
@@ -792,6 +939,7 @@
     return {
       deviceId: null,
       token: null,
+      syncKey: null,
       pairedAt: null,
       lastRevision: 0,
       generation: null,
@@ -834,6 +982,7 @@
   function classify(e, hasPermission2) {
     if (!(e instanceof ApiError)) return null;
     if (e.code === "device_revoked") return "device_revoked";
+    if (e.code === "key_mismatch") return "key";
     if (e.code === "unauthorized" && e.status === 401) return "unauthorized";
     if (e.code === "network_error") return hasPermission2 ? "unreachable" : "permission";
     if (e.status >= 500) return "server";
@@ -858,8 +1007,11 @@
         return `Cannot reach ${hostOf(serverUrl2)}. Check the connection or the server; changes are kept and retried.`;
       case "server":
         return `The server failed${status ? ` (HTTP ${status})` : ""}. Changes are kept and retried.`;
+      case "key":
+        return KEY_MISMATCH_MESSAGE;
     }
   }
+  var KEY_MISMATCH_MESSAGE = "Different encryption key. Disconnect and pair again with an invite link.";
   function clock(ms) {
     const d = new Date(ms);
     return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -896,7 +1048,7 @@
   var nowMs = (deps2) => nowDate(deps2).getTime();
   var idGen = (deps2) => deps2.newId ?? newOpId;
   function apiFor(deps2, s) {
-    return deps2.api({ baseUrl: s.serverUrl, token: s.token });
+    return deps2.api({ baseUrl: s.serverUrl, token: s.token, key: s.syncKey });
   }
   function requirePaired(s) {
     if (!isPaired(s)) throw new Error("This device is not paired");
@@ -947,7 +1099,7 @@
         errorKind: kind,
         lastError: message
       });
-    } else if (e instanceof ApiError && e.status > 0) {
+    } else if (e instanceof ApiError && (e.status > 0 || kind === "key")) {
       await store.set({ online: true, nextRetryAt: null, retryAttempts: 0, errorKind: kind, lastError: message ?? e.message });
     } else {
       await store.set({ lastError: message ?? (e instanceof Error ? e.message : String(e)) });
@@ -1368,8 +1520,8 @@
   }
 
   // src/core/pairing.ts
-  function pairingLink(serverUrl2, code) {
-    return `${serverUrl2}#${code}`;
+  function pairingLink(serverUrl2, code, key) {
+    return key ? `${serverUrl2}#${code}.${key}` : `${serverUrl2}#${code}`;
   }
   function browserLabel(browser) {
     if (browser === "safari") return "Safari";
@@ -1629,6 +1781,7 @@
       return fail(store, e, store.s.generation);
     }
   }
+  var KEY_REQUIRED_MESSAGE = "This server already holds encrypted tabs. Pair with an invite link from a browser that is already paired.";
   async function pair(deps2, input) {
     const store = await Store.open(deps2);
     try {
@@ -1639,6 +1792,7 @@
       if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
       if (!code) throw new Error("Pairing code is required");
       const res = await deps2.api({ baseUrl: serverUrl2, token: null }).pair({ code, name: deviceName, browser: deps2.browser });
+      const syncKey = input.key || await keyForFirstBrowser(store, deps2, serverUrl2, res);
       const name = res.name ?? deviceName;
       const renamed = name !== deviceName ? ` as "${name}" (another device is named "${deviceName}")` : "";
       await store.set({
@@ -1647,6 +1801,7 @@
         deviceName: name,
         deviceId: res.deviceId,
         token: res.token,
+        syncKey,
         pairedAt: nowIso(deps2),
         mappings: emptyMappings(),
         ...succeeded(deps2),
@@ -1657,6 +1812,21 @@
     } catch (e) {
       return fail(store, e);
     }
+  }
+  async function keyForFirstBrowser(store, deps2, baseUrl, paired) {
+    const api = deps2.api({ baseUrl, token: paired.token });
+    const revoke = () => api.deleteDevice(paired.deviceId).catch(() => void 0);
+    let revision;
+    try {
+      revision = await api.sessionRevision();
+    } catch (e) {
+      await revoke();
+      throw e;
+    }
+    if (revision === 0) return generateKey();
+    await revoke();
+    await store.set({ ...clearedCredentials(), errorKind: "key", statusText: null });
+    throw new Error(KEY_REQUIRED_MESSAGE);
   }
   async function pairFromPending(deps2, now = Date.now()) {
     const s = await loadState(deps2.adapter.storage);
@@ -1671,7 +1841,8 @@
     try {
       requirePaired(store.s);
       const res = await apiFor(deps2, store.s).createPairingCode();
-      return { code: res.code, expiresAt: res.expiresAt, link: res.link ?? pairingLink(store.s.serverUrl, res.code) };
+      const link = res.link ?? pairingLink(store.s.serverUrl, res.code);
+      return { code: res.code, expiresAt: res.expiresAt, link: store.s.syncKey ? `${link}.${store.s.syncKey}` : link };
     } catch (e) {
       return fail(store, e);
     }
@@ -2231,6 +2402,7 @@
       online: s.online,
       nextRetryAt: s.nextRetryAt,
       paused: s.paused,
+      encrypted: s.syncKey !== null,
       summary: syncSummary({ ...s, pendingCount }),
       lastError: s.lastError,
       errorKind: s.errorKind,
@@ -2247,7 +2419,8 @@
   var adapter = createWebExtAdapter();
   var deps = {
     adapter,
-    api: (cfg) => new ApiClient(cfg),
+    // The cipher is derived once per key (cipherFor memoizes); unpaired calls carry no URLs.
+    api: ({ key, ...cfg }) => new ApiClient({ ...cfg, cipher: key ? cipherFor(key) : void 0 }),
     browser: "safari"
   };
   var engine = new SyncEngine(deps);

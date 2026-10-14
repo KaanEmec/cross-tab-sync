@@ -78,10 +78,20 @@ export function pendingEntryIds(journal: Journal): Set<string> {
 }
 
 export const MAX_BATCH_OPS = 500;
-/** Request bodies are capped at 64 KiB; leave room for the envelope. */
-export const MAX_BATCH_BYTES = 60 * 1024;
+/** Request bodies are capped at 256 KiB; leave room for the envelope. */
+export const MAX_BATCH_BYTES = 240 * 1024;
 
 const encoder = new TextEncoder();
+
+/**
+ * Encoded size of an operation on the wire. The URL travels sealed (PROTOCOL.md "Encryption"):
+ * a 43-character `urlKey` plus the base64url of the padded URL (64-byte blocks), with a margin
+ * for ids, nonce, tag and field names.
+ */
+export function wireSize(op: Operation): number {
+  if (op.type !== "open" && op.type !== "navigate") return encoder.encode(JSON.stringify(op)).length;
+  return 43 + (Math.ceil((encoder.encode(op.url).length + 2) / 64) * 64 * 4) / 3 + 80;
+}
 
 /** Split operations into batches within the server limits, preserving order. */
 export function batches<T extends Operation>(ops: T[], maxOps = MAX_BATCH_OPS, maxBytes = MAX_BATCH_BYTES): T[][] {
@@ -89,7 +99,7 @@ export function batches<T extends Operation>(ops: T[], maxOps = MAX_BATCH_OPS, m
   let current: T[] = [];
   let bytes = 0;
   for (const op of ops) {
-    const size = encoder.encode(JSON.stringify(op)).length + 1;
+    const size = wireSize(op) + 1;
     if (current.length > 0 && (current.length >= maxOps || bytes + size > maxBytes)) {
       out.push(current);
       current = [];

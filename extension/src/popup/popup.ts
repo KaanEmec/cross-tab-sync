@@ -167,6 +167,7 @@ function renderSettings(s: StatusView, blocked: boolean): void {
   const server = $("self-server");
   server.textContent = s.serverUrl;
   server.title = `${s.serverUrl}\nRevision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from revision ${s.minRevision}` : "");
+  $("encryption-row").hidden = !s.encrypted;
   $("last-activity").textContent = activityLine(s);
   $("last-result-row").hidden = !s.statusText;
   $("last-result").textContent = s.statusText ?? "";
@@ -399,7 +400,7 @@ pairView.addEventListener("submit", (ev) => {
   // Save the form first (the prompt may close this popup; the worker then pairs on
   // permissions.onAdded), then request permission synchronously inside the user gesture.
   const saved = saveState(storageLocal, {
-    pendingPair: { serverUrl: target.serverUrl, deviceName: deviceName.value, code: target.code, createdAt: Date.now() },
+    pendingPair: { ...target, deviceName: deviceName.value, createdAt: Date.now() },
     lastError: null,
   });
   const granted = requestOrigin(target.serverUrl);
@@ -459,7 +460,9 @@ $("invite").addEventListener("click", async () => {
   if (!res.ok || !res.pairingCode) return;
   const { link, expiresAt } = res.pairingCode;
   inviteLink.value = link;
-  $("invite-note").textContent = `Valid until ${clock(Date.parse(expiresAt))}, single use. Paste it into Cross-Tab-Sync in the other browser.`;
+  // The link carries the encryption key (`#CODE.KEY`).
+  $("invite-note").textContent = "This link contains your encryption key. Share it privately. It is valid 10 minutes.";
+  $("invite-note").title = `Valid until ${clock(Date.parse(expiresAt))}, single use.`;
   $("invite-box").hidden = false;
   inviteLink.focus();
   inviteLink.select();

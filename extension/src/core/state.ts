@@ -11,6 +11,11 @@ export interface State {
   deviceName: string;
   deviceId: string | null;
   token: string | null;
+  /**
+   * Root key for end-to-end URL encryption (core/crypto.ts), 43 base64url characters. Stored with
+   * the credentials, shown only inside invite links, cleared with them.
+   */
+  syncKey: string | null;
   /** ISO time this device paired (backfilled from the device list for devices paired before it was kept). */
   pairedAt: string | null;
   /** Last session revision this device applied. */
@@ -88,12 +93,14 @@ export interface State {
 }
 
 /** Error classes the popup explains with an action (see status.ts). */
-export type ErrorKind = "unauthorized" | "device_revoked" | "permission" | "unreachable" | "server";
+export type ErrorKind = "unauthorized" | "device_revoked" | "permission" | "unreachable" | "server" | "key";
 
 export interface PendingPair {
   serverUrl: string;
   deviceName: string;
   code: string;
+  /** Encryption key from the pairing link (`#CODE.KEY`); absent for a keyless link. */
+  key?: string;
   createdAt: number;
 }
 
@@ -106,6 +113,7 @@ export function defaultState(): State {
     deviceName: "",
     deviceId: null,
     token: null,
+    syncKey: null,
     pairedAt: null,
     lastRevision: 0,
     generation: null,
@@ -171,6 +179,7 @@ export function clearedCredentials(): Partial<State> {
   return {
     deviceId: null,
     token: null,
+    syncKey: null,
     pairedAt: null,
     lastRevision: 0,
     generation: null,

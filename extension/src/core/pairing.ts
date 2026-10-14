@@ -1,20 +1,35 @@
-// Pairing links (PROTOCOL.md "Pairing"): the server URL with the code as the fragment, e.g.
-// https://tabs.example.com#ABCD2345. Parsing of what the user pastes into the pairing form. Pure.
+// Pairing links (PROTOCOL.md "Pairing"): the server URL with the code and the encryption key as
+// the fragment, https://tabs.example.com#ABCD2345.<key>; server-made links carry only the code.
+// Parsing of what the user pastes into the pairing form. Pure.
 
 import { normalizeServerUrl, type BrowserKind } from "./client.js";
+import { decodeKey } from "./crypto.js";
 
 export const CODE_LENGTH = 8;
 
 const EXAMPLE = "https://tabs.example.com#ABCD2345";
+const SHAPE = "#CODE.KEY (or #CODE for the first browser)";
 
 export interface PairingTarget {
   serverUrl: string;
   code: string;
+  /** Encryption key carried by an invite link; absent for a keyless link or a bare code. */
+  key?: string;
 }
 
 /** Uppercase and drop spaces and dashes, as the server does. */
 export function normalizeCode(input: string): string {
   return input.toUpperCase().replace(/[\s-]+/g, "");
+}
+
+/** A canonical 43-character base64url key (32 bytes). */
+function isKey(text: string): boolean {
+  try {
+    decodeKey(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Shape check only (8 letters or digits); the server decides whether the code is valid. */
@@ -26,9 +41,9 @@ function checkCode(raw: string): string {
   return code;
 }
 
-/** The link for a code on a server: `https://tabs.example.com#ABCD2345`. */
-export function pairingLink(serverUrl: string, code: string): string {
-  return `${serverUrl}#${code}`;
+/** The link for a code on a server: `https://tabs.example.com#ABCD2345`, plus `.<key>` when given. */
+export function pairingLink(serverUrl: string, code: string, key?: string): string {
+  return key ? `${serverUrl}#${code}.${key}` : `${serverUrl}#${code}`;
 }
 
 /**
@@ -48,10 +63,18 @@ export function parsePairingInput(input: string, knownServerUrl = ""): PairingTa
   }
   const hash = text.indexOf("#");
   const fragment = hash < 0 ? "" : text.slice(hash + 1);
-  if (!fragment.trim()) throw new Error(`This link has no pairing code. A pairing link ends with #CODE, e.g. ${EXAMPLE}`);
+  if (!fragment.trim()) throw new Error(`This link has no pairing code. A pairing link ends with ${SHAPE}, e.g. ${EXAMPLE}`);
   let base = hash < 0 ? text : text.slice(0, hash);
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(base.trim())) base = `https://${base.trim()}`;
-  return { serverUrl: normalizeServerUrl(base), code: checkCode(fragment) };
+  const dot = fragment.indexOf(".");
+  const serverUrl = normalizeServerUrl(base);
+  const code = checkCode(dot < 0 ? fragment : fragment.slice(0, dot));
+  if (dot < 0) return { serverUrl, code };
+  const key = fragment.slice(dot + 1).trim();
+  if (!isKey(key)) {
+    throw new Error(`The encryption key in this link is incomplete or damaged. A pairing link ends with ${SHAPE}; copy the whole link again.`);
+  }
+  return { serverUrl, code, key };
 }
 
 /** The popup form: the link field wins; otherwise the Advanced code with the Advanced or known server URL. */
