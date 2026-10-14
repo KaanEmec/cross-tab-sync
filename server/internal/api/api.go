@@ -18,10 +18,11 @@ import (
 
 // Server holds the handler dependencies.
 type Server struct {
-	store *store.Store
-	cfg   config.Config
-	log   *slog.Logger
-	now   func() time.Time
+	store   *store.Store
+	cfg     config.Config
+	log     *slog.Logger
+	now     func() time.Time
+	limiter *limiter
 }
 
 // New returns the API handler. now may be nil (time.Now).
@@ -29,30 +30,31 @@ func New(st *store.Store, cfg config.Config, log *slog.Logger, now func() time.T
 	if now == nil {
 		now = time.Now
 	}
-	s := &Server{store: st, cfg: cfg, log: log, now: now}
+	s := &Server{store: st, cfg: cfg, log: log, now: now, limiter: newLimiter()}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /healthz", s.healthz)
-	mux.HandleFunc("POST /v2/pair", s.pair)
-	mux.Handle("POST /v2/pairing-codes", s.auth(s.createPairingCode))
-	mux.Handle("GET /v2/devices", s.auth(s.listDevices))
-	mux.Handle("PATCH /v2/devices/{id}", s.auth(s.renameDevice))
-	mux.Handle("DELETE /v2/devices/{id}", s.auth(s.revokeDevice))
-	mux.Handle("GET /v2/session", s.auth(s.getSession))
-	mux.Handle("PUT /v2/session/key", s.auth(s.setKeyCheck))
-	mux.Handle("GET /v2/session/changes", s.auth(s.changes))
-	mux.Handle("POST /v2/session/acquire", s.auth(s.acquire))
-	mux.Handle("POST /v2/session/release", s.auth(s.release))
-	mux.Handle("POST /v2/session/heartbeat", s.auth(s.heartbeat))
-	mux.Handle("POST /v2/session/operations", s.auth(s.operations))
-	mux.Handle("POST /v2/session/merge", s.auth(s.merge))
-	mux.Handle("GET /v2/snapshots", s.auth(s.listSnapshots))
-	mux.Handle("POST /v2/snapshots/{id}/restore", s.auth(s.restore))
+	mux.Handle("POST /v3/sessions", s.rateLimit(s.createSession))
+	mux.Handle("POST /v3/pair", s.rateLimit(s.pair))
+	mux.Handle("POST /v3/pairing-codes", s.auth(s.createPairingCode))
+	mux.Handle("GET /v3/devices", s.auth(s.listDevices))
+	mux.Handle("PATCH /v3/devices/{id}", s.auth(s.renameDevice))
+	mux.Handle("DELETE /v3/devices/{id}", s.auth(s.revokeDevice))
+	mux.Handle("GET /v3/session", s.auth(s.getSession))
+	mux.Handle("GET /v3/session/changes", s.auth(s.changes))
+	mux.Handle("POST /v3/session/acquire", s.auth(s.acquire))
+	mux.Handle("POST /v3/session/release", s.auth(s.release))
+	mux.Handle("POST /v3/session/heartbeat", s.auth(s.heartbeat))
+	mux.Handle("POST /v3/session/operations", s.auth(s.operations))
+	mux.Handle("POST /v3/session/merge", s.auth(s.merge))
+	mux.Handle("GET /v3/snapshots", s.auth(s.listSnapshots))
+	mux.Handle("POST /v3/snapshots/{id}/restore", s.auth(s.restore))
 	if cfg.Debug {
 		// Development aid only; without CTS_DEBUG the path falls through to 404 not_found.
-		mux.Handle("POST /v2/diag", s.auth(s.diag))
+		mux.Handle("POST /v3/diag", s.auth(s.diag))
 	}
-	// Everything else, including the retired /v1 routes, is 404 not_found.
+	// Everything else, including the retired /v1 and /v2 routes, is 404 not_found.
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint", nil)
 	})
@@ -153,7 +155,8 @@ func (s *Server) requireHTTPS(next http.Handler) http.Handler {
 	})
 }
 
-// auth resolves the bearer token and stores the device in the context.
+// auth resolves the bearer token and stores the device in the context. The
+// store resolves the device's session inside each request's transaction.
 func (s *Server) auth(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
@@ -225,8 +228,6 @@ func (s *Server) storeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusUnauthorized, "device_revoked", "this device has been revoked; pair again", nil)
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "not found", nil)
-	case errors.Is(err, store.ErrKeySet):
-		writeError(w, http.StatusConflict, "key_set", "a different key check is already set", nil)
 	case errors.Is(err, store.ErrHistoryExpired):
 		writeError(w, http.StatusGone, "history_expired", "history is not available; fetch the full session", nil)
 	default:

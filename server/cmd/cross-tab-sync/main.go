@@ -1,4 +1,5 @@
-// Command cross-tab-sync runs the Cross-Tab-Sync service and its admin tasks.
+// Command cross-tab-sync runs the Cross-Tab-Sync service. Sessions and
+// invites are created from the extension; there are no admin commands.
 package main
 
 import (
@@ -22,10 +23,6 @@ const usage = `Usage: cross-tab-sync <command>
 
 Commands:
   serve       run the HTTP service
-  pair-code   create a single-use pairing code (valid 10 minutes); prints the
-              pairing link (CTS_PUBLIC_URL#CODE) when CTS_PUBLIC_URL is set.
-              For the first browser only: further browsers are invited from a
-              paired browser's popup, whose link carries the encryption key
 
 Configuration (environment):
   CTS_ADDR                listen address (default :8080)
@@ -34,8 +31,12 @@ Configuration (environment):
   CTS_OWNER_LIVENESS      owner liveness window (default 10m)
   CTS_SNAPSHOT_RETENTION  recovery snapshots kept (default 20)
   CTS_HISTORY_RETENTION   operation and tombstone history kept (default 720h)
-  CTS_PUBLIC_URL          public base URL of the service, e.g. https://tabs.example.com
-                          (default: derived from each request; the CLI prints bare codes)
+  CTS_SESSION_RETENTION   sessions without device activity this long are deleted (default 4320h)
+  CTS_MAX_SESSIONS        sessions on this server, 0 = unlimited (default 0; a personal server sets 1)
+  CTS_MAX_DEVICES         active devices per session (default 10)
+  CTS_CLIENT_IP_HEADER    header carrying the client IP for the rate limit, e.g. CF-Connecting-IP
+                          (default: the last X-Forwarded-For entry, else the connection address)
+  CTS_DEBUG               accept client diagnostics on POST /v3/diag (development only)
 `
 
 func main() {
@@ -60,12 +61,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
-	case "pair-code":
-		if err := pairCode(cfg, stdout, stderr); err != nil {
-			fmt.Fprintf(stderr, "pair-code: %v\n", err)
-			return 1
-		}
-		return 0
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -85,7 +80,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	}
 	defer st.Close()
 
-	// History pruning: once now, then hourly until shutdown. Deferred after
+	// Session and history pruning: once now, then hourly until shutdown. Deferred after
 	// st.Close so the pruner has stopped before the database closes.
 	pruneCtx, stopPruner := context.WithCancel(ctx)
 	pruned := make(chan struct{})
@@ -93,7 +88,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		defer close(pruned)
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
-		st.RunPruner(pruneCtx, ticker.C, cfg.HistoryRetention, time.Now, logger)
+		st.RunPruner(pruneCtx, ticker.C, cfg.HistoryRetention, cfg.SessionRetention, time.Now, logger)
 	}()
 	defer func() {
 		stopPruner()
@@ -127,27 +122,5 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err := <-errc; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
-	return nil
-}
-
-func pairCode(cfg config.Config, stdout, stderr io.Writer) error {
-	ctx := context.Background()
-	st, err := store.Open(ctx, cfg.DBPath)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	code, expires, err := st.CreatePairingCode(ctx, "", time.Now())
-	if err != nil {
-		return err
-	}
-	if cfg.PublicURL != "" {
-		fmt.Fprintln(stdout, api.PairingLink(cfg.PublicURL, code))
-	} else {
-		fmt.Fprintln(stdout, code)
-		fmt.Fprintln(stderr, "set CTS_PUBLIC_URL (e.g. https://tabs.example.com) to print a pairing link to paste instead")
-	}
-	fmt.Fprintf(stderr, "single use, valid until %s\n", expires.Local().Format(time.DateTime))
-	fmt.Fprintln(stderr, "Use this link for the first browser only; invite further browsers from a paired browser's popup (its link carries the encryption key).")
 	return nil
 }

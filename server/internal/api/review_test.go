@@ -13,20 +13,19 @@ func TestRoutesRequireToken(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
 	routes := []struct{ method, path string }{
-		{"POST", "/v2/pairing-codes"},
-		{"GET", "/v2/devices"},
-		{"PATCH", "/v2/devices/00000000-0000-4000-8000-000000000001"},
-		{"DELETE", "/v2/devices/00000000-0000-4000-8000-000000000001"},
-		{"GET", "/v2/session"},
-		{"PUT", "/v2/session/key"},
-		{"GET", "/v2/session/changes?since=0"},
-		{"POST", "/v2/session/acquire"},
-		{"POST", "/v2/session/release"},
-		{"POST", "/v2/session/heartbeat"},
-		{"POST", "/v2/session/operations"},
-		{"POST", "/v2/session/merge"},
-		{"GET", "/v2/snapshots"},
-		{"POST", "/v2/snapshots/1/restore"},
+		{"POST", "/v3/pairing-codes"},
+		{"GET", "/v3/devices"},
+		{"PATCH", "/v3/devices/00000000-0000-4000-8000-000000000001"},
+		{"DELETE", "/v3/devices/00000000-0000-4000-8000-000000000001"},
+		{"GET", "/v3/session"},
+		{"GET", "/v3/session/changes?since=0"},
+		{"POST", "/v3/session/acquire"},
+		{"POST", "/v3/session/release"},
+		{"POST", "/v3/session/heartbeat"},
+		{"POST", "/v3/session/operations"},
+		{"POST", "/v3/session/merge"},
+		{"GET", "/v3/snapshots"},
+		{"POST", "/v3/snapshots/1/restore"},
 	}
 	for _, rt := range routes {
 		t.Run(rt.method+" "+rt.path, func(t *testing.T) {
@@ -44,14 +43,14 @@ func TestRevokeNonOwnerAndSelf(t *testing.T) {
 	a, b, c := e.pair("A"), e.pair("B"), e.pair("C")
 	gen := e.acquire(a, false)
 
-	e.expect(http.StatusNoContent, "DELETE", "/v2/devices/"+b.ID, a.Token, nil, nil)
+	e.expect(http.StatusNoContent, "DELETE", "/v3/devices/"+b.ID, a.Token, nil, nil)
 	if s := e.session(a); s.Owner == nil || s.Owner.DeviceID != a.ID || s.Owner.Generation != gen {
 		t.Fatalf("revoking a non-owner changed ownership: %+v", s.Owner)
 	}
 
-	e.expect(http.StatusNoContent, "DELETE", "/v2/devices/"+c.ID, c.Token, nil, nil)
+	e.expect(http.StatusNoContent, "DELETE", "/v3/devices/"+c.ID, c.Token, nil, nil)
 	var er errorJSON
-	e.expect(http.StatusUnauthorized, "POST", "/v2/pairing-codes", c.Token, nil, &er)
+	e.expect(http.StatusUnauthorized, "POST", "/v3/pairing-codes", c.Token, nil, &er)
 	if er.Error != "device_revoked" {
 		t.Fatalf("self-revoked device: %+v", er)
 	}
@@ -75,24 +74,24 @@ func TestTimestampsHaveMilliseconds(t *testing.T) {
 			} `json:"owner"`
 		} `json:"session"`
 	}
-	e.expect(http.StatusOK, "POST", "/v2/session/acquire", a.Token, nil, &acq)
+	e.expect(http.StatusOK, "POST", "/v3/session/acquire", a.Token, nil, &acq)
 	var pc struct {
 		ExpiresAt string `json:"expiresAt"`
 	}
-	e.expect(http.StatusCreated, "POST", "/v2/pairing-codes", a.Token, nil, &pc)
+	e.expect(http.StatusCreated, "POST", "/v3/pairing-codes", a.Token, nil, &pc)
 	var devs struct {
 		Devices []struct {
 			CreatedAt  string `json:"createdAt"`
 			LastSeenAt string `json:"lastSeenAt"`
 		} `json:"devices"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/devices", a.Token, nil, &devs)
+	e.expect(http.StatusOK, "GET", "/v3/devices", a.Token, nil, &devs)
 	var snaps struct {
 		Snapshots []struct {
 			CreatedAt string `json:"createdAt"`
 		} `json:"snapshots"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/snapshots", a.Token, nil, &snaps)
+	e.expect(http.StatusOK, "GET", "/v3/snapshots", a.Token, nil, &snaps)
 
 	got := map[string]string{
 		"owner.lastSeenAt":   acq.Session.Owner.LastSeenAt,
@@ -119,7 +118,7 @@ func TestPositionBound(t *testing.T) {
 	o := openOp(uid(), "https://a.example/")
 	o["position"] = int64(1 << 53)
 	var er errorJSON
-	e.expect(http.StatusBadRequest, "POST", "/v2/session/operations", a.Token,
+	e.expect(http.StatusBadRequest, "POST", "/v3/session/operations", a.Token,
 		map[string]any{"generation": gen, "baseRevision": 0, "operations": []op{o}}, &er)
 	if er.Error != "invalid_request" {
 		t.Fatalf("%+v", er)
@@ -132,12 +131,12 @@ func TestLogUsesRoutePattern(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
 	a := e.pair("A")
-	e.call("DELETE", "/v2/devices/weird-segment-https:%2F%2Fleak.example", a.Token, nil, nil)
+	e.call("DELETE", "/v3/devices/weird-segment-https:%2F%2Fleak.example", a.Token, nil, nil)
 	logs := e.logs.String()
 	if strings.Contains(logs, "weird-segment") || strings.Contains(logs, "leak.example") {
 		t.Fatalf("log contains client path segment:\n%s", logs)
 	}
-	if !strings.Contains(logs, `"path":"/v2/devices/{id}"`) {
+	if !strings.Contains(logs, `"path":"/v3/devices/{id}"`) {
 		t.Fatalf("log missing route pattern:\n%s", logs)
 	}
 }
@@ -151,7 +150,7 @@ func TestRestoreRetryIsReplay(t *testing.T) {
 	e.ops(a, gen, 0, openOp(e1, "https://a.example/"), openOp(e2, "https://b.example/"))
 	e.ops(a, gen, 2, op{"opId": uid(), "type": "close", "entryId": e2})
 
-	path := "/v2/snapshots/1/restore"
+	path := "/v3/snapshots/1/restore"
 	var first, second opsResp
 	e.expect(http.StatusOK, "POST", path, a.Token, map[string]int64{"generation": gen}, &first)
 	e.expect(http.StatusOK, "POST", path, a.Token, map[string]int64{"generation": gen}, &second)
@@ -166,7 +165,7 @@ func TestRestoreRetryIsReplay(t *testing.T) {
 	var snaps struct {
 		Snapshots []json.RawMessage `json:"snapshots"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/snapshots", a.Token, nil, &snaps)
+	e.expect(http.StatusOK, "GET", "/v3/snapshots", a.Token, nil, &snaps)
 	if len(snaps.Snapshots) != 2 { // the close snapshot + one pre-restore snapshot
 		t.Fatalf("snapshots after retried restore: %d", len(snaps.Snapshots))
 	}
@@ -205,7 +204,7 @@ func TestReplayEdgeCases(t *testing.T) {
 		var s struct {
 			Snapshots []json.RawMessage `json:"snapshots"`
 		}
-		e.expect(http.StatusOK, "GET", "/v2/snapshots", a.Token, nil, &s)
+		e.expect(http.StatusOK, "GET", "/v3/snapshots", a.Token, nil, &s)
 		return len(s.Snapshots)
 	}
 
@@ -259,7 +258,7 @@ func TestOperationsRefreshOwnerLiveness(t *testing.T) {
 	}
 	e.clock.Advance(8 * time.Minute) // 16m since acquire, 8m since operations
 	var er errorJSON
-	e.expect(http.StatusConflict, "POST", "/v2/session/acquire", b.Token, nil, &er)
+	e.expect(http.StatusConflict, "POST", "/v3/session/acquire", b.Token, nil, &er)
 	if er.Error != "owner_active" {
 		t.Fatalf("%+v", er)
 	}

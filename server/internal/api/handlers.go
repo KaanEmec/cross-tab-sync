@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	_ "embed" // root page
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +29,7 @@ type entryJSON struct {
 type sessionJSON struct {
 	Revision    int64        `json:"revision"`
 	MinRevision int64        `json:"minRevision"`
-	KeyCheck    *string      `json:"keyCheck"`
+	KeyCheck    string       `json:"keyCheck"`
 	Owner       *store.Owner `json:"owner"`
 	Entries     []entryJSON  `json:"entries"`
 }
@@ -47,6 +48,19 @@ func results(rs []session.Result) []session.Result {
 		return []session.Result{}
 	}
 	return rs
+}
+
+//go:embed root.html
+var rootPage []byte
+
+// root serves a static page without script: invite links carry the key in
+// their fragment, which a script on this origin could read.
+func (s *Server) root(w http.ResponseWriter, _ *http.Request) {
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+	h.Set("Referrer-Policy", "no-referrer")
+	_, _ = w.Write(rootPage) // the client may have gone away; nothing to do
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -71,6 +85,61 @@ func validLabel(s string, maxRunes int) (string, bool) {
 	return s, true
 }
 
+// deviceLabels validates the name and browser of a new device, writing
+// 400 invalid_request and returning false when either is invalid.
+func deviceLabels(w http.ResponseWriter, name, browser string) (string, string, bool) {
+	name, ok := validLabel(name, session.MaxNameLength)
+	if !ok {
+		invalid(w, fmt.Sprintf("name must be 1..%d printable characters", session.MaxNameLength))
+		return "", "", false
+	}
+	browser, ok = validLabel(browser, 32)
+	if !ok {
+		invalid(w, "browser must be 1..32 printable characters")
+		return "", "", false
+	}
+	return name, browser, true
+}
+
+// paired answers a new device's credentials and records it for the access log.
+func paired(w http.ResponseWriter, r *http.Request, dev store.Device, token string) {
+	if info, ok := r.Context().Value(infoKey).(*reqInfo); ok {
+		info.deviceID = dev.ID
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"deviceId": dev.ID, "token": token, "name": dev.Name})
+}
+
+// createSession starts a session with the caller's key check and the caller
+// as its first device.
+func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		KeyCheck string `json:"keyCheck"`
+		Name     string `json:"name"`
+		Browser  string `json:"browser"`
+	}
+	if !decode(w, r, &req, false) {
+		return
+	}
+	if !session.IsKey(req.KeyCheck) {
+		invalid(w, fmt.Sprintf("keyCheck must be %d base64url characters", session.URLKeyLength))
+		return
+	}
+	name, browser, ok := deviceLabels(w, req.Name, req.Browser)
+	if !ok {
+		return
+	}
+	dev, token, err := s.store.CreateSession(r.Context(), req.KeyCheck, name, browser, s.now(), s.cfg.MaxSessions)
+	if errors.Is(err, store.ErrSessionsClosed) {
+		writeError(w, http.StatusForbidden, "sessions_closed", "this server accepts no new sessions", nil)
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	paired(w, r, dev, token)
+}
+
 func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Code    string `json:"code"`
@@ -80,48 +149,22 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req, false) {
 		return
 	}
-	name, ok := validLabel(req.Name, session.MaxNameLength)
+	name, browser, ok := deviceLabels(w, req.Name, req.Browser)
 	if !ok {
-		invalid(w, fmt.Sprintf("name must be 1..%d printable characters", session.MaxNameLength))
 		return
 	}
-	browser, ok := validLabel(req.Browser, 32)
-	if !ok {
-		invalid(w, "browser must be 1..32 printable characters")
-		return
-	}
-	dev, token, err := s.store.Pair(r.Context(), req.Code, name, browser, s.now())
-	if errors.Is(err, store.ErrInvalidCode) {
+	dev, token, err := s.store.Pair(r.Context(), req.Code, name, browser, s.now(), s.cfg.MaxDevices)
+	switch {
+	case errors.Is(err, store.ErrInvalidCode):
 		writeError(w, http.StatusBadRequest, "invalid_code", "pairing code is invalid, used or expired", nil)
-		return
-	}
-	if err != nil {
+	case errors.Is(err, store.ErrSessionFull):
+		writeError(w, http.StatusForbidden, "session_full",
+			fmt.Sprintf("the session already has %d devices; revoke one first", s.cfg.MaxDevices), nil)
+	case err != nil:
 		s.internal(w, r, err)
-		return
+	default:
+		paired(w, r, dev, token)
 	}
-	if info, ok := r.Context().Value(infoKey).(*reqInfo); ok {
-		info.deviceID = dev.ID
-	}
-	writeJSON(w, http.StatusCreated, map[string]string{"deviceId": dev.ID, "token": token, "name": dev.Name})
-}
-
-// PairingLink is the link a new browser pastes to pair: the server's public
-// base URL with the code as the fragment.
-func PairingLink(base, code string) string {
-	return base + "#" + code
-}
-
-// publicBase is CTS_PUBLIC_URL, or else the scheme (TLS or X-Forwarded-Proto)
-// and Host the request arrived with.
-func (s *Server) publicBase(r *http.Request) string {
-	if s.cfg.PublicURL != "" {
-		return s.cfg.PublicURL
-	}
-	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		scheme = "https"
-	}
-	return scheme + "://" + r.Host
 }
 
 func (s *Server) createPairingCode(w http.ResponseWriter, r *http.Request) {
@@ -130,9 +173,7 @@ func (s *Server) createPairingCode(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"code": code, "expiresAt": store.Timestamp{Time: expires}, "link": PairingLink(s.publicBase(r), code),
-	})
+	writeJSON(w, http.StatusCreated, map[string]any{"code": code, "expiresAt": store.Timestamp{Time: expires}})
 }
 
 type deviceJSON struct {
@@ -155,9 +196,9 @@ func toDeviceJSON(d store.Device, self string) deviceJSON {
 }
 
 func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
-	ds, err := s.store.ListDevices(r.Context(), s.now())
+	ds, err := s.store.ListDevices(r.Context(), device(r).ID, s.now())
 	if err != nil {
-		s.internal(w, r, err)
+		s.storeError(w, r, err)
 		return
 	}
 	self := device(r).ID
@@ -203,32 +244,12 @@ func (s *Server) revokeDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
-	sess, err := s.store.GetSession(r.Context())
+	sess, err := s.store.GetSession(r.Context(), device(r).ID)
 	if err != nil {
-		s.internal(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, toSessionJSON(sess))
-}
-
-// setKeyCheck stores the session's key check once; a different stored value
-// is 409 key_set.
-func (s *Server) setKeyCheck(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		KeyCheck string `json:"keyCheck"`
-	}
-	if !decode(w, r, &req, false) {
-		return
-	}
-	if !session.IsKey(req.KeyCheck) {
-		invalid(w, fmt.Sprintf("keyCheck must be %d base64url characters", session.URLKeyLength))
-		return
-	}
-	if err := s.store.SetKeyCheck(r.Context(), device(r).ID, req.KeyCheck); err != nil {
 		s.storeError(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, toSessionJSON(sess))
 }
 
 func (s *Server) changes(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +258,7 @@ func (s *Server) changes(w http.ResponseWriter, r *http.Request) {
 		invalid(w, "since must be an integer revision")
 		return
 	}
-	cs, err := s.store.Changes(r.Context(), since)
+	cs, err := s.store.Changes(r.Context(), device(r).ID, since)
 	if err != nil {
 		s.storeError(w, r, err)
 		return
@@ -403,9 +424,9 @@ func (s *Server) merge(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
-	snaps, err := s.store.ListSnapshots(r.Context())
+	snaps, err := s.store.ListSnapshots(r.Context(), device(r).ID)
 	if err != nil {
-		s.internal(w, r, err)
+		s.storeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
@@ -429,7 +450,7 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"revision": res.Revision, "results": results(res.Results)})
 }
 
-// Limits for POST /v2/diag.
+// Limits for POST /v3/diag.
 const (
 	maxDiagLines    = 200
 	maxDiagLineRune = 300

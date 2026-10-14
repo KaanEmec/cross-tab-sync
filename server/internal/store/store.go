@@ -1,5 +1,6 @@
-// Package store persists devices, pairing codes, the shared session, the
-// operation log and recovery snapshots in SQLite.
+// Package store persists sessions and, per session, devices, pairing codes,
+// entries, the operation log and recovery snapshots in SQLite. Every query is
+// scoped to the session of the calling device.
 package store
 
 import (
@@ -30,7 +31,8 @@ var (
 	ErrRevoked        = errors.New("device revoked")
 	ErrNotFound       = errors.New("not found")
 	ErrHistoryExpired = errors.New("history expired")
-	ErrKeySet         = errors.New("a different key check is already set")
+	ErrSessionsClosed = errors.New("the server accepts no more sessions")
+	ErrSessionFull    = errors.New("the session has the maximum number of devices")
 )
 
 // Conflict codes carried by ConflictError.
@@ -67,8 +69,7 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 	// SQLite has a single writer; one connection serializes all access in
-	// this process and avoids busy waits. Other processes (the CLI) rely on
-	// busy_timeout.
+	// this process and avoids busy waits.
 	db.SetMaxOpenConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()

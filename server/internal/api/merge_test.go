@@ -23,7 +23,7 @@ func (e *env) merge(d testDevice, ops ...op) mergeResp {
 		ops = []op{}
 	}
 	var r mergeResp
-	e.expect(http.StatusOK, "POST", "/v2/session/merge", d.Token, map[string]any{"operations": ops}, &r)
+	e.expect(http.StatusOK, "POST", "/v3/session/merge", d.Token, map[string]any{"operations": ops}, &r)
 	return r
 }
 
@@ -77,7 +77,7 @@ func TestMergeForkedNavigateKeepsBothURLs(t *testing.T) {
 	var ch struct {
 		Operations []loggedOp `json:"operations"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/session/changes?since=2", a.Token, nil, &ch)
+	e.expect(http.StatusOK, "GET", "/v3/session/changes?since=2", a.Token, nil, &ch)
 	if len(ch.Operations) != 1 {
 		t.Fatalf("changes: %+v", ch)
 	}
@@ -135,9 +135,9 @@ func TestMergeFromNonOwnerWhileOwned(t *testing.T) {
 	}
 
 	// A revoked device cannot merge.
-	e.expect(http.StatusNoContent, "DELETE", "/v2/devices/"+b.ID, a.Token, nil, nil)
+	e.expect(http.StatusNoContent, "DELETE", "/v3/devices/"+b.ID, a.Token, nil, nil)
 	var er errorJSON
-	e.expect(http.StatusUnauthorized, "POST", "/v2/session/merge", b.Token, map[string]any{"operations": []op{}}, &er)
+	e.expect(http.StatusUnauthorized, "POST", "/v3/session/merge", b.Token, map[string]any{"operations": []op{}}, &er)
 	if er.Error != "device_revoked" {
 		t.Fatalf("%+v", er)
 	}
@@ -176,7 +176,7 @@ func TestMergeReplay(t *testing.T) {
 			Reason   string `json:"reason"`
 		} `json:"snapshots"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/snapshots", b.Token, nil, &snaps)
+	e.expect(http.StatusOK, "GET", "/v3/snapshots", b.Token, nil, &snaps)
 	if len(snaps.Snapshots) != 2 { // the owner's navigate + the merge
 		t.Fatalf("snapshots: %+v", snaps)
 	}
@@ -212,7 +212,7 @@ func TestMergeValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var er errorJSON
-			if st := e.call("POST", "/v2/session/merge", b.Token, tt.body, &er); st != tt.status || er.Error != tt.code {
+			if st := e.call("POST", "/v3/session/merge", b.Token, tt.body, &er); st != tt.status || er.Error != tt.code {
 				t.Fatalf("status %d %+v, want %d %s", st, er, tt.status, tt.code)
 			}
 		})
@@ -236,8 +236,8 @@ func TestHistoryRetentionThresholds(t *testing.T) {
 
 	e.clock.Advance(31 * 24 * time.Hour)
 	e.ops(a, gen, 3, openOp(e3, "https://c.example/")) // 4
-	res, err := e.st.Prune(context.Background(), e.clock.Now(), 720*time.Hour)
-	if err != nil || res.MinRevision != 4 || res.Tombstones != 1 {
+	res, err := e.st.Prune(context.Background(), e.clock.Now(), 720*time.Hour, 4320*time.Hour)
+	if err != nil || res.Sessions != 0 || res.Tombstones != 1 {
 		t.Fatalf("prune: %+v %v", res, err)
 	}
 	if got := minRevision(t, e, a); got != 4 {
@@ -249,7 +249,7 @@ func TestHistoryRetentionThresholds(t *testing.T) {
 
 	// changes: since >= minRevision-1 is served, older is 410.
 	var er errorJSON
-	e.expect(http.StatusGone, "GET", "/v2/session/changes?since=2", a.Token, nil, &er)
+	e.expect(http.StatusGone, "GET", "/v3/session/changes?since=2", a.Token, nil, &er)
 	if er.Error != "history_expired" {
 		t.Fatalf("%+v", er)
 	}
@@ -257,7 +257,7 @@ func TestHistoryRetentionThresholds(t *testing.T) {
 		MinRevision int64      `json:"minRevision"`
 		Operations  []loggedOp `json:"operations"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/session/changes?since=3", a.Token, nil, &ch)
+	e.expect(http.StatusOK, "GET", "/v3/session/changes?since=3", a.Token, nil, &ch)
 	if ch.MinRevision != 4 || len(ch.Operations) != 1 || ch.Operations[0].Seq != 4 {
 		t.Fatalf("changes since 3: %+v", ch)
 	}
@@ -268,7 +268,7 @@ func TestHistoryRetentionThresholds(t *testing.T) {
 		fullResync bool
 	}{{2, true}, {3, false}} {
 		var raw map[string]json.RawMessage
-		e.expect(http.StatusOK, "POST", "/v2/session/operations", a.Token,
+		e.expect(http.StatusOK, "POST", "/v3/session/operations", a.Token,
 			map[string]any{"generation": gen, "baseRevision": tt.base, "operations": []op{}}, &raw)
 		_, hasCatchUp := raw["catchUp"]
 		if got := string(raw["fullResync"]) == "true"; got != tt.fullResync || hasCatchUp == tt.fullResync {
@@ -305,7 +305,7 @@ func minRevision(t *testing.T, e *env, d testDevice) int64 {
 	var s struct {
 		MinRevision *int64 `json:"minRevision"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/session", d.Token, nil, &s)
+	e.expect(http.StatusOK, "GET", "/v3/session", d.Token, nil, &s)
 	if s.MinRevision == nil {
 		t.Fatal("GET session has no minRevision")
 	}

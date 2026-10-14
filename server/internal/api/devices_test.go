@@ -1,67 +1,11 @@
 package api
 
 import (
-	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/kaanemec/cross-tab-sync/server/internal/config"
 )
-
-type pairingCodeResp struct {
-	Code      string `json:"code"`
-	ExpiresAt string `json:"expiresAt"`
-	Link      string `json:"link"`
-}
-
-// createCode calls POST /v1/pairing-codes with the given Host and extra headers.
-func (e *env) createCode(d testDevice, host string, headers map[string]string) pairingCodeResp {
-	e.t.Helper()
-	req, err := http.NewRequest("POST", e.srv.URL+"/v2/pairing-codes", nil)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	if host != "" {
-		req.Host = host
-	}
-	req.Header.Set("Authorization", "Bearer "+d.Token)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := e.srv.Client().Do(req)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		e.t.Fatalf("pairing-codes: status %d", resp.StatusCode)
-	}
-	var out pairingCodeResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		e.t.Fatal(err)
-	}
-	return out
-}
-
-type pairResp struct {
-	testDevice
-	Name string `json:"name"`
-}
-
-// pairAs pairs a device with name and returns the response including the stored name.
-func (e *env) pairAs(name string) pairResp {
-	e.t.Helper()
-	code, _, err := e.st.CreatePairingCode(context.Background(), "", e.clock.Now())
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	var r pairResp
-	e.expect(http.StatusCreated, "POST", "/v2/pair", "", map[string]string{"code": code, "name": name, "browser": "brave"}, &r)
-	return r
-}
 
 type deviceResp struct {
 	ID        string  `json:"id"`
@@ -76,48 +20,8 @@ func (e *env) devices(d testDevice) []deviceResp {
 	var r struct {
 		Devices []deviceResp `json:"devices"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/devices", d.Token, nil, &r)
+	e.expect(http.StatusOK, "GET", "/v3/devices", d.Token, nil, &r)
 	return r.Devices
-}
-
-func TestPairingLinkFromRequest(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t, nil)
-	a := e.pair("A")
-	host := strings.TrimPrefix(e.srv.URL, "http://")
-
-	for _, tc := range []struct {
-		name, host string
-		headers    map[string]string
-		wantBase   string
-	}{
-		{"plain http", "", nil, "http://" + host},
-		{"forwarded https", "tabs.example.com", map[string]string{"X-Forwarded-Proto": "https"}, "https://tabs.example.com"},
-		{"forwarded http", "127.0.0.1:8080", map[string]string{"X-Forwarded-Proto": "http"}, "http://127.0.0.1:8080"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := e.createCode(a, tc.host, tc.headers)
-			if len(r.Code) != 8 || r.Link != tc.wantBase+"#"+r.Code {
-				t.Fatalf("link %q for code %q, want %s#%s", r.Link, r.Code, tc.wantBase, r.Code)
-			}
-		})
-	}
-
-	// The link's code pairs a new device.
-	r := e.createCode(a, "", nil)
-	_, code, _ := strings.Cut(r.Link, "#")
-	var d testDevice
-	e.expect(http.StatusCreated, "POST", "/v2/pair", "", map[string]string{"code": code, "name": "B", "browser": "safari"}, &d)
-}
-
-func TestPairingLinkFromPublicURL(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t, func(c *config.Config) { c.PublicURL = "https://tabs.example.com/cts" })
-	a := e.pair("A")
-	r := e.createCode(a, "internal:8080", map[string]string{"X-Forwarded-Proto": "http"})
-	if r.Link != "https://tabs.example.com/cts#"+r.Code {
-		t.Fatalf("link %q", r.Link)
-	}
 }
 
 func TestDuplicateNamesAreSuffixed(t *testing.T) {
@@ -136,7 +40,7 @@ func TestDuplicateNamesAreSuffixed(t *testing.T) {
 	}
 
 	// A revoked device frees its name; the lowest free suffix is used.
-	e.expect(http.StatusNoContent, "DELETE", "/v2/devices/"+b.ID, a.Token, nil, nil)
+	e.expect(http.StatusNoContent, "DELETE", "/v3/devices/"+b.ID, a.Token, nil, nil)
 	if d := e.pairAs("Brave on macOS"); d.Name != "Brave on macOS 2" {
 		t.Fatalf("after revoke: %q", d.Name)
 	}
@@ -150,11 +54,11 @@ func TestDuplicateNamesAreSuffixed(t *testing.T) {
 
 	// Rename: same rule, and renaming to one's own name keeps it.
 	var dev deviceResp
-	e.expect(http.StatusOK, "PATCH", "/v2/devices/"+c.ID, c.Token, map[string]string{"name": "Brave on macOS"}, &dev)
+	e.expect(http.StatusOK, "PATCH", "/v3/devices/"+c.ID, c.Token, map[string]string{"name": "Brave on macOS"}, &dev)
 	if dev.Name != "Brave on macOS 3" || !dev.IsSelf || dev.ID != c.ID {
 		t.Fatalf("rename to taken name: %+v", dev)
 	}
-	e.expect(http.StatusOK, "PATCH", "/v2/devices/"+c.ID, c.Token, map[string]string{"name": "Brave on macOS 3"}, &dev)
+	e.expect(http.StatusOK, "PATCH", "/v3/devices/"+c.ID, c.Token, map[string]string{"name": "Brave on macOS 3"}, &dev)
 	if dev.Name != "Brave on macOS 3" {
 		t.Fatalf("rename to own name: %+v", dev)
 	}
@@ -167,7 +71,7 @@ func TestRenameDevice(t *testing.T) {
 	e.acquire(a, false)
 
 	var dev deviceResp
-	e.expect(http.StatusOK, "PATCH", "/v2/devices/"+a.ID, a.Token, map[string]string{"name": "  Work Mac  "}, &dev)
+	e.expect(http.StatusOK, "PATCH", "/v3/devices/"+a.ID, a.Token, map[string]string{"name": "  Work Mac  "}, &dev)
 	if dev.Name != "Work Mac" || dev.Browser != "brave" || !dev.IsSelf {
 		t.Fatalf("renamed: %+v", dev)
 	}
@@ -181,17 +85,17 @@ func TestRenameDevice(t *testing.T) {
 	}
 
 	var er errorJSON
-	e.expect(http.StatusForbidden, "PATCH", "/v2/devices/"+b.ID, a.Token, map[string]string{"name": "Mine"}, &er)
+	e.expect(http.StatusForbidden, "PATCH", "/v3/devices/"+b.ID, a.Token, map[string]string{"name": "Mine"}, &er)
 	if er.Error != "forbidden" {
 		t.Fatalf("rename other: %+v", er)
 	}
 	for _, bad := range []any{map[string]string{"name": "   "}, map[string]string{"name": strings.Repeat("n", 65)}, map[string]int{"name": 1}} {
-		e.expect(http.StatusBadRequest, "PATCH", "/v2/devices/"+a.ID, a.Token, bad, &er)
+		e.expect(http.StatusBadRequest, "PATCH", "/v3/devices/"+a.ID, a.Token, bad, &er)
 		if er.Error != "invalid_request" {
 			t.Fatalf("rename %v: %+v", bad, er)
 		}
 	}
-	e.expect(http.StatusOK, "PATCH", "/v2/devices/"+a.ID, a.Token, map[string]string{"name": strings.Repeat("n", 64)}, &dev)
+	e.expect(http.StatusOK, "PATCH", "/v3/devices/"+a.ID, a.Token, map[string]string{"name": strings.Repeat("n", 64)}, &dev)
 }
 
 func TestRevokedDevicesListedForSevenDays(t *testing.T) {
@@ -202,7 +106,7 @@ func TestRevokedDevicesListedForSevenDays(t *testing.T) {
 	b := e.pair("B")
 	e.clock.Advance(time.Second)
 	c := e.pair("C")
-	e.expect(http.StatusNoContent, "DELETE", "/v2/devices/"+b.ID, a.Token, nil, nil)
+	e.expect(http.StatusNoContent, "DELETE", "/v3/devices/"+b.ID, a.Token, nil, nil)
 	revokedAt := e.clock.Now()
 
 	ds := e.devices(a)
@@ -226,7 +130,7 @@ func TestRevokedDevicesListedForSevenDays(t *testing.T) {
 	}
 	// A revoked device cannot rename itself.
 	var er errorJSON
-	e.expect(http.StatusUnauthorized, "PATCH", "/v2/devices/"+b.ID, b.Token, map[string]string{"name": "X"}, &er)
+	e.expect(http.StatusUnauthorized, "PATCH", "/v3/devices/"+b.ID, b.Token, map[string]string{"name": "X"}, &er)
 	if er.Error != "device_revoked" {
 		t.Fatalf("%+v", er)
 	}

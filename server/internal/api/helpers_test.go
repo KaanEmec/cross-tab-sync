@@ -58,11 +58,12 @@ func (s *syncBuffer) String() string {
 }
 
 type env struct {
-	t     *testing.T
-	srv   *httptest.Server
-	st    *store.Store
-	clock *clock
-	logs  *syncBuffer
+	t       *testing.T
+	srv     *httptest.Server
+	st      *store.Store
+	clock   *clock
+	logs    *syncBuffer
+	inviter testDevice // the device that started the env's session; see pair
 }
 
 func newEnv(t *testing.T, mutate func(*config.Config)) *env {
@@ -109,6 +110,9 @@ func (e *env) call(method, path, token string, body, out any) int {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	// A fresh client IP per request keeps tests clear of the rate limit.
+	n := ipSeq.Add(1)
+	req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.1, 10.%d.%d.%d", n>>16&255, n>>8&255, n&255))
 	resp, err := e.srv.Client().Do(req)
 	if err != nil {
 		e.t.Fatal(err)
@@ -139,15 +143,54 @@ type testDevice struct {
 	Token string `json:"token"`
 }
 
+var ipSeq atomic.Int64
+
+// testKeyCheck is the key check of sessions started by tests.
+var testKeyCheck = urlKey("test key")
+
+// start creates a new session with the device name as its first device.
+func (e *env) start(name string) testDevice {
+	e.t.Helper()
+	var d testDevice
+	e.expect(http.StatusCreated, "POST", "/v3/sessions", "",
+		map[string]string{"keyCheck": testKeyCheck, "name": name, "browser": "brave"}, &d)
+	return d
+}
+
+// invite returns a fresh pairing code from device by.
+func (e *env) invite(by testDevice) string {
+	e.t.Helper()
+	var pc struct {
+		Code string `json:"code"`
+	}
+	e.expect(http.StatusCreated, "POST", "/v3/pairing-codes", by.Token, nil, &pc)
+	return pc.Code
+}
+
+// pair adds a device to the env's session: the first call starts the
+// session, later ones are invited by that first device.
 func (e *env) pair(name string) testDevice {
 	e.t.Helper()
-	code, _, err := e.st.CreatePairingCode(context.Background(), "", e.clock.Now())
-	if err != nil {
-		e.t.Fatal(err)
+	return e.pairAs(name).testDevice
+}
+
+type pairResp struct {
+	testDevice
+	Name string `json:"name"`
+}
+
+// pairAs is pair returning the stored name too.
+func (e *env) pairAs(name string) pairResp {
+	e.t.Helper()
+	var r pairResp
+	if e.inviter.Token == "" {
+		e.expect(http.StatusCreated, "POST", "/v3/sessions", "",
+			map[string]string{"keyCheck": testKeyCheck, "name": name, "browser": "brave"}, &r)
+		e.inviter = r.testDevice
+		return r
 	}
-	var d testDevice
-	e.expect(http.StatusCreated, "POST", "/v2/pair", "", map[string]string{"code": code, "name": name, "browser": "brave"}, &d)
-	return d
+	e.expect(http.StatusCreated, "POST", "/v3/pair", "", map[string]string{"code": e.invite(e.inviter), "name": name, "browser": "brave"}, &r)
+	return r
 }
 
 type ownerJSON struct {
@@ -249,14 +292,14 @@ func openOp(entryID, url string) op { return urlOp("open", entryID, url) }
 func (e *env) acquire(d testDevice, force bool) int64 {
 	e.t.Helper()
 	var r acquireResp
-	e.expect(http.StatusOK, "POST", "/v2/session/acquire", d.Token, map[string]bool{"force": force}, &r)
+	e.expect(http.StatusOK, "POST", "/v3/session/acquire", d.Token, map[string]bool{"force": force}, &r)
 	return r.Generation
 }
 
 func (e *env) ops(d testDevice, gen, base int64, ops ...op) opsResp {
 	e.t.Helper()
 	var r opsResp
-	e.expect(http.StatusOK, "POST", "/v2/session/operations", d.Token,
+	e.expect(http.StatusOK, "POST", "/v3/session/operations", d.Token,
 		map[string]any{"generation": gen, "baseRevision": base, "operations": ops}, &r)
 	return r
 }
@@ -264,6 +307,6 @@ func (e *env) ops(d testDevice, gen, base int64, ops ...op) opsResp {
 func (e *env) session(d testDevice) sessionResp {
 	e.t.Helper()
 	var s sessionResp
-	e.expect(http.StatusOK, "GET", "/v2/session", d.Token, nil, &s)
+	e.expect(http.StatusOK, "GET", "/v3/session", d.Token, nil, &s)
 	return s
 }

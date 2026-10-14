@@ -47,11 +47,7 @@ func TestMigrationsFreshAndIdempotent(t *testing.T) {
 	}
 
 	now := time.Now()
-	code, _, err := st.CreatePairingCode(ctx, "", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dev, _, err := st.Pair(ctx, code, "Mac", "safari", now)
+	dev, _, err := st.CreateSession(ctx, key("k"), "Mac", "safari", now, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,12 +65,12 @@ func TestMigrationsFreshAndIdempotent(t *testing.T) {
 	if got := countVersions(st); got != len(ms) {
 		t.Fatalf("after restart %d migration rows, want %d", got, len(ms))
 	}
-	ds, err := st.ListDevices(ctx, now)
+	ds, err := st.ListDevices(ctx, id, now)
 	if err != nil || len(ds) != 1 || ds[0].ID != id {
 		t.Fatalf("devices after restart: %+v %v", ds, err)
 	}
-	sess, err := st.GetSession(ctx)
-	if err != nil || sess.Revision != 0 || sess.Owner != nil {
+	sess, err := st.GetSession(ctx, id)
+	if err != nil || sess.Revision != 0 || sess.Owner != nil || sess.KeyCheck != key("k") {
 		t.Fatalf("session after restart: %+v %v", sess, err)
 	}
 }
@@ -104,19 +100,19 @@ func TestRevokedDeviceCannotWrite(t *testing.T) {
 	}
 	defer st.Close()
 	now := time.Now()
-	pair := func(name string) string {
-		t.Helper()
-		code, _, err := st.CreatePairingCode(ctx, "", now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dev, _, err := st.Pair(ctx, code, name, "brave", now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return dev.ID
+	first, _, err := st.CreateSession(ctx, key("k"), "A", "brave", now, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
-	a, b := pair("A"), pair("B")
+	code, _, err := st.CreatePairingCode(ctx, first.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := st.Pair(ctx, code, "B", "brave", now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := first.ID, second.ID
 	gen, _, err := st.Acquire(ctx, a, false, now, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -135,12 +131,17 @@ func TestRevokedDeviceCannotWrite(t *testing.T) {
 	_, checks["restore"] = st.RestoreSnapshot(ctx, a, gen, 1, now, 5)
 	_, checks["merge"] = st.Merge(ctx, a, nil, now, 5)
 	checks["revoke"] = st.RevokeDevice(ctx, a, b, now)
+	_, checks["session"] = st.GetSession(ctx, a)
+	_, checks["changes"] = st.Changes(ctx, a, 0)
+	_, checks["devices"] = st.ListDevices(ctx, a, now)
+	_, checks["rename"] = st.RenameDevice(ctx, a, "X")
+	_, checks["snapshots"] = st.ListSnapshots(ctx, a)
 	for name, err := range checks {
 		if !errors.Is(err, ErrRevoked) {
 			t.Errorf("%s by revoked device: %v, want ErrRevoked", name, err)
 		}
 	}
-	sess, err := st.GetSession(ctx)
+	sess, err := st.GetSession(ctx, b)
 	if err != nil || sess.Owner != nil {
 		t.Fatalf("owner after revocation: %+v %v", sess.Owner, err)
 	}
@@ -159,8 +160,7 @@ func TestTimestampJSON(t *testing.T) {
 func TestMigration0003E2E(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "cts.db")
-	db := legacyDB(t, path)
+	db := legacyDB(t, filepath.Join(t.TempDir(), "cts.db"))
 	migrateTo(t, db, 1,
 		`INSERT INTO devices (id, name, browser, token_hash, created_at, last_seen_at) VALUES ('a', 'A', 'brave', x'01', 1, 1)`,
 		`INSERT INTO devices (id, name, browser, token_hash, created_at, last_seen_at, revoked_at) VALUES ('b', 'B', 'safari', x'02', 1, 1, 5)`,
@@ -172,17 +172,9 @@ func TestMigration0003E2E(t *testing.T) {
 			VALUES (2, 'a', 'operations', 1, 1, '[{"url":"https://a.example/"}]')`,
 		`UPDATE session SET revision = 3, generation = 4, owner_device_id = 'a', owner_last_seen_at = 1`)
 	migrateTo(t, db, 2, `UPDATE session SET min_revision = 2`)
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
 	before := time.Now().UnixMilli()
-	st, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	f := &historyFixture{t: t, st: st}
+	migrateTo(t, db, 3)
+
 	for query, want := range map[string]int{
 		`SELECT COUNT(*) FROM entries`:    0,
 		`SELECT COUNT(*) FROM operations`: 0,
@@ -194,54 +186,46 @@ func TestMigration0003E2E(t *testing.T) {
 		`SELECT COUNT(*) FROM session WHERE revision = 0 AND min_revision = 1 AND generation = 4
 			AND owner_device_id IS NULL AND owner_last_seen_at IS NULL AND key_check IS NULL`: 1,
 	} {
-		if n := f.count(query); n != want {
-			t.Errorf("%s = %d, want %d", query, n, want)
+		var n int
+		if err := db.QueryRowContext(ctx, query).Scan(&n); err != nil || n != want {
+			t.Errorf("%s = %d (%v), want %d", query, n, err, want)
 		}
 	}
+}
 
-	// A browser pairs again; opens with the same urlKey coalesce.
+// Opens with the same urlKey coalesce, and the database itself enforces one
+// open entry per url_key and session.
+func TestOneOpenEntryPerURLKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newHistoryFixture(t)
 	now := time.Now()
-	code, _, err := st.CreatePairingCode(ctx, "", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dev, _, err := st.Pair(ctx, code, "A", "brave", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.SetKeyCheck(ctx, dev.ID, key("k")); err != nil {
-		t.Fatalf("key check after upgrade: %v", err)
-	}
-	if err := st.SetKeyCheck(ctx, dev.ID, key("other")); !errors.Is(err, ErrKeySet) {
-		t.Fatalf("second key check: %v", err)
-	}
-	gen, sess, err := st.Acquire(ctx, dev.ID, false, now, time.Minute)
-	if err != nil || gen != 5 || sess.KeyCheck == nil || *sess.KeyCheck != key("k") {
-		t.Fatalf("acquire after upgrade: generation %d %+v %v", gen, sess, err)
-	}
 	k := key("https://a.example/")
 	ops := []session.Op{
 		{OpID: "00000000-0000-4000-8000-000000000001", Type: session.TypeOpen, EntryID: "10000000-0000-4000-8000-000000000001", URLKey: k, URLEnc: "AAAA"},
 		{OpID: "00000000-0000-4000-8000-000000000002", Type: session.TypeOpen, EntryID: "10000000-0000-4000-8000-000000000002", URLKey: k, URLEnc: "BBBB"},
 	}
-	res, err := st.ApplyOperations(ctx, dev.ID, gen, 0, ops, now, 5)
-	if err != nil || res.Revision != 2 || res.Results[0].Status != session.StatusApplied ||
+	res := f.apply(now, ops...)
+	if res.Revision != 2 || res.Results[0].Status != session.StatusApplied ||
 		res.Results[1].Status != session.StatusCoalesced || res.Results[1].EntryID != ops[0].EntryID {
-		t.Fatalf("opens after upgrade: %+v %v", res, err)
+		t.Fatalf("opens: %+v", res)
 	}
-	sess, err = st.GetSession(ctx)
-	if err != nil || len(sess.Entries) != 1 || sess.Entries[0].URLKey != k || sess.Entries[0].URLEnc != "AAAA" {
-		t.Fatalf("session after upgrade: %+v %v", sess, err)
+	if sess := f.session(); len(sess.Entries) != 1 || sess.Entries[0].URLKey != k || sess.Entries[0].URLEnc != "AAAA" {
+		t.Fatalf("session: %+v", sess)
 	}
-	// The database itself enforces one open entry per url_key.
-	_, err = st.db.ExecContext(ctx, `INSERT INTO entries (id, url_key, url_enc, opened_by, created_revision, updated_revision)
-		VALUES ('dup', ?, 'CCCC', 'x', 3, 3)`, k)
+	_, err := f.st.db.ExecContext(ctx, `INSERT INTO entries (session_id, id, url_key, url_enc, opened_by, created_revision, updated_revision)
+		SELECT session_id, 'dup', ?, 'CCCC', 'x', 3, 3 FROM devices WHERE id = ?`, k, f.dev)
 	if err == nil || !strings.Contains(err.Error(), "UNIQUE") {
 		t.Fatalf("duplicate open url_key inserted: %v", err)
 	}
-	if _, err := st.db.ExecContext(ctx, `INSERT INTO entries (id, url_key, url_enc, opened_by, created_revision, updated_revision, closed_revision)
-		VALUES ('tomb', ?, 'CCCC', 'x', 3, 3, 3)`, k); err != nil {
+	if _, err := f.st.db.ExecContext(ctx, `INSERT INTO entries (session_id, id, url_key, url_enc, opened_by, created_revision, updated_revision, closed_revision)
+		SELECT session_id, 'tomb', ?, 'CCCC', 'x', 3, 3, 3 FROM devices WHERE id = ?`, k, f.dev); err != nil {
 		t.Fatalf("tombstone with the same url_key: %v", err)
+	}
+	// Another session opens the same urlKey and the same entry and op ids.
+	g := newHistoryFixtureIn(t, f.st)
+	if res := g.apply(now, ops...); res.Revision != 2 || res.Results[0].Status != session.StatusApplied || res.Results[0].Replayed {
+		t.Fatalf("same ids in another session: %+v", res)
 	}
 }
 
@@ -267,19 +251,18 @@ func TestSnapshotStoresSealedURLs(t *testing.T) {
 	if fmt.Sprint(items[0]) != fmt.Sprint(want) {
 		t.Fatalf("snapshot entry %v, want %v", items[0], want)
 	}
-	snaps, err := f.st.ListSnapshots(ctx)
+	snaps, err := f.st.ListSnapshots(ctx, f.dev)
 	if err != nil || len(snaps) != 1 {
 		t.Fatalf("snapshots %+v %v", snaps, err)
 	}
 	if _, err := f.st.RestoreSnapshot(ctx, f.dev, f.gen, snaps[0].ID, now, 5); err != nil {
 		t.Fatal(err)
 	}
-	sess, err := f.st.GetSession(ctx)
-	if err != nil || len(sess.Entries) != 1 || sess.Entries[0].URLKey != key("https://a.example/") ||
+	if sess := f.session(); len(sess.Entries) != 1 || sess.Entries[0].URLKey != key("https://a.example/") ||
 		sess.Entries[0].URLEnc != enc("https://a.example/") {
-		t.Fatalf("restored session %+v %v", sess, err)
+		t.Fatalf("restored session %+v", sess)
 	}
-	cs, err := f.st.Changes(ctx, 2)
+	cs, err := f.st.Changes(ctx, f.dev, 2)
 	if err != nil || len(cs.Operations) != 1 || !strings.Contains(string(cs.Operations[0].Op), `"urlEnc":"`+enc("https://a.example/")+`"`) {
 		t.Fatalf("restore op %+v %v", cs, err)
 	}

@@ -33,12 +33,15 @@ func newHistoryFixture(t *testing.T) *historyFixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	return newHistoryFixtureIn(t, st)
+}
+
+// newHistoryFixtureIn starts another session in st.
+func newHistoryFixtureIn(t *testing.T, st *Store) *historyFixture {
+	t.Helper()
+	ctx := context.Background()
 	now := time.Now()
-	code, _, err := st.CreatePairingCode(ctx, "", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dev, _, err := st.Pair(ctx, code, "A", "brave", now)
+	dev, _, err := st.CreateSession(ctx, key("k"), "A", "brave", now, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,6 +50,20 @@ func newHistoryFixture(t *testing.T) *historyFixture {
 		t.Fatal(err)
 	}
 	return &historyFixture{t: t, st: st, dev: dev.ID, gen: gen}
+}
+
+// prune runs a pass that keeps every session.
+func (f *historyFixture) prune(at time.Time, retention time.Duration) (PruneResult, error) {
+	return f.st.Prune(context.Background(), at, retention, 100*365*day)
+}
+
+func (f *historyFixture) session() Session {
+	f.t.Helper()
+	sess, err := f.st.GetSession(context.Background(), f.dev)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return sess
 }
 
 func (f *historyFixture) id() string {
@@ -87,46 +104,45 @@ func TestPruneKeepsOpenEntriesAndAdvancesMinRevision(t *testing.T) {
 	)
 	f.apply(t0.Add(20*day), session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: late, URLKey: key("https://late.example/"), URLEnc: enc("https://late.example/")}) // 4
 
-	if sess, err := f.st.GetSession(ctx); err != nil || sess.MinRevision != 1 {
-		t.Fatalf("before pruning: minRevision %d %v", sess.MinRevision, err)
+	if sess := f.session(); sess.MinRevision != 1 {
+		t.Fatalf("before pruning: minRevision %d", sess.MinRevision)
 	}
 	// Nothing is older than 30 days yet.
-	if res, err := f.st.Prune(ctx, t0.Add(25*day), 30*day); err != nil || res != (PruneResult{MinRevision: 1}) {
+	if res, err := f.prune(t0.Add(25*day), 30*day); err != nil || res != (PruneResult{}) || f.session().MinRevision != 1 {
 		t.Fatalf("early prune: %+v %v", res, err)
 	}
 
-	res, err := f.st.Prune(ctx, t0.Add(31*day), 30*day)
+	res, err := f.prune(t0.Add(31*day), 30*day)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res != (PruneResult{Operations: 4, Tombstones: 1, MinRevision: 4}) {
+	if res != (PruneResult{Operations: 4, Tombstones: 1}) {
 		t.Fatalf("prune: %+v", res)
 	}
-	sess, err := f.st.GetSession(ctx)
-	if err != nil || sess.MinRevision != 4 || sess.Revision != 4 || len(sess.Entries) != 2 {
-		t.Fatalf("session after prune: %+v %v", sess, err)
+	if sess := f.session(); sess.MinRevision != 4 || sess.Revision != 4 || len(sess.Entries) != 2 {
+		t.Fatalf("session after prune: %+v", sess)
 	}
 	if n := f.count(`SELECT COUNT(*) FROM entries`); n != 2 {
 		t.Fatalf("entries rows %d, want the 2 open ones", n)
 	}
-	if _, err := f.st.Changes(ctx, 2); !errors.Is(err, ErrHistoryExpired) {
+	if _, err := f.st.Changes(ctx, f.dev, 2); !errors.Is(err, ErrHistoryExpired) {
 		t.Fatalf("changes since 2: %v", err)
 	}
-	if cs, err := f.st.Changes(ctx, 3); err != nil || cs.MinRevision != 4 || len(cs.Operations) != 1 || cs.Operations[0].Seq != 4 {
+	if cs, err := f.st.Changes(ctx, f.dev, 3); err != nil || cs.MinRevision != 4 || len(cs.Operations) != 1 || cs.Operations[0].Seq != 4 {
 		t.Fatalf("changes since 3: %+v %v", cs, err)
 	}
 
 	// Everything expired: minRevision moves past the revision, and never back.
-	if res, err := f.st.Prune(ctx, t0.Add(60*day), 30*day); err != nil || res.MinRevision != 5 || res.Operations != 1 {
+	if res, err := f.prune(t0.Add(60*day), 30*day); err != nil || f.session().MinRevision != 5 || res.Operations != 1 {
 		t.Fatalf("full prune: %+v %v", res, err)
 	}
-	if res, err := f.st.Prune(ctx, t0, 30*day); err != nil || res.MinRevision != 5 {
-		t.Fatalf("clock moved back: %+v %v", res, err)
+	if _, err := f.prune(t0, 30*day); err != nil || f.session().MinRevision != 5 {
+		t.Fatalf("clock moved back: %v", err)
 	}
-	if sess, err := f.st.GetSession(ctx); err != nil || len(sess.Entries) != 2 {
-		t.Fatalf("open entries must survive: %+v %v", sess, err)
+	if sess := f.session(); len(sess.Entries) != 2 {
+		t.Fatalf("open entries must survive: %+v", sess)
 	}
-	if cs, err := f.st.Changes(ctx, 4); err != nil || len(cs.Operations) != 0 {
+	if cs, err := f.st.Changes(ctx, f.dev, 4); err != nil || len(cs.Operations) != 0 {
 		t.Fatalf("changes at revision: %+v %v", cs, err)
 	}
 }
@@ -141,11 +157,11 @@ func TestPruneKeepsLogContiguous(t *testing.T) {
 	// The clock went backwards: revision 3 looks older than revision 2.
 	f.apply(t0, session.Op{OpID: f.id(), Type: session.TypeOpen, EntryID: f.id(), URLKey: key("https://c.example/"), URLEnc: enc("https://c.example/")}) // 3
 
-	res, err := f.st.Prune(ctx, t0.Add(45*day), 30*day)
-	if err != nil || res.MinRevision != 2 || res.Operations != 1 {
+	res, err := f.prune(t0.Add(45*day), 30*day)
+	if err != nil || f.session().MinRevision != 2 || res.Operations != 1 {
 		t.Fatalf("prune: %+v %v", res, err)
 	}
-	if cs, err := f.st.Changes(ctx, 1); err != nil || len(cs.Operations) != 2 {
+	if cs, err := f.st.Changes(ctx, f.dev, 1); err != nil || len(cs.Operations) != 2 {
 		t.Fatalf("retained log must be contiguous: %+v %v", cs, err)
 	}
 }
@@ -170,7 +186,7 @@ func TestRunPrunerStopsOnCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		f.st.RunPruner(ctx, ticks, 30*day, clock, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		f.st.RunPruner(ctx, ticks, 30*day, 100*365*day, clock, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	}()
 
 	ticks <- t0 // startup pass done, nothing pruned
@@ -246,9 +262,8 @@ func TestMergeFailureRollsBack(t *testing.T) {
 	if _, err := f.st.Merge(ctx, f.dev, ops, now, 5); err == nil {
 		t.Fatal("merge succeeded despite the injected failure")
 	}
-	sess, err := f.st.GetSession(ctx)
-	if err != nil || sess.Revision != 1 || len(sess.Entries) != 1 || sess.Entries[0].URLKey != key("https://a.example/") {
-		t.Fatalf("session after failed merge: %+v %v", sess, err)
+	if sess := f.session(); sess.Revision != 1 || len(sess.Entries) != 1 || sess.Entries[0].URLKey != key("https://a.example/") {
+		t.Fatalf("session after failed merge: %+v", sess)
 	}
 	for query, want := range map[string]int{
 		`SELECT COUNT(*) FROM operations`: 1,

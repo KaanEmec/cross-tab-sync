@@ -3,7 +3,6 @@ package config
 
 import (
 	"fmt"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -17,8 +16,11 @@ type Config struct {
 	OwnerLiveness     time.Duration // CTS_OWNER_LIVENESS
 	SnapshotRetention int           // CTS_SNAPSHOT_RETENTION
 	HistoryRetention  time.Duration // CTS_HISTORY_RETENTION
-	PublicURL         string        // CTS_PUBLIC_URL, e.g. https://tabs.example.com (no trailing slash); "" when unset
-	Debug             bool          // CTS_DEBUG: accept and log client diagnostics (POST /v1/diag); development aid
+	SessionRetention  time.Duration // CTS_SESSION_RETENTION: sessions without device activity this long are deleted
+	MaxSessions       int           // CTS_MAX_SESSIONS: 0 = unlimited
+	MaxDevices        int           // CTS_MAX_DEVICES: active devices per session
+	ClientIPHeader    string        // CTS_CLIENT_IP_HEADER: header carrying the client IP for the rate limit; "" = X-Forwarded-For
+	Debug             bool          // CTS_DEBUG: accept and log client diagnostics (POST /v3/diag); development aid
 }
 
 // Default returns the configuration used when no variables are set.
@@ -29,6 +31,8 @@ func Default() Config {
 		OwnerLiveness:     10 * time.Minute,
 		SnapshotRetention: 20,
 		HistoryRetention:  30 * 24 * time.Hour,
+		SessionRetention:  180 * 24 * time.Hour,
+		MaxDevices:        10,
 	}
 }
 
@@ -85,28 +89,36 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 		c.HistoryRetention = d
 	}
-	if v := getenv("CTS_PUBLIC_URL"); v != "" {
-		u, err := parsePublicURL(v)
+	if v := getenv("CTS_SESSION_RETENTION"); v != "" {
+		d, err := time.ParseDuration(v)
 		if err != nil {
-			return Config{}, fmt.Errorf("CTS_PUBLIC_URL: %w", err)
+			return Config{}, fmt.Errorf("CTS_SESSION_RETENTION: %w", err)
 		}
-		c.PublicURL = u
+		if d <= 0 {
+			return Config{}, fmt.Errorf("CTS_SESSION_RETENTION: must be positive, got %s", d)
+		}
+		c.SessionRetention = d
 	}
+	if v := getenv("CTS_MAX_SESSIONS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("CTS_MAX_SESSIONS: %w", err)
+		}
+		if n < 0 {
+			return Config{}, fmt.Errorf("CTS_MAX_SESSIONS: must be 0 (unlimited) or more, got %d", n)
+		}
+		c.MaxSessions = n
+	}
+	if v := getenv("CTS_MAX_DEVICES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("CTS_MAX_DEVICES: %w", err)
+		}
+		if n < 1 {
+			return Config{}, fmt.Errorf("CTS_MAX_DEVICES: must be at least 1, got %d", n)
+		}
+		c.MaxDevices = n
+	}
+	c.ClientIPHeader = strings.TrimSpace(getenv("CTS_CLIENT_IP_HEADER"))
 	return c, nil
-}
-
-// parsePublicURL accepts an absolute http(s) URL without query or fragment and
-// returns it without a trailing slash.
-func parsePublicURL(v string) (string, error) {
-	u, err := url.Parse(strings.TrimSpace(v))
-	if err != nil {
-		return "", err
-	}
-	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return "", fmt.Errorf("must be an absolute http(s) URL, got %q", v)
-	}
-	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-		return "", fmt.Errorf("must not contain credentials, a query or a fragment, got %q", v)
-	}
-	return strings.TrimRight(u.Scheme+"://"+u.Host+u.EscapedPath(), "/"), nil
 }

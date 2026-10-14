@@ -2,12 +2,10 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,12 +27,12 @@ func TestHealthzAndHTTPSEnforcement(t *testing.T) {
 	}
 
 	var er errorJSON
-	e.expect(http.StatusForbidden, "GET", "/v2/session", "", nil, &er)
+	e.expect(http.StatusForbidden, "GET", "/v3/session", "", nil, &er)
 	if er.Error != "invalid_request" {
 		t.Fatalf("plain http: %+v", er)
 	}
 
-	req, _ := http.NewRequest("GET", e.srv.URL+"/v2/session", nil)
+	req, _ := http.NewRequest("GET", e.srv.URL+"/v3/session", nil)
 	req.Header.Set("X-Forwarded-Proto", "https")
 	resp, err := e.srv.Client().Do(req)
 	if err != nil {
@@ -49,52 +47,40 @@ func TestHealthzAndHTTPSEnforcement(t *testing.T) {
 func TestPairingAndRevocation(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	a := e.pair("Mac Safari")
+	e.clock.Advance(time.Second) // distinct createdAt: equal ones are ordered by random id
 
-	// Single use.
-	code, _, err := e.st.CreatePairingCode(ctx, "", e.clock.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var a testDevice
-	e.expect(http.StatusCreated, "POST", "/v2/pair", "", map[string]string{"code": strings.ToLower(code), "name": "Mac Safari", "browser": "safari"}, &a)
-	if !strings.HasPrefix(a.Token, "cts_") || len(a.Token) != 4+43 || a.ID == "" {
-		t.Fatalf("pair response %+v", a)
+	// Single use; input is case-insensitive.
+	code := e.invite(a)
+	var b testDevice
+	e.expect(http.StatusCreated, "POST", "/v3/pair", "", map[string]string{"code": strings.ToLower(code), "name": "Win Brave", "browser": "brave"}, &b)
+	if !strings.HasPrefix(b.Token, "cts_") || len(b.Token) != 4+43 || b.ID == "" {
+		t.Fatalf("pair response %+v", b)
 	}
 	var er errorJSON
-	e.expect(http.StatusBadRequest, "POST", "/v2/pair", "", map[string]string{"code": code, "name": "x", "browser": "brave"}, &er)
+	e.expect(http.StatusBadRequest, "POST", "/v3/pair", "", map[string]string{"code": code, "name": "x", "browser": "brave"}, &er)
 	if er.Error != "invalid_code" {
 		t.Fatalf("reused code: %+v", er)
 	}
 
 	// Expiry after 10 minutes.
-	code, _, err = e.st.CreatePairingCode(ctx, "", e.clock.Now())
-	if err != nil {
-		t.Fatal(err)
+	var pc map[string]any
+	e.expect(http.StatusCreated, "POST", "/v3/pairing-codes", a.Token, nil, &pc)
+	code, _ = pc["code"].(string)
+	if len(pc) != 2 || len(code) != 8 || pc["expiresAt"] != e.clock.Now().Add(10*time.Minute).UTC().Format("2006-01-02T15:04:05.000Z") {
+		t.Fatalf("pairing code %v", pc)
 	}
 	e.clock.Advance(10*time.Minute + time.Second)
-	e.expect(http.StatusBadRequest, "POST", "/v2/pair", "", map[string]string{"code": code, "name": "x", "browser": "brave"}, &er)
+	e.expect(http.StatusBadRequest, "POST", "/v3/pair", "", map[string]string{"code": code, "name": "x", "browser": "brave"}, &er)
 	if er.Error != "invalid_code" {
 		t.Fatalf("expired code: %+v", er)
 	}
 
 	// Validation.
-	e.expect(http.StatusBadRequest, "POST", "/v2/pair", "", map[string]string{"code": code, "name": " ", "browser": "brave"}, &er)
+	e.expect(http.StatusBadRequest, "POST", "/v3/pair", "", map[string]string{"code": e.invite(a), "name": " ", "browser": "brave"}, &er)
 	if er.Error != "invalid_request" {
 		t.Fatalf("empty name: %+v", er)
 	}
-
-	// A paired device issues a code for the next one.
-	var pc struct {
-		Code      string    `json:"code"`
-		ExpiresAt time.Time `json:"expiresAt"`
-	}
-	e.expect(http.StatusCreated, "POST", "/v2/pairing-codes", a.Token, nil, &pc)
-	if len(pc.Code) != 8 || !pc.ExpiresAt.Equal(e.clock.Now().Add(10*time.Minute)) {
-		t.Fatalf("pairing code %+v", pc)
-	}
-	var b testDevice
-	e.expect(http.StatusCreated, "POST", "/v2/pair", "", map[string]string{"code": pc.Code, "name": "Win Brave", "browser": "brave"}, &b)
 
 	var list struct {
 		Devices []struct {
@@ -103,14 +89,14 @@ func TestPairingAndRevocation(t *testing.T) {
 			IsSelf bool   `json:"isSelf"`
 		} `json:"devices"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/devices", b.Token, nil, &list)
+	e.expect(http.StatusOK, "GET", "/v3/devices", b.Token, nil, &list)
 	if len(list.Devices) != 2 || list.Devices[0].ID != a.ID || list.Devices[0].IsSelf || !list.Devices[1].IsSelf {
 		t.Fatalf("devices %+v", list)
 	}
 
 	// Unauthorized variants.
 	for _, tok := range []string{"", "cts_nope", "garbage"} {
-		e.expect(http.StatusUnauthorized, "GET", "/v2/session", tok, nil, &er)
+		e.expect(http.StatusUnauthorized, "GET", "/v3/session", tok, nil, &er)
 		if er.Error != "unauthorized" {
 			t.Fatalf("token %q: %+v", tok, er)
 		}
@@ -118,20 +104,20 @@ func TestPairingAndRevocation(t *testing.T) {
 
 	// Revoking the owner clears ownership; the revoked device gets device_revoked.
 	e.acquire(a, false)
-	e.expect(http.StatusNoContent, "DELETE", "/v2/devices/"+a.ID, b.Token, nil, nil)
-	e.expect(http.StatusUnauthorized, "GET", "/v2/session", a.Token, nil, &er)
+	e.expect(http.StatusNoContent, "DELETE", "/v3/devices/"+a.ID, b.Token, nil, nil)
+	e.expect(http.StatusUnauthorized, "GET", "/v3/session", a.Token, nil, &er)
 	if er.Error != "device_revoked" {
 		t.Fatalf("revoked: %+v", er)
 	}
 	if s := e.session(b); s.Owner != nil {
 		t.Fatalf("owner after revocation: %+v", s.Owner)
 	}
-	e.expect(http.StatusNotFound, "DELETE", "/v2/devices/"+a.ID, b.Token, nil, &er)
+	e.expect(http.StatusNotFound, "DELETE", "/v3/devices/"+a.ID, b.Token, nil, &er)
 	if er.Error != "not_found" {
 		t.Fatalf("double revoke: %+v", er)
 	}
 	// The revoked device stays listed (with revokedAt) for 7 days, after the active ones.
-	e.expect(http.StatusOK, "GET", "/v2/devices", b.Token, nil, &list)
+	e.expect(http.StatusOK, "GET", "/v3/devices", b.Token, nil, &list)
 	if len(list.Devices) != 2 || list.Devices[0].ID != b.ID || list.Devices[1].ID != a.ID {
 		t.Fatalf("devices after revoke %+v", list)
 	}
@@ -150,23 +136,23 @@ func TestAcquireReleaseHeartbeat(t *testing.T) {
 	}
 
 	var er errorJSON
-	e.expect(http.StatusConflict, "POST", "/v2/session/acquire", b.Token, map[string]bool{}, &er)
+	e.expect(http.StatusConflict, "POST", "/v3/session/acquire", b.Token, map[string]bool{}, &er)
 	if er.Error != "owner_active" || er.Owner == nil || er.Owner.DeviceID != a.ID || er.Owner.Generation != 1 || er.Owner.Name != "A" {
 		t.Fatalf("owner_active: %+v", er)
 	}
 
 	// Heartbeat keeps the owner live.
 	e.clock.Advance(9 * time.Minute)
-	e.expect(http.StatusNoContent, "POST", "/v2/session/heartbeat", a.Token, map[string]int64{"generation": 1}, nil)
+	e.expect(http.StatusNoContent, "POST", "/v3/session/heartbeat", a.Token, map[string]int64{"generation": 1}, nil)
 	e.clock.Advance(9 * time.Minute)
-	e.expect(http.StatusConflict, "POST", "/v2/session/acquire", b.Token, nil, &er)
+	e.expect(http.StatusConflict, "POST", "/v3/session/acquire", b.Token, nil, &er)
 
 	// Liveness expired: takeover without force.
 	e.clock.Advance(2 * time.Minute)
 	if g := e.acquire(b, false); g != 2 {
 		t.Fatalf("takeover generation %d", g)
 	}
-	e.expect(http.StatusConflict, "POST", "/v2/session/heartbeat", a.Token, map[string]int64{"generation": 1}, &er)
+	e.expect(http.StatusConflict, "POST", "/v3/session/heartbeat", a.Token, map[string]int64{"generation": 1}, &er)
 	if er.Error != "stale_owner" || er.Owner.DeviceID != b.ID || er.Owner.Generation != 2 {
 		t.Fatalf("stale heartbeat: %+v", er)
 	}
@@ -175,14 +161,14 @@ func TestAcquireReleaseHeartbeat(t *testing.T) {
 	if g := e.acquire(a, true); g != 3 {
 		t.Fatalf("forced generation %d", g)
 	}
-	e.expect(http.StatusConflict, "POST", "/v2/session/release", b.Token, map[string]int64{"generation": 2}, &er)
-	e.expect(http.StatusConflict, "POST", "/v2/session/release", a.Token, map[string]int64{"generation": 2}, &er)
-	e.expect(http.StatusBadRequest, "POST", "/v2/session/release", a.Token, map[string]int64{}, &er)
-	e.expect(http.StatusNoContent, "POST", "/v2/session/release", a.Token, map[string]int64{"generation": 3}, nil)
+	e.expect(http.StatusConflict, "POST", "/v3/session/release", b.Token, map[string]int64{"generation": 2}, &er)
+	e.expect(http.StatusConflict, "POST", "/v3/session/release", a.Token, map[string]int64{"generation": 2}, &er)
+	e.expect(http.StatusBadRequest, "POST", "/v3/session/release", a.Token, map[string]int64{}, &er)
+	e.expect(http.StatusNoContent, "POST", "/v3/session/release", a.Token, map[string]int64{"generation": 3}, nil)
 	if s := e.session(a); s.Owner != nil {
 		t.Fatalf("owner after release %+v", s.Owner)
 	}
-	e.expect(http.StatusConflict, "POST", "/v2/session/release", a.Token, map[string]int64{"generation": 3}, &er)
+	e.expect(http.StatusConflict, "POST", "/v3/session/release", a.Token, map[string]int64{"generation": 3}, &er)
 	if er.Error != "stale_owner" || er.Owner != nil {
 		t.Fatalf("release without owner: %+v", er)
 	}
@@ -209,7 +195,7 @@ func TestConcurrentAcquireSingleOwner(t *testing.T) {
 			wg.Go(func() {
 				<-start
 				var r acquireResp
-				st := e.call("POST", "/v2/session/acquire", d.Token, map[string]bool{"force": false}, &r)
+				st := e.call("POST", "/v3/session/acquire", d.Token, map[string]bool{"force": false}, &r)
 				mu.Lock()
 				defer mu.Unlock()
 				statuses[st]++
@@ -226,7 +212,7 @@ func TestConcurrentAcquireSingleOwner(t *testing.T) {
 		if gen != int64(round+1) {
 			t.Fatalf("round %d: generation %d", round, gen)
 		}
-		e.expect(http.StatusNoContent, "POST", "/v2/session/release", devs[winner].Token, map[string]int64{"generation": gen}, nil)
+		e.expect(http.StatusNoContent, "POST", "/v3/session/release", devs[winner].Token, map[string]int64{"generation": gen}, nil)
 	}
 }
 
@@ -318,16 +304,16 @@ func TestStaleOwnerAndInvalidBatchApplyNothing(t *testing.T) {
 		late, {"opId": uid(), "type": "close", "entryId": e1},
 	}}
 	var er errorJSON
-	e.expect(http.StatusConflict, "POST", "/v2/session/operations", a.Token, body, &er)
+	e.expect(http.StatusConflict, "POST", "/v3/session/operations", a.Token, body, &er)
 	if er.Error != "stale_owner" || er.Owner == nil || er.Owner.DeviceID != b.ID {
 		t.Fatalf("stale write: %+v", er)
 	}
 	// Right generation, wrong testDevice.
 	body["generation"] = genB
-	e.expect(http.StatusConflict, "POST", "/v2/session/operations", a.Token, body, &er)
+	e.expect(http.StatusConflict, "POST", "/v3/session/operations", a.Token, body, &er)
 
 	// A valid op followed by an invalid one rejects the whole batch.
-	e.expect(http.StatusBadRequest, "POST", "/v2/session/operations", b.Token, map[string]any{
+	e.expect(http.StatusBadRequest, "POST", "/v3/session/operations", b.Token, map[string]any{
 		"generation": genB, "baseRevision": 1,
 		"operations": []op{openOp(uid(), "https://ok.example/"),
 			op{"opId": uid(), "type": "open", "entryId": uid(), "urlKey": urlKey("x"), "urlEnc": "not base64url!"}},
@@ -340,7 +326,7 @@ func TestStaleOwnerAndInvalidBatchApplyNothing(t *testing.T) {
 	var snaps struct {
 		Snapshots []any `json:"snapshots"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/snapshots", b.Token, nil, &snaps)
+	e.expect(http.StatusOK, "GET", "/v3/snapshots", b.Token, nil, &snaps)
 	if len(snaps.Snapshots) != 0 {
 		t.Fatalf("rejected batch left a snapshot: %+v", snaps)
 	}
@@ -358,12 +344,12 @@ func TestCatchUp(t *testing.T) {
 
 	gen := e.acquire(a, false)
 	e.ops(a, gen, 0, openOp(uid(), "https://a1.example/"), openOp(uid(), "https://a2.example/")) // rev 1, 2
-	e.expect(http.StatusNoContent, "POST", "/v2/session/release", a.Token, map[string]int64{"generation": gen}, nil)
+	e.expect(http.StatusNoContent, "POST", "/v3/session/release", a.Token, map[string]int64{"generation": gen}, nil)
 
 	gen = e.acquire(b, false)
 	bOp := openOp(uid(), "https://b1.example/")
 	e.ops(b, gen, 2, bOp, op{"opId": uid(), "type": "close", "entryId": uid()}) // rev 3 + ignored
-	e.expect(http.StatusNoContent, "POST", "/v2/session/release", b.Token, map[string]int64{"generation": gen}, nil)
+	e.expect(http.StatusNoContent, "POST", "/v3/session/release", b.Token, map[string]int64{"generation": gen}, nil)
 
 	gen = e.acquire(a, false)
 	r := e.ops(a, gen, 2, openOp(uid(), "https://a3.example/"))
@@ -395,22 +381,22 @@ func TestChanges(t *testing.T) {
 		Owner      *ownerJSON `json:"owner"`
 		Operations []loggedOp `json:"operations"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/session/changes?since=0", a.Token, nil, &ch)
+	e.expect(http.StatusOK, "GET", "/v3/session/changes?since=0", a.Token, nil, &ch)
 	if ch.Revision != 2 || ch.Owner == nil || len(ch.Operations) != 2 || ch.Operations[0].Seq != 1 || ch.Operations[1].Seq != 2 {
 		t.Fatalf("changes %+v", ch)
 	}
-	e.expect(http.StatusOK, "GET", "/v2/session/changes?since=2", a.Token, nil, &ch)
+	e.expect(http.StatusOK, "GET", "/v3/session/changes?since=2", a.Token, nil, &ch)
 	if len(ch.Operations) != 0 {
 		t.Fatalf("changes at head %+v", ch)
 	}
 	var er errorJSON
 	for _, q := range []string{"3", "-1"} {
-		e.expect(http.StatusGone, "GET", "/v2/session/changes?since="+q, a.Token, nil, &er)
+		e.expect(http.StatusGone, "GET", "/v3/session/changes?since="+q, a.Token, nil, &er)
 		if er.Error != "history_expired" {
 			t.Fatalf("since=%s: %+v", q, er)
 		}
 	}
-	e.expect(http.StatusBadRequest, "GET", "/v2/session/changes", a.Token, nil, &er)
+	e.expect(http.StatusBadRequest, "GET", "/v3/session/changes", a.Token, nil, &er)
 }
 
 func TestRestoreSnapshot(t *testing.T) {
@@ -432,17 +418,17 @@ func TestRestoreSnapshot(t *testing.T) {
 	var list struct {
 		Snapshots []snapshot `json:"snapshots"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/snapshots", a.Token, nil, &list)
+	e.expect(http.StatusOK, "GET", "/v3/snapshots", a.Token, nil, &list)
 	if len(list.Snapshots) != 1 || list.Snapshots[0].EntryCount != 2 || list.Snapshots[0].Revision != 2 ||
 		list.Snapshots[0].DeviceID != a.ID || list.Snapshots[0].Reason != "operations" {
 		t.Fatalf("snapshots %+v", list)
 	}
 	id := list.Snapshots[0].ID
-	path := "/v2/snapshots/" + strconv.FormatInt(id, 10) + "/restore"
+	path := "/v3/snapshots/" + strconv.FormatInt(id, 10) + "/restore"
 
 	var er errorJSON
 	e.expect(http.StatusConflict, "POST", path, a.Token, map[string]int64{"generation": gen + 1}, &er)
-	e.expect(http.StatusNotFound, "POST", "/v2/snapshots/999/restore", a.Token, map[string]int64{"generation": gen}, &er)
+	e.expect(http.StatusNotFound, "POST", "/v3/snapshots/999/restore", a.Token, map[string]int64{"generation": gen}, &er)
 
 	var r opsResp
 	e.expect(http.StatusOK, "POST", path, a.Token, map[string]int64{"generation": gen}, &r)
@@ -461,7 +447,7 @@ func TestRestoreSnapshot(t *testing.T) {
 	var ch struct {
 		Operations []loggedOp `json:"operations"`
 	}
-	e.expect(http.StatusOK, "GET", "/v2/session/changes?since=3", a.Token, nil, &ch)
+	e.expect(http.StatusOK, "GET", "/v3/session/changes?since=3", a.Token, nil, &ch)
 	if len(ch.Operations) != 2 {
 		t.Fatalf("restore ops %+v", ch.Operations)
 	}
@@ -476,18 +462,18 @@ func TestRestoreSnapshot(t *testing.T) {
 	}
 
 	// A pre-restore snapshot was saved first.
-	e.expect(http.StatusOK, "GET", "/v2/snapshots", a.Token, nil, &list)
+	e.expect(http.StatusOK, "GET", "/v3/snapshots", a.Token, nil, &list)
 	if len(list.Snapshots) != 2 || list.Snapshots[0].Reason != "restore" || list.Snapshots[0].EntryCount != 1 {
 		t.Fatalf("snapshots after restore %+v", list)
 	}
 
 	// Retention bound.
 	for range 4 {
-		e.expect(http.StatusOK, "GET", "/v2/snapshots", a.Token, nil, &list)
-		latest := "/v2/snapshots/" + strconv.FormatInt(list.Snapshots[0].ID, 10) + "/restore"
+		e.expect(http.StatusOK, "GET", "/v3/snapshots", a.Token, nil, &list)
+		latest := "/v3/snapshots/" + strconv.FormatInt(list.Snapshots[0].ID, 10) + "/restore"
 		e.expect(http.StatusOK, "POST", latest, a.Token, map[string]int64{"generation": gen}, &r)
 	}
-	e.expect(http.StatusOK, "GET", "/v2/snapshots", a.Token, nil, &list)
+	e.expect(http.StatusOK, "GET", "/v3/snapshots", a.Token, nil, &list)
 	if len(list.Snapshots) != 3 {
 		t.Fatalf("retention: %d snapshots", len(list.Snapshots))
 	}
@@ -500,7 +486,7 @@ func TestLimitsAndValidation(t *testing.T) {
 	gen := e.acquire(a, false)
 	send := func(ops []op) (int, errorJSON) {
 		var er errorJSON
-		st := e.call("POST", "/v2/session/operations", a.Token, map[string]any{"generation": gen, "baseRevision": 0, "operations": ops}, &er)
+		st := e.call("POST", "/v3/session/operations", a.Token, map[string]any{"generation": gen, "baseRevision": 0, "operations": ops}, &er)
 		return st, er
 	}
 
@@ -527,8 +513,8 @@ func TestLimitsAndValidation(t *testing.T) {
 		return append(data[:len(data)-1], append(bytes.Repeat([]byte(" "), size-len(data)), '}')...)
 	}
 	var er errorJSON
-	e.expect(http.StatusOK, "POST", "/v2/session/operations", a.Token, sizedBody(200<<10), nil)
-	if st := e.call("POST", "/v2/session/operations", a.Token, sizedBody(300<<10), &er); st != http.StatusRequestEntityTooLarge || er.Error != "payload_too_large" {
+	e.expect(http.StatusOK, "POST", "/v3/session/operations", a.Token, sizedBody(200<<10), nil)
+	if st := e.call("POST", "/v3/session/operations", a.Token, sizedBody(300<<10), &er); st != http.StatusRequestEntityTooLarge || er.Error != "payload_too_large" {
 		t.Fatalf("300 KiB body: %d %+v", st, er)
 	}
 
@@ -556,10 +542,10 @@ func TestLimitsAndValidation(t *testing.T) {
 		t.Fatalf("rejected batches changed state: %d entries, want %d", len(s.Entries), before)
 	}
 
-	e.expect(http.StatusBadRequest, "POST", "/v2/session/operations", a.Token, []byte(`{"generation":1,`), &er)
-	e.expect(http.StatusBadRequest, "POST", "/v2/session/operations", a.Token, []byte(`{"generation":1,"baseRevision":0} {}`), &er)
-	e.expect(http.StatusBadRequest, "POST", "/v2/session/operations", a.Token, map[string]any{"generation": gen}, &er)
-	e.expect(http.StatusNotFound, "GET", "/v2/nope", a.Token, nil, &er)
+	e.expect(http.StatusBadRequest, "POST", "/v3/session/operations", a.Token, []byte(`{"generation":1,`), &er)
+	e.expect(http.StatusBadRequest, "POST", "/v3/session/operations", a.Token, []byte(`{"generation":1,"baseRevision":0} {}`), &er)
+	e.expect(http.StatusBadRequest, "POST", "/v3/session/operations", a.Token, map[string]any{"generation": gen}, &er)
+	e.expect(http.StatusNotFound, "GET", "/v3/nope", a.Token, nil, &er)
 	if er.Error != "not_found" {
 		t.Fatalf("unknown route %+v", er)
 	}
@@ -568,38 +554,46 @@ func TestLimitsAndValidation(t *testing.T) {
 func TestLogsOmitURLsAndTokens(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
-	code, _, err := e.st.CreatePairingCode(context.Background(), "", e.clock.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
+	first := e.pair("First")
+	code := e.invite(first)
 	var a testDevice
-	e.expect(http.StatusCreated, "POST", "/v2/pair", "", map[string]string{"code": code, "name": "A", "browser": "safari"}, &a)
+	e.expect(http.StatusCreated, "POST", "/v3/pair", "", map[string]string{"code": code, "name": "A", "browser": "safari"}, &a)
 	gen := e.acquire(a, false)
 	e.ops(a, gen, 0, openOp(uid(), "https://secret.example/private?token=abc"))
 	e.call("GET", "/https://secret.example/x", a.Token, nil, nil)
-	e.call("GET", "/v2/session/changes?since=secret.example", a.Token, nil, nil)
+	e.call("GET", "/v3/session/changes?since=secret.example", a.Token, nil, nil)
 
 	logs := e.logs.String()
-	for _, s := range []string{"secret.example", a.Token, code, "cts_"} {
+	for _, s := range []string{"secret.example", a.Token, code, "cts_", testKeyCheck, "198.51.100.1", "127.0.0.1"} {
 		if strings.Contains(logs, s) {
 			t.Fatalf("logs contain %q:\n%s", s, logs)
 		}
 	}
-	if !strings.Contains(logs, `"device_id":"`+a.ID+`"`) || !strings.Contains(logs, `"path":"/v2/session/operations"`) {
+	if !strings.Contains(logs, `"device_id":"`+a.ID+`"`) || !strings.Contains(logs, `"path":"/v3/session/operations"`) {
 		t.Fatalf("logs missing expected fields:\n%s", logs)
 	}
 }
 
-// v2 replaced v1: the old prefix falls through to the 404 catch-all.
-func TestV1RoutesAreGone(t *testing.T) {
+// v3 replaced v1 and v2: the old prefixes, the key-check endpoint and the
+// debug route without CTS_DEBUG fall through to the 404 catch-all.
+func TestOldRoutesAreGone(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, nil)
+	e := newEnv(t, func(c *config.Config) { c.Debug = true })
 	a := e.pair("A")
 	for _, r := range []struct{ method, path string }{
 		{"GET", "/v1/session"},
 		{"POST", "/v1/pair"},
 		{"POST", "/v1/session/operations"},
 		{"GET", "/v1/devices"},
+		{"GET", "/v2/session"},
+		{"POST", "/v2/pair"},
+		{"POST", "/v2/pairing-codes"},
+		{"POST", "/v2/session/operations"},
+		{"POST", "/v2/diag"},
+		{"PUT", "/v2/session/key"},
+		{"PUT", "/v3/session/key"},
+		{"POST", "/v3/session"},
+		{"GET", "/v3"},
 	} {
 		var er errorJSON
 		if st := e.call(r.method, r.path, a.Token, map[string]any{}, &er); st != http.StatusNotFound || er.Error != "not_found" {
@@ -644,12 +638,12 @@ func TestSealedURLsOnTheWire(t *testing.T) {
 		return string(out)
 	}
 
-	res := raw("POST", "/v2/session/operations", map[string]any{"generation": gen, "baseRevision": 0, "operations": []op{o}})
+	res := raw("POST", "/v3/session/operations", map[string]any{"generation": gen, "baseRevision": 0, "operations": []op{o}})
 	if strings.Contains(res, enc) || strings.Contains(res, "urlEnc") {
 		t.Fatalf("operations response echoes urlEnc: %s", res)
 	}
 	var sess map[string]any
-	if err := json.Unmarshal([]byte(raw("GET", "/v2/session", nil)), &sess); err != nil {
+	if err := json.Unmarshal([]byte(raw("GET", "/v3/session", nil)), &sess); err != nil {
 		t.Fatal(err)
 	}
 	entries, _ := sess["entries"].([]any)
@@ -660,78 +654,28 @@ func TestSealedURLsOnTheWire(t *testing.T) {
 	if _, ok := en["url"]; ok || en["urlKey"] != k || en["urlEnc"] != enc {
 		t.Fatalf("session entry %v", en)
 	}
-	changes := raw("GET", "/v2/session/changes?since=0", nil)
+	changes := raw("GET", "/v3/session/changes?since=0", nil)
 	if !strings.Contains(changes, `"urlKey":"`+k+`"`) || !strings.Contains(changes, `"urlEnc":"`+enc+`"`) || strings.Contains(changes, `"url"`) {
 		t.Fatalf("changes %s", changes)
 	}
 }
 
+// The key check is fixed when the session starts and returned with it.
 func TestKeyCheck(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
-	a, b := e.pair("A"), e.pair("B")
-	k1, k2 := urlKey("key one"), urlKey("key two")
-	keyCheck := func(path string) any {
-		t.Helper()
-		var m map[string]any
-		e.expect(http.StatusOK, "GET", path, a.Token, nil, &m)
-		v, ok := m["keyCheck"]
-		if !ok {
-			t.Fatalf("%s lacks keyCheck: %v", path, m)
-		}
-		return v
-	}
-	if v := keyCheck("/v2/session"); v != nil {
-		t.Fatalf("initial keyCheck %v, want null", v)
-	}
-
-	var er errorJSON
-	for _, bad := range []any{map[string]any{}, map[string]string{"keyCheck": k1[1:]}, map[string]string{"keyCheck": k1[1:] + "="}} {
-		e.expect(http.StatusBadRequest, "PUT", "/v2/session/key", a.Token, bad, &er)
-	}
-	e.expect(http.StatusNoContent, "PUT", "/v2/session/key", a.Token, map[string]string{"keyCheck": k1}, nil)
-	e.expect(http.StatusNoContent, "PUT", "/v2/session/key", b.Token, map[string]string{"keyCheck": k1}, nil) // equal: idempotent
-	var body map[string]any
-	e.expect(http.StatusConflict, "PUT", "/v2/session/key", b.Token, map[string]string{"keyCheck": k2}, &body)
-	if len(body) != 2 || body["error"] != "key_set" || body["message"] == nil {
-		t.Fatalf("key_set body %v", body)
-	}
-	if v := keyCheck("/v2/session"); v != k1 {
-		t.Fatalf("keyCheck %v, want %s", v, k1)
+	a := e.pair("A")
+	var m map[string]any
+	e.expect(http.StatusOK, "GET", "/v3/session", a.Token, nil, &m)
+	if m["keyCheck"] != testKeyCheck {
+		t.Fatalf("session keyCheck %v, want %s", m["keyCheck"], testKeyCheck)
 	}
 	var acq struct {
 		Session map[string]any `json:"session"`
 	}
-	e.expect(http.StatusOK, "POST", "/v2/session/acquire", a.Token, nil, &acq)
-	if acq.Session["keyCheck"] != k1 {
+	e.expect(http.StatusOK, "POST", "/v3/session/acquire", a.Token, nil, &acq)
+	if acq.Session["keyCheck"] != testKeyCheck {
 		t.Fatalf("acquire session keyCheck %v", acq.Session["keyCheck"])
-	}
-
-	e.expect(http.StatusNoContent, "DELETE", "/v2/devices/"+b.ID, a.Token, nil, nil)
-	e.expect(http.StatusUnauthorized, "PUT", "/v2/session/key", b.Token, map[string]string{"keyCheck": k1}, &er)
-	if er.Error != "device_revoked" {
-		t.Fatalf("revoked device: %+v", er)
-	}
-}
-
-// Two first browsers race to store different key checks: exactly one wins.
-func TestKeyCheckRace(t *testing.T) {
-	t.Parallel()
-	for range 5 {
-		e := newEnv(t, nil)
-		devs := []testDevice{e.pair("A"), e.pair("B")}
-		statuses := make([]int, len(devs))
-		var wg sync.WaitGroup
-		for i, d := range devs {
-			wg.Go(func() {
-				statuses[i] = e.call("PUT", "/v2/session/key", d.Token, map[string]string{"keyCheck": urlKey(d.ID)}, nil)
-			})
-		}
-		wg.Wait()
-		slices.Sort(statuses)
-		if !slices.Equal(statuses, []int{http.StatusNoContent, http.StatusConflict}) {
-			t.Fatalf("statuses %v, want one 204 and one 409", statuses)
-		}
 	}
 }
 
@@ -741,8 +685,8 @@ func TestUnknownTopLevelFieldsIgnored(t *testing.T) {
 	e := newEnv(t, nil)
 	a := e.pair("A")
 	gen := e.acquire(a, false)
-	e.expect(http.StatusOK, "POST", "/v2/session/operations", a.Token,
+	e.expect(http.StatusOK, "POST", "/v3/session/operations", a.Token,
 		map[string]any{"generation": gen, "baseRevision": 0, "operations": []op{openOp(uid(), "https://a.example/")}, "extra": 1}, nil)
-	e.expect(http.StatusOK, "POST", "/v2/session/merge", a.Token,
+	e.expect(http.StatusOK, "POST", "/v3/session/merge", a.Token,
 		map[string]any{"operations": []op{at(1, openOp(uid(), "https://b.example/"))}, "extra": 1}, nil)
 }
