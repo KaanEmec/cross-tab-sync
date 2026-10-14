@@ -1,122 +1,768 @@
+/* Cross-Tab-Sync popup. One panel (the hero), everything else sits on the page surface. */
+
 :root {
   color-scheme: light dark;
-  --bg: #ffffff;
-  --fg: #1d1d1f;
-  --muted: #6e6e73;
-  --line: #e5e5ea;
-  --accent: #0a66d8;
-  --accent-fg: #ffffff;
-  --danger: #c4271c;
-  --field: #f5f5f7;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #141a20;
+  --muted: #68737f;
+  --line: #e3e7ec;
+  --hover: rgba(20, 26, 32, 0.05);
+  --accent: #0e7c7b;
+  --accent-hover: #0b6968;
+  --accent-ink: #ffffff;
+  --ok: #1e8e5a;
+  --slate: #5d6b79;
+  --warn: #b7791f;
+  --bad: #c8403a;
+  --bad-tint: #fbeceb;
+  --bad-text: #9e2f2a;
+  --focus: rgba(14, 124, 123, 0.45);
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --mono-size: 11.5px;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1c1c1e;
-    --fg: #f2f2f7;
-    --muted: #98989f;
-    --line: #38383a;
-    --accent: #3d8bfd;
-    --accent-fg: #0b0b0c;
-    --danger: #ff6b5e;
-    --field: #2c2c2e;
+    --bg: #15191e;
+    --panel: #1c2228;
+    --ink: #e8ecf0;
+    --muted: #98a2ad;
+    --line: #2a323b;
+    --hover: rgba(232, 236, 240, 0.06);
+    --accent: #3fb6b3;
+    --accent-hover: #5cc4c1;
+    --accent-ink: #0d1d1d;
+    --ok: #4cc38a;
+    --slate: #8d9cab;
+    --warn: #e2aa52;
+    --bad: #f0716a;
+    --bad-tint: #35201f;
+    --bad-text: #f6a8a2;
+    --focus: rgba(63, 182, 179, 0.5);
   }
 }
 
-* { box-sizing: border-box; }
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
 
 body {
   margin: 0;
-  width: 320px;
-  padding: 14px 16px 16px;
-  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  width: 360px;
+  padding: 14px 16px 12px;
   background: var(--bg);
-  color: var(--fg);
+  color: var(--ink);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
 }
 
-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-h1 { font-size: 15px; font-weight: 600; margin: 0; }
+p {
+  margin: 0;
+}
 
-.badge {
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 999px;
+svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Header ---------------------------------------------------------------------------------- */
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 26px;
+  margin-bottom: 12px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.logo {
+  color: var(--accent);
+}
+
+h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.chip {
+  /* Room for 8 id characters, so "Copied" does not change the width. */
+  min-width: calc(8ch + 20px);
+  padding: 3px 9px;
   border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
   color: var(--muted);
+  font: var(--mono-size)/1.4 var(--mono);
+  text-align: center;
+  cursor: pointer;
 }
-.badge.owner { color: var(--accent); border-color: currentColor; }
 
-label { display: block; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
-input {
+.chip:hover {
+  color: var(--ink);
+}
+
+/* Hero ------------------------------------------------------------------------------------- */
+
+.hero {
+  --tone: var(--line);
+  position: relative;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.hero[data-tone="ok"] { --tone: var(--ok); }
+.hero[data-tone="neutral"] { --tone: var(--slate); }
+.hero[data-tone="warn"] { --tone: var(--warn); }
+.hero[data-tone="bad"] { --tone: var(--bad); }
+
+.relay {
   display: block;
   width: 100%;
-  margin-top: 4px;
-  padding: 7px 9px;
-  font: inherit;
-  color: var(--fg);
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: 6px;
+  height: auto;
+  overflow: visible;
 }
-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
-.hint { color: var(--muted); font-size: 11px; margin: 0 0 12px; }
-code { font-size: 11px; }
+.relay .track {
+  stroke: var(--line);
+  stroke-width: 2;
+}
+
+.relay .flow {
+  stroke: var(--tone);
+  stroke-width: 2;
+  stroke-dasharray: 2 7;
+  opacity: 0;
+}
+
+.hero:not([data-driver="none"]) .flow {
+  opacity: 0.7;
+}
+
+.hero[data-working="true"]:not([data-driver="none"]) .flow {
+  animation: flow 0.9s linear infinite;
+}
+
+.hero[data-driver="other"] .flow {
+  animation-direction: reverse;
+}
+
+@keyframes flow {
+  to { stroke-dashoffset: -9; }
+}
+
+.relay .node {
+  fill: var(--panel);
+  stroke: var(--muted);
+  stroke-width: 1.75;
+  transition: fill 0.2s ease, stroke 0.2s ease;
+}
+
+.relay .halo {
+  fill: var(--tone);
+  stroke: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.hero[data-driver="self"] .node.self,
+.hero[data-driver="other"] .node.other {
+  fill: var(--tone);
+  stroke: var(--tone);
+}
+
+.hero[data-driver="self"] .halo.self,
+.hero[data-driver="other"] .halo.other {
+  opacity: 0.18;
+}
+
+.relay-labels {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.relay-labels span {
+  max-width: 48%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.relay-labels span:last-child {
+  text-align: right;
+}
+
+.hero-title {
+  margin-top: 14px;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+
+.hero-detail {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.hero-detail:empty {
+  display: none;
+}
+
+/* Error strip ------------------------------------------------------------------------------ */
+
+.error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 9px 10px 9px 12px;
+  border-radius: 10px;
+  background: var(--bad-tint);
+  color: var(--bad-text);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.error p {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.error .fix {
+  flex-shrink: 0;
+  border-color: currentColor;
+  background: transparent;
+  color: inherit;
+}
+
+/* Buttons ---------------------------------------------------------------------------------- */
 
 button {
   font: inherit;
-  padding: 7px 12px;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  background: var(--field);
-  color: var(--fg);
+  color: inherit;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn.secondary {
+  border-color: var(--line);
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.btn.secondary:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+
+.btn.small {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+
+.btn.small svg {
+  width: 14px;
+  height: 14px;
+}
+
+.btn.wide {
+  width: 100%;
+}
+
+.btn.square {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+}
+
+.btn:disabled,
+.switch:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.text-btn {
+  padding: 2px 4px;
+  margin: -2px -4px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 500;
   cursor: pointer;
 }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
-button:disabled { opacity: 0.55; cursor: default; }
-button.link { border: 0; background: none; padding: 0; color: var(--accent); }
-button.link.danger { color: var(--danger); }
-#pair { width: 100%; }
 
-.facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0 0 10px; }
-.facts dt { color: var(--muted); }
-.facts dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
-
-.status { margin: 0 0 12px; min-height: 1.4em; color: var(--muted); }
-
-.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
-.actions .wide { grid-column: 1 / -1; }
-
-.pairing { margin-bottom: 12px; }
-.inline { display: flex; align-items: center; gap: 6px; margin: 8px 0 0; }
-.inline input { margin-top: 0; flex: 1; min-width: 0; }
-.inline button { flex-shrink: 0; }
-#invite-link { font: 12px ui-monospace, "SF Mono", Consolas, monospace; }
-#invite-note { margin: 4px 0 0; }
-
-.muted { color: var(--muted); font-weight: normal; }
-#self-id { font-family: ui-monospace, "SF Mono", Consolas, monospace; }
-.facts dd button.link { font-size: 12px; margin-left: 4px; }
-
-footer {
-  display: flex;
-  justify-content: flex-end;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
-  font-size: 11px;
+.text-btn:hover:not(:disabled) {
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
-footer button { text-align: right; }
 
-.error { margin: 10px 0 0; color: var(--danger); }
-[hidden] { display: none !important; }
+.text-btn.danger {
+  color: var(--bad);
+}
 
-details { margin-bottom: 12px; border-top: 1px solid var(--line); padding-top: 8px; }
-summary { cursor: pointer; font-weight: 600; }
-.list { list-style: none; margin: 6px 0 0; padding: 0; }
-.list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; }
-.list li span { overflow-wrap: anywhere; }
-.list li small { color: var(--muted); display: block; }
-.list button { padding: 3px 8px; font-size: 12px; flex-shrink: 0; }
-.list .empty { color: var(--muted); }
-.list li.revoked { opacity: 0.55; }
-button.danger:not(.link) { color: var(--danger); }
+.text-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.icon-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Actions row ------------------------------------------------------------------------------ */
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.actions .primary {
+  flex: 1;
+  height: 36px;
+  font-size: 13.5px;
+}
+
+#sync-now[data-working="true"] svg {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Folded sections -------------------------------------------------------------------------- */
+
+.folds {
+  margin-top: 10px;
+}
+
+.fold + .fold {
+  border-top: 1px solid var(--line);
+}
+
+.fold summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 6px;
+  margin: 0 -6px;
+  border-radius: 8px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.fold summary::-webkit-details-marker {
+  display: none;
+}
+
+.fold summary:hover {
+  background: var(--hover);
+}
+
+.fold .glyph {
+  color: var(--ink);
+  opacity: 0.8;
+}
+
+.fold-label {
+  font-weight: 500;
+}
+
+.fold-summary {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.fold .chev {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  transition: transform 0.18s ease;
+}
+
+.fold-label + .chev {
+  margin-left: auto;
+}
+
+.fold[open] .chev {
+  transform: rotate(90deg);
+}
+
+.fold-body {
+  padding: 2px 0 14px 26px;
+}
+
+.fold[open] .fold-body {
+  animation: reveal 0.16s ease-out;
+}
+
+/* Movement only: content is never drawn faded, even if the animation is interrupted. */
+@keyframes reveal {
+  from { transform: translateY(-3px); }
+}
+
+/* Devices ---------------------------------------------------------------------------------- */
+
+.self {
+  padding-bottom: 10px;
+}
+
+.self-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.self-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 26px;
+}
+
+#self-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+code {
+  font: var(--mono-size) var(--mono);
+}
+
+.rows {
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.rows li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+}
+
+.rows li.empty {
+  min-height: 0;
+  color: var(--muted);
+}
+
+.row-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.row-title {
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-meta {
+  display: flex;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rows li.revoked .row-main,
+.rows li.restoring {
+  opacity: 0.5;
+}
+
+/* While one restore runs the other buttons are briefly disabled; they keep their normal look. */
+#snapshots li:not(.restoring) .btn:disabled {
+  opacity: 1;
+}
+
+.rows li.more {
+  min-height: 0;
+  padding: 8px 0 0;
+}
+
+.tag {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.invite {
+  margin-top: 10px;
+}
+
+.inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inline input {
+  flex: 1;
+  min-width: 0;
+}
+
+#rename-form {
+  margin: 2px 0 6px;
+}
+
+#invite-link {
+  font: var(--mono-size) var(--mono);
+}
+
+/* Recovery and settings -------------------------------------------------------------------- */
+
+.hint {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.setting {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+}
+
+.setting.toggle {
+  align-items: center;
+  padding: 8px 0;
+}
+
+.setting + .setting {
+  border-top: 1px solid var(--line);
+}
+
+.setting-label {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* Long values wrap within their own right-hand column instead of truncating. */
+.setting-value {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+#disconnect {
+  text-align: left;
+  line-height: 1.4;
+}
+
+#disconnect[data-armed] {
+  margin: 0;
+  padding: 0;
+}
+
+.switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 34px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--line);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.switch[aria-checked="true"] {
+  background: var(--accent);
+}
+
+.knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 0.15s ease;
+}
+
+.switch[aria-checked="true"] .knob {
+  transform: translateX(14px);
+}
+
+/* Fields ----------------------------------------------------------------------------------- */
+
+.pair {
+  margin-top: 14px;
+}
+
+.field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 5px;
+  font-weight: 500;
+}
+
+.pair .hint {
+  margin: -6px 0 12px;
+}
+
+.pair .fold {
+  margin-top: 6px;
+}
+
+.pair .fold-body .field:last-child {
+  margin-bottom: 0;
+}
+
+input {
+  display: block;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+}
+
+.inline input {
+  height: 28px;
+}
+
+input::placeholder {
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus);
+}
+
+input[readonly] {
+  background: var(--bg);
+}
+
+/* Motion ----------------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

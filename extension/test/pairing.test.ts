@@ -2,9 +2,25 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { FakeBrowser } from "../src/adapter/fake.js";
 import type { Device } from "../src/core/client.js";
-import { deviceRows, ownerLine, relativeTime, shortId } from "../src/core/devices.js";
+import {
+  activityLine,
+  deviceRows,
+  devicesSummary,
+  errorFix,
+  heroView,
+  type HeroContext,
+  ownerLine,
+  primaryAction,
+  relativeTime,
+  secondsAgo,
+  shortId,
+  SNAPSHOT_LIMIT,
+  snapshotList,
+  snapshotRows,
+  snapshotsSummary,
+} from "../src/core/devices.js";
 import { createPairingCode, pair, pairFromPending, type Deps } from "../src/core/handover.js";
-import { statusView } from "../src/core/messages.js";
+import { statusView, type StatusView } from "../src/core/messages.js";
 import { defaultDeviceName, normalizeCode, pairingLink, parsePairingInput, resolvePairingForm } from "../src/core/pairing.js";
 import { listDevices, renameDevice } from "../src/core/recovery.js";
 import { loadState, saveState } from "../src/core/state.js";
@@ -165,36 +181,83 @@ describe("device list view model", () => {
       [
         dev({ id: "1a2b3c4d-0000-4000-8000-000000000001", name: "Brave on macOS", isSelf: true }),
         dev({ id: "5e6f7a8b-0000-4000-8000-000000000002", name: "Safari on macOS", browser: "safari", lastSeenAt: ago(5 * 60_000) }),
-        dev({ id: "9c0d1e2f-0000-4000-8000-000000000003", name: "Old Brave", lastSeenAt: ago(3 * 86_400_000), revokedAt: ago(2 * 3600_000) }),
+        dev({ id: "9c0d1e2f-0000-4000-8000-000000000003", name: "Old Brave", lastSeenAt: ago(3 * 3600_000), revokedAt: ago(2 * 3600_000) }),
       ],
       now,
     );
     expect(rows).toEqual([
       {
         id: "1a2b3c4d-0000-4000-8000-000000000001",
-        title: "Brave on macOS (this device)",
-        detail: "Brave · 1a2b3c4d · last seen just now",
+        name: "Brave on macOS",
+        browser: "Brave",
+        shortId: "1a2b3c4d",
+        seen: "Seen just now",
+        revokedNote: null,
         isSelf: true,
         revoked: false,
         canRevoke: false,
       },
       {
         id: "5e6f7a8b-0000-4000-8000-000000000002",
-        title: "Safari on macOS",
-        detail: "Safari · 5e6f7a8b · last seen 5 min ago",
+        name: "Safari on macOS",
+        browser: "Safari",
+        shortId: "5e6f7a8b",
+        seen: "Seen 5 min ago",
+        revokedNote: null,
         isSelf: false,
         revoked: false,
         canRevoke: true,
       },
       {
         id: "9c0d1e2f-0000-4000-8000-000000000003",
-        title: "Old Brave",
-        detail: "Brave · 9c0d1e2f · revoked 2 h ago",
+        name: "Old Brave",
+        browser: "Brave",
+        shortId: "9c0d1e2f",
+        seen: "Seen 3 h ago",
+        revokedNote: "Revoked 2 h ago",
         isSelf: false,
         revoked: true,
         canRevoke: false,
       },
     ]);
+    // No middle-dot meta strings anywhere in the rows.
+    expect(JSON.stringify(rows)).not.toContain("\u00b7");
+  });
+
+  it("summarizes active browsers", () => {
+    expect(devicesSummary([dev({ isSelf: true }), dev({}), dev({ revokedAt: ago(0) })])).toBe("2 browsers");
+    expect(devicesSummary([dev({ isSelf: true })])).toBe("1 browser");
+  });
+
+  it("builds snapshot rows with device names and tab counts", () => {
+    const snap = (over: Partial<{ id: number; deviceId: string; reason: string; entryCount: number }>) => ({
+      id: 1,
+      revision: 3,
+      deviceId: "self",
+      reason: "operations",
+      createdAt: ago(60_000),
+      entryCount: 12,
+      ...over,
+    });
+    const rows = snapshotRows(
+      [snap({}), snap({ id: 2, deviceId: "other", entryCount: 1, reason: "restore" }), snap({ id: 3, deviceId: "gone" })],
+      "self",
+      [dev({ id: "other", name: "Safari on macOS" })],
+    );
+    expect(rows.map(({ when: _when, ...r }) => r)).toEqual([
+      { id: 1, device: "This browser", tabs: "12 tabs", why: "Taken before a change" },
+      { id: 2, device: "Safari on macOS", tabs: "1 tab", why: "Taken before a restore" },
+      { id: 3, device: "A removed browser", tabs: "12 tabs", why: "Taken before a change" },
+    ]);
+    expect(rows[0]!.when).toEqual(expect.any(String));
+    expect(snapshotsSummary(0)).toBe("None yet");
+    expect(snapshotsSummary(1)).toBe("1 snapshot");
+    expect(snapshotsSummary(4)).toBe("4 snapshots");
+
+    const many = Array.from({ length: 20 }, (_, i) => i);
+    expect(snapshotList(many, false)).toEqual({ rows: many.slice(0, SNAPSHOT_LIMIT), more: "Show all 20" });
+    expect(snapshotList(many, true)).toEqual({ rows: many, more: null });
+    expect(snapshotList(many.slice(0, 6), false)).toEqual({ rows: many.slice(0, 6), more: null });
   });
 
   it("formats the owner line and relative times", () => {
@@ -206,5 +269,120 @@ describe("device list view model", () => {
     expect(relativeTime(null, now)).toBe("never");
     expect(relativeTime(ago(30_000), now)).toBe("just now");
     expect(relativeTime(ago(5 * 3600_000), now)).toBe("5 h ago");
+    expect(relativeTime(ago(30 * 3600_000), now)).toBe("yesterday");
+    expect(relativeTime(ago(3 * 86_400_000), now)).toBe("3 days ago");
+    expect(relativeTime(ago(30 * 86_400_000), now)).toMatch(/^on /);
+  });
+});
+
+describe("hero view model", () => {
+  const now = Date.parse("2026-10-13T10:00:00.000Z");
+  const self = "1a2b3c4d-0000-4000-8000-000000000001";
+  const other = { deviceId: "5e6f7a8b-0000-4000-8000-000000000002", name: "Safari on macOS", generation: 4, lastSeenAt: "t" };
+  const base: StatusView = {
+    paired: true,
+    serverUrl: "https://sync.example",
+    deviceName: "Brave on macOS",
+    deviceId: self,
+    pairedAt: null,
+    owner: null,
+    isOwner: false,
+    generation: null,
+    lastRevision: 7,
+    minRevision: null,
+    lastSuccessAt: new Date(now - 12_000).toISOString(),
+    pendingCount: 0,
+    online: true,
+    nextRetryAt: null,
+    paused: false,
+    summary: "",
+    lastError: null,
+    errorKind: null,
+    statusText: null,
+    running: false,
+    lastActivityAt: null,
+    lastActivityKind: null,
+  };
+  const ctx: HeroContext = { now, offline: false, working: false, devices: null };
+  const view = (over: Partial<StatusView>, c: Partial<HeroContext> = {}) => heroView({ ...base, ...over }, { ...ctx, ...c });
+
+  it("maps each state to a status line, a driver dot and a tone", () => {
+    expect(view({ isOwner: true, generation: 4, owner: { ...other, deviceId: self, name: "Brave on macOS" } })).toMatchObject({
+      title: "This browser is driving",
+      driver: "self",
+      tone: "ok",
+      detail: "Saved 12 s ago",
+      selfLabel: "Brave on macOS",
+    });
+    expect(view({ owner: other })).toMatchObject({
+      title: "Following Safari on macOS",
+      driver: "other",
+      tone: "neutral",
+      detail: "Synced 12 s ago",
+      otherLabel: "Safari on macOS",
+    });
+    expect(view({})).toMatchObject({ title: "Nobody is driving", driver: "none", tone: "neutral" });
+    expect(view({ paused: true, owner: other })).toMatchObject({ title: "Paused", driver: "other", tone: "warn" });
+    expect(view({ paired: false, deviceId: null })).toMatchObject({
+      title: "Not connected",
+      driver: "none",
+      tone: "off",
+      selfLabel: "This browser",
+      otherLabel: "Other browsers",
+    });
+    expect(view({ owner: other, lastError: "Cannot reach", errorKind: "unreachable" })).toMatchObject({ tone: "bad", driver: "other" });
+  });
+
+  it("describes pending work, retries and offline in the detail line", () => {
+    const retryAt = new Date(2026, 9, 13, 10, 42).getTime();
+    expect(view({ pendingCount: 3, nextRetryAt: retryAt }).detail).toBe("3 changes waiting, retrying at 10:42");
+    expect(view({ pendingCount: 1 }).detail).toBe("1 change waiting");
+    expect(view({ pendingCount: 3, online: false }).detail).toBe("Offline, 3 changes waiting");
+    expect(view({ pendingCount: 3 }, { offline: true }).detail).toBe("Offline, 3 changes waiting");
+    expect(view({}, { offline: true }).detail).toBe("Offline");
+    expect(view({ lastSuccessAt: null }).detail).toBe("Not synced yet");
+    expect(view({}, { working: true }).detail).toBe("Syncing now");
+    expect(view({ paused: true, pendingCount: 2 }).detail).toBe("2 changes waiting, kept until you resume");
+    expect(view({ isOwner: true, lastSuccessAt: new Date(now - 5 * 60_000).toISOString() }).detail).toBe("Saved 5 min ago");
+  });
+
+  it("labels the other relay dot from the device list when not following", () => {
+    const d = (id: string, name: string, over: Partial<Device> = {}): Device => ({
+      id,
+      name,
+      browser: "brave",
+      createdAt: "t",
+      lastSeenAt: "t",
+      isSelf: id === self,
+      ...over,
+    });
+    const mine = d(self, "Brave on macOS");
+    expect(view({ isOwner: true }, { devices: [mine, d("b", "Safari on macOS")] }).otherLabel).toBe("Safari on macOS");
+    expect(view({ isOwner: true }, { devices: [mine, d("b", "Safari"), d("c", "Edge")] }).otherLabel).toBe("2 other browsers");
+    expect(view({ isOwner: true }, { devices: [mine, d("c", "Old", { revokedAt: "t" })] }).otherLabel).toBe("No other browsers");
+    expect(view({ isOwner: true }).otherLabel).toBe("Other browsers");
+  });
+
+  it("picks the primary action, the error fix and the activity line", () => {
+    expect(primaryAction({ ...base, isOwner: true })).toMatchObject({ label: "Hand over", request: "handOver" });
+    expect(primaryAction({ ...base, owner: other })).toMatchObject({ label: "Continue here", request: "continueHere" });
+    expect(primaryAction(base)).toMatchObject({ label: "Continue here", request: "continueHere" });
+    expect(primaryAction({ ...base, paused: true, isOwner: true })).toMatchObject({ label: "Resume sync", request: "resume" });
+
+    expect(errorFix({ lastError: "x", errorKind: "permission" })).toBe("grant");
+    expect(errorFix({ lastError: "x", errorKind: "unreachable" })).toBe("retry");
+    expect(errorFix({ lastError: "x", errorKind: "server" })).toBe("retry");
+    expect(errorFix({ lastError: "x", errorKind: "device_revoked" })).toBeNull();
+    expect(errorFix({ lastError: null, errorKind: "server" })).toBeNull();
+
+    expect(activityLine({ lastActivityAt: null, lastActivityKind: null })).toBe("None yet");
+    expect(activityLine({ lastActivityAt: new Date(2026, 9, 13, 10, 22).getTime(), lastActivityKind: "activated" })).toBe("Tab switch, 10:22");
+  });
+
+  it("counts seconds for the saved line", () => {
+    expect(secondsAgo(new Date(now - 2_000).toISOString(), now)).toBe("just now");
+    expect(secondsAgo(new Date(now - 12_000).toISOString(), now)).toBe("12 s ago");
+    expect(secondsAgo(new Date(now - 90_000).toISOString(), now)).toBe("1 min ago");
+    expect(secondsAgo(new Date(now - 2 * 3600_000).toISOString(), now)).toBe("2 h ago");
   });
 });

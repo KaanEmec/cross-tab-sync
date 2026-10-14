@@ -3,97 +3,225 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>Cross-Tab-Sync</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <header>
-      <h1>Cross-Tab-Sync</h1>
-      <span id="badge" class="badge" hidden></span>
+    <svg hidden xmlns="http://www.w3.org/2000/svg">
+      <symbol id="i-logo" viewBox="0 0 24 24">
+        <rect x="2" y="7.5" width="7" height="9" rx="2.25" fill="currentColor" />
+        <rect x="15" y="7.5" width="7" height="9" rx="2.25" />
+        <path d="M9 12h6" />
+      </symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24">
+        <path d="M19.5 10.5A7.75 7.75 0 0 0 5.9 7.1L4.5 8.5" />
+        <path d="M4.5 4v4.5H9" />
+        <path d="M4.5 13.5a7.75 7.75 0 0 0 13.6 3.4l1.4-1.4" />
+        <path d="M19.5 20v-4.5H15" />
+      </symbol>
+      <symbol id="i-devices" viewBox="0 0 24 24">
+        <path d="M8 15H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v3" />
+        <rect x="8" y="9" width="13" height="11" rx="2" />
+      </symbol>
+      <symbol id="i-history" viewBox="0 0 24 24">
+        <path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1L3.5 8.5" />
+        <path d="M3.5 3.5v5h5" />
+        <path d="M12 7.5V12l3 2" />
+      </symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24">
+        <path d="M4 7h9M17 7h3M4 17h3M11 17h9" />
+        <circle cx="15" cy="7" r="2" />
+        <circle cx="9" cy="17" r="2" />
+      </symbol>
+      <symbol id="i-link" viewBox="0 0 24 24">
+        <path d="M10 14a4 4 0 0 0 5.66 0l3-3A4 4 0 0 0 13 5.34l-1 1" />
+        <path d="M14 10a4 4 0 0 0-5.66 0l-3 3A4 4 0 0 0 11 18.66l1-1" />
+      </symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24">
+        <rect x="8.5" y="8.5" width="11.5" height="11.5" rx="2" />
+        <path d="M15.5 8.5V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7.5a2 2 0 0 0 2 2h2.5" />
+      </symbol>
+      <symbol id="i-pencil" viewBox="0 0 24 24">
+        <path d="M4 20h4L18.5 9.5a2.83 2.83 0 0 0-4-4L4 16v4z" />
+        <path d="M13 7l4 4" />
+      </symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24">
+        <path d="M9.5 6l6 6-6 6" />
+      </symbol>
+      <symbol id="i-check" viewBox="0 0 24 24">
+        <path d="M5 12.5l4.5 4.5L19 7.5" />
+      </symbol>
+    </svg>
+
+    <header class="top">
+      <div class="brand">
+        <svg class="logo" aria-hidden="true"><use href="#i-logo" /></svg>
+        <h1>Cross-Tab-Sync</h1>
+      </div>
+      <button id="id-chip" class="chip" type="button" title="Paired id of this browser" hidden>
+        <span id="id-chip-text"></span>
+      </button>
     </header>
 
-    <form id="pair-view" novalidate hidden>
-      <label>Paste pairing link
-        <input id="pair-link" type="text" placeholder="https://tabs.example.com#ABCD2345" autocomplete="off"
-          spellcheck="false" autocapitalize="off" />
+    <section id="hero" class="hero" data-tone="off" data-driver="none" aria-live="polite">
+      <svg class="relay" viewBox="0 0 294 24" aria-hidden="true">
+        <line class="track" x1="18" y1="12" x2="276" y2="12" />
+        <line class="flow" x1="18" y1="12" x2="276" y2="12" />
+        <circle class="halo self" cx="9" cy="12" r="9" />
+        <circle class="halo other" cx="285" cy="12" r="9" />
+        <circle class="node self" cx="9" cy="12" r="5.5" />
+        <circle class="node other" cx="285" cy="12" r="5.5" />
+      </svg>
+      <div class="relay-labels">
+        <span id="relay-self">This browser</span>
+        <span id="relay-other">Other browsers</span>
+      </div>
+      <p id="hero-title" class="hero-title">Not connected</p>
+      <p id="hero-detail" class="hero-detail"></p>
+    </section>
+
+    <div id="error" class="error" role="alert" hidden>
+      <p id="error-text"></p>
+      <button id="error-fix" type="button" class="btn small fix" hidden></button>
+    </div>
+
+    <form id="pair-view" class="pair" novalidate hidden>
+      <label class="field">
+        <span class="field-label">Pairing link</span>
+        <input id="pair-link" type="text" placeholder="https://your-server#CODE" autocomplete="off" spellcheck="false"
+          autocapitalize="off" />
       </label>
-      <p id="pair-target" class="hint">From <b>Invite another browser</b> on a paired browser, or <code>cross-tab-sync pair-code</code> on the server.</p>
-      <label>Device name
+      <p id="pair-target" class="hint">Get one from <b>Invite another browser</b> on a paired browser, or run
+        <code>cross-tab-sync pair-code</code> on the server.</p>
+      <label class="field">
+        <span class="field-label">This browser's name</span>
         <input id="device-name" type="text" maxlength="64" />
       </label>
-      <details id="pair-advanced">
-        <summary>Advanced</summary>
-        <label>Server URL
-          <input id="server-url" type="text" inputmode="url" placeholder="https://tabs.example.com" autocomplete="url"
-            spellcheck="false" autocapitalize="off" />
-        </label>
-        <label>Pairing code
-          <input id="pair-code" type="text" maxlength="16" autocomplete="one-time-code"
-            spellcheck="false" autocapitalize="characters" placeholder="8 characters" />
-        </label>
+      <button id="pair" type="submit" class="btn primary wide">Pair this browser</button>
+      <details id="pair-advanced" class="fold">
+        <summary>
+          <svg class="glyph" aria-hidden="true"><use href="#i-sliders" /></svg>
+          <span class="fold-label">Advanced</span>
+          <span class="fold-summary">Server URL and code</span>
+          <svg class="chev" aria-hidden="true"><use href="#i-chevron" /></svg>
+        </summary>
+        <div class="fold-body">
+          <label class="field">
+            <span class="field-label">Server URL</span>
+            <input id="server-url" type="text" inputmode="url" placeholder="https://your-server" autocomplete="url"
+              spellcheck="false" autocapitalize="off" />
+          </label>
+          <label class="field">
+            <span class="field-label">Code</span>
+            <input id="pair-code" type="text" maxlength="16" autocomplete="one-time-code" spellcheck="false"
+              autocapitalize="characters" placeholder="8 letters and digits" />
+          </label>
+        </div>
       </details>
-      <button id="pair" type="submit" class="primary">Pair</button>
     </form>
 
     <section id="main-view" hidden>
-      <dl class="facts">
-        <dt>Role</dt><dd id="role"></dd>
-        <dt>Owner</dt><dd id="owner"></dd>
-        <dt>Last sync</dt><dd id="last-sync"></dd>
-        <dt>Local changes</dt><dd id="sync-state"></dd>
-      </dl>
-      <p id="applied-note" class="hint"></p>
-      <p id="status-text" class="status"></p>
-      <p id="last-activity" class="hint" hidden></p>
       <div class="actions">
-        <button id="hand-over" type="button">Hand over</button>
-        <button id="continue-here" type="button">Continue here</button>
-        <button id="sync-now" type="button" title="Owner: publish pending changes. Follower: send local changes and fetch the latest.">Sync now</button>
-        <button id="pause" type="button" title="Stop syncing on this browser. Local changes are kept.">Pause sync</button>
-        <button id="grant" type="button" class="wide primary" hidden>Grant access to the server</button>
+        <button id="primary" type="button" class="btn primary">Continue here</button>
+        <button id="sync-now" type="button" class="btn secondary square" title="Sync now" aria-label="Sync now">
+          <svg aria-hidden="true"><use href="#i-refresh" /></svg>
+        </button>
       </div>
-      <details id="recover-section">
-        <summary>Recover</summary>
-        <p id="restore-note" class="hint"></p>
-        <ul id="snapshots" class="list"></ul>
-      </details>
-      <details id="device-section">
-        <summary>This device <span id="self-summary" class="muted"></span></summary>
-        <dl class="facts">
-          <dt>Name</dt>
-          <dd><span id="self-name"></span> <button id="rename" type="button" class="link">Rename</button></dd>
-          <dt>Browser</dt><dd id="self-browser"></dd>
-          <dt>Device id</dt>
-          <dd><code id="self-id"></code> <button id="copy-id" type="button" class="link" title="Copy the full device id">Copy</button></dd>
-          <dt>Server</dt><dd id="self-server"></dd>
-          <dt>Paired since</dt><dd id="self-since"></dd>
-        </dl>
-        <form id="rename-form" class="inline" hidden>
-          <input id="rename-input" type="text" maxlength="64" aria-label="New device name" />
-          <button type="submit">Save</button>
-          <button id="rename-cancel" type="button" class="link">Cancel</button>
-        </form>
-      </details>
-      <details id="devices-section">
-        <summary>Devices</summary>
-        <ul id="devices" class="list"></ul>
-      </details>
-      <div class="pairing">
-        <button id="invite" type="button" class="link">Invite another browser</button>
-        <div id="invite-box" hidden>
-          <div class="inline">
-            <input id="invite-link" type="text" readonly aria-label="Pairing link" />
-            <button id="copy-link" type="button">Copy</button>
+
+      <div class="folds">
+        <details id="devices-section" class="fold" name="more">
+          <summary>
+            <svg class="glyph" aria-hidden="true"><use href="#i-devices" /></svg>
+            <span class="fold-label">Devices</span>
+            <span id="devices-summary" class="fold-summary"></span>
+            <svg class="chev" aria-hidden="true"><use href="#i-chevron" /></svg>
+          </summary>
+          <div class="fold-body">
+            <div class="self">
+              <p class="self-label">This browser</p>
+              <div id="self-name-line" class="self-name">
+                <span id="self-name"></span>
+                <button id="rename" type="button" class="icon-btn" title="Rename this browser" aria-label="Rename this browser">
+                  <svg aria-hidden="true"><use href="#i-pencil" /></svg>
+                </button>
+              </div>
+              <form id="rename-form" class="inline" hidden>
+                <input id="rename-input" type="text" maxlength="64" aria-label="New name for this browser" />
+                <button type="submit" class="btn small primary">Save</button>
+                <button id="rename-cancel" type="button" class="btn small secondary">Cancel</button>
+              </form>
+              <p class="meta">
+                <span id="self-browser"></span>
+                <code id="self-id"></code>
+                <button id="copy-id" type="button" class="text-btn" title="Copy the full id of this browser">Copy</button>
+              </p>
+            </div>
+            <ul id="devices" class="rows"></ul>
+            <button id="invite" type="button" class="btn secondary wide">
+              <svg aria-hidden="true"><use href="#i-link" /></svg>
+              <span>Invite another browser</span>
+            </button>
+            <div id="invite-box" class="invite" hidden>
+              <div class="inline">
+                <input id="invite-link" type="text" readonly aria-label="Pairing link" />
+                <button id="copy-link" type="button" class="btn small secondary">
+                  <svg aria-hidden="true"><use href="#i-copy" /></svg>
+                  <span>Copy</span>
+                </button>
+              </div>
+              <p id="invite-note" class="hint"></p>
+            </div>
           </div>
-          <p id="invite-note" class="hint"></p>
-        </div>
+        </details>
+
+        <details id="recover-section" class="fold" name="more">
+          <summary>
+            <svg class="glyph" aria-hidden="true"><use href="#i-history" /></svg>
+            <span class="fold-label">Recovery</span>
+            <span id="snapshots-summary" class="fold-summary"></span>
+            <svg class="chev" aria-hidden="true"><use href="#i-chevron" /></svg>
+          </summary>
+          <div class="fold-body">
+            <ul id="snapshots" class="rows"></ul>
+            <p class="hint">Restores tabs by URL. Unsaved page content is not recovered.</p>
+          </div>
+        </details>
+
+        <details id="settings-section" class="fold" name="more">
+          <summary>
+            <svg class="glyph" aria-hidden="true"><use href="#i-sliders" /></svg>
+            <span class="fold-label">Settings</span>
+            <span id="settings-summary" class="fold-summary"></span>
+            <svg class="chev" aria-hidden="true"><use href="#i-chevron" /></svg>
+          </summary>
+          <div class="fold-body">
+            <div class="setting toggle">
+              <span id="pause-label" class="setting-label">Sync on this browser</span>
+              <button id="pause" type="button" role="switch" class="switch" aria-checked="true" aria-labelledby="pause-label"
+                title="Pause sync"><span class="knob"></span></button>
+            </div>
+            <div class="setting">
+              <span class="setting-label">Server</span>
+              <span id="self-server" class="setting-value"></span>
+            </div>
+            <div class="setting">
+              <span class="setting-label">Last activity</span>
+              <span id="last-activity" class="setting-value"></span>
+            </div>
+            <div id="last-result-row" class="setting" hidden>
+              <span class="setting-label">Status</span>
+              <span id="last-result" class="setting-value"></span>
+            </div>
+            <div class="setting">
+              <button id="disconnect" type="button" class="text-btn danger"
+                title="Releases driving and revokes this browser on the server. Your tabs stay open.">Disconnect</button>
+            </div>
+          </div>
+        </details>
       </div>
-      <footer>
-        <button id="disconnect" type="button" class="link danger">Disconnect</button>
-      </footer>
     </section>
 
-    <p id="error" class="error" role="alert" hidden></p>
     <script src="popup.js"></script>
   </body>
 </html>
