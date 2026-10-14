@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createCipher, generateKey } from "../src/core/crypto.js";
 import type { Operation } from "../src/core/client.js";
 import { acknowledge, append, batches, list, MAX_BATCH_BYTES, newOpId, pendingEntryIds, wireSize } from "../src/core/journal.js";
 
@@ -38,6 +39,31 @@ describe("journal", () => {
     for (const b of out) expect(b.reduce((n, op) => n + wireSize(op) + 1, 0)).toBeLessThanOrEqual(MAX_BATCH_BYTES);
     // Small operations: the 500-operation cap decides.
     expect(batches(Array.from({ length: 1200 }, (_, i) => open(i))).map((b) => b.length)).toEqual([500, 500, 200]);
+  });
+
+  it("worst case: 500 merge operations with 2048-byte URLs seal into bodies of at most 256 KiB", async () => {
+    const cipher = await createCipher(generateKey());
+    const url = (i: number) => {
+      const prefix = `https://w.example/${i}/`;
+      return prefix + "é".repeat(Math.floor((2048 - prefix.length) / 2)) + "x".repeat((2048 - prefix.length) % 2);
+    };
+    const ops = Array.from({ length: 500 }, (_, i) => ({
+      opId: crypto.randomUUID(),
+      type: "open" as const,
+      entryId: crypto.randomUUID(),
+      url: url(i),
+      pinned: false,
+      position: 99_999,
+      baseRevision: 9_999_999_999,
+    }));
+    expect(new TextEncoder().encode(ops[0]!.url).length).toBe(2048);
+    const out = batches(ops);
+    expect(out.flat()).toHaveLength(500);
+    for (const batch of out) {
+      const sealed = await Promise.all(batch.map(async ({ url: u, ...rest }) => ({ ...rest, ...(await cipher.seal(u)) })));
+      const body = JSON.stringify({ generation: 9_999_999, baseRevision: 9_999_999_999, operations: sealed });
+      expect(new TextEncoder().encode(body).length).toBeLessThanOrEqual(256 * 1024);
+    }
   });
 
   it("estimates the sealed size of URL operations: urlKey plus base64url of 64-byte padded blocks", () => {

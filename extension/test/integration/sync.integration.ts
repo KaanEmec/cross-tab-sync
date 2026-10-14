@@ -344,6 +344,15 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     expect(s).toMatchObject({ token: null, syncKey: null, errorKind: "key" });
     const devices = await listDevices(safari.deps);
     expect(devices.find((d) => d.name === "Late")?.revokedAt).toEqual(expect.any(String));
+
+    // An invite link with another key fails the key check (409 key_set) and revokes itself too.
+    const invite = parsePairingInput((await createPairingCode(safari.deps)).link);
+    const wrong: Deps = { adapter: new FakeBrowser(), browser: "brave", api: clientFactory };
+    const owner = (await (await api(safari)).session()).owner;
+    await expect(pair(wrong, { ...invite, key: "A".repeat(43), deviceName: "Wrong" })).rejects.toThrow(KEY_REQUIRED_MESSAGE);
+    expect(await loadState(wrong.adapter.storage)).toMatchObject({ token: null, syncKey: null, errorKind: "key" });
+    expect((await listDevices(safari.deps)).find((d) => d.name === "Wrong")?.revokedAt).toEqual(expect.any(String));
+    expect((await (await api(safari)).session()).owner).toEqual(owner);
   });
 
   it.skipIf(!hasSqlite)("the database holds no readable URLs", async () => {

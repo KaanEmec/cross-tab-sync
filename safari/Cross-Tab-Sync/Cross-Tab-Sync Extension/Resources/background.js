@@ -154,14 +154,22 @@
     out.set(bytes, 2);
     return out;
   }
-  async function createCipher(key) {
+  async function deriveKeys(key) {
     const root = await crypto.subtle.importKey("raw", decodeKey(key), "HKDF", false, ["deriveKey"]);
     const hkdf = (info) => ({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: encoder.encode(info) });
     const mac = await crypto.subtle.deriveKey(hkdf("cts-url-mac"), root, { name: "HMAC", hash: "SHA-256", length: 256 }, false, ["sign"]);
     const enc = await crypto.subtle.deriveKey(hkdf("cts-url-enc"), root, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    return { mac, enc };
+  }
+  var hmac = async (mac, text) => base64url(new Uint8Array(await crypto.subtle.sign("HMAC", mac, encoder.encode(text))));
+  async function keyCheck(key) {
+    return hmac((await deriveKeys(key)).mac, "cts-key-check");
+  }
+  async function createCipher(key) {
+    const { mac, enc } = await deriveKeys(key);
     return {
       async seal(url) {
-        const urlKey = base64url(new Uint8Array(await crypto.subtle.sign("HMAC", mac, encoder.encode(url))));
+        const urlKey = await hmac(mac, url);
         const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
         const params = { name: "AES-GCM", iv: nonce, additionalData: encoder.encode(urlKey) };
         const sealed = new Uint8Array(await crypto.subtle.encrypt(params, enc, pad(url)));
@@ -171,6 +179,7 @@
         out.set(sealed, 1 + NONCE_BYTES);
         return { urlKey, urlEnc: base64url(out) };
       },
+      /** Authenticated decryption, then the URL must hash to `urlKey` (the AAD alone binds only the pair). */
       async open({ urlKey, urlEnc }) {
         try {
           const raw = fromBase64url(urlEnc);
@@ -179,7 +188,9 @@
           const plain = new Uint8Array(await crypto.subtle.decrypt(params, enc, raw.slice(1 + NONCE_BYTES)));
           const length = plain[0] << 8 | plain[1];
           if (plain.length % BLOCK !== 0 || length + 2 > plain.length) throw new Error("length");
-          return decoder.decode(plain.subarray(2, 2 + length));
+          const url = decoder.decode(plain.subarray(2, 2 + length));
+          if (await hmac(mac, url) !== urlKey) throw new Error("urlKey");
+          return url;
         } catch {
           throw new KeyMismatchError();
         }
@@ -196,6 +207,9 @@
       ciphers.set(key, c);
     }
     return c;
+  }
+  function forgetCiphers() {
+    ciphers.clear();
   }
 
   // src/core/client.ts
@@ -238,6 +252,11 @@
       return null;
     }
   }
+  function checkWire(item, sealed) {
+    const fields = item;
+    const ok = !("url" in fields) && (!sealed || typeof fields["urlKey"] === "string" && typeof fields["urlEnc"] === "string");
+    if (!ok) throw new ApiError(200, "bad_wire", "The server sent a tab that is not encrypted with this browser's key");
+  }
   var ApiClient = class {
     baseUrl;
     token;
@@ -272,17 +291,27 @@
     async session() {
       return this.openSession(await this.request("GET", "/v2/session"));
     }
-    /** The session revision only, without decrypting entries (pairing checks whether the session is empty). */
-    async sessionRevision() {
-      return (await this.request("GET", "/v2/session")).revision;
+    /** The session's key check only, without decrypting entries (keyless pairing). */
+    async sessionKeyCheck() {
+      return (await this.request("GET", "/v2/session")).keyCheck ?? null;
+    }
+    /** Store the key check (first browser) or confirm it: `409 key_set` when another key's check is stored. */
+    async putKeyCheck(keyCheck2) {
+      await this.request("PUT", "/v2/session/key", { keyCheck: keyCheck2 });
     }
     async changes(since) {
       const res = await this.request("GET", `/v2/session/changes?since=${encodeURIComponent(String(since))}`);
       return { ...res, operations: await this.openLogged(res.operations) };
     }
+    /** A session this device cannot open gives the ownership straight back (best effort). */
     async acquire(force) {
       const res = await this.request("POST", "/v2/session/acquire", { force });
-      return { ...res, session: await this.openSession(res.session) };
+      try {
+        return { ...res, session: await this.openSession(res.session) };
+      } catch (e) {
+        await this.release(res.generation).catch(() => void 0);
+        throw e;
+      }
     }
     async release(generation) {
       await this.request("POST", "/v2/session/release", { generation });
@@ -313,13 +342,16 @@
       if (!this.cipher) throw new ApiError(0, "key_mismatch", "This device has no encryption key");
       return this.cipher;
     }
-    /** Seal the URL of every `open`/`navigate`; other fields (e.g. `baseRevision`) pass through. */
+    /**
+     * Seal the URL of every `open`/`navigate`; other fields (e.g. `baseRevision`) pass through. A
+     * `url` field never leaves, whatever the operation type.
+     */
     sealAll(ops) {
       return Promise.all(
         ops.map(async (op) => {
-          if (!("url" in op)) return op;
           const { url, ...rest } = op;
-          return { ...rest, ...await this.sealUrl(url) };
+          if (op.type !== "open" && op.type !== "navigate") return rest;
+          return { ...rest, ...await this.sealUrl(url ?? "") };
         })
       );
     }
@@ -342,15 +374,23 @@
         throw new ApiError(200, "key_mismatch", why);
       }
     }
-    openOp(op) {
-      if (!("urlKey" in op)) return Promise.resolve(op);
-      const { urlKey, urlEnc, ...rest } = op;
-      return this.openUrl({ urlKey, urlEnc }).then((url) => ({ ...rest, url }));
-    }
+    /**
+     * Received operations, decided by type: `open`/`navigate` must carry exactly the sealed fields
+     * (a plaintext `url` would be a forgery: the server cannot make one we could verify), nothing
+     * carries `url`. The whole response is refused before anything is decrypted or applied.
+     */
     openLogged(items) {
-      return Promise.all(items.map(async (l) => ({ ...l, op: await this.openOp(l.op) })));
+      for (const { op } of items) checkWire(op, op.type === "open" || op.type === "navigate");
+      return Promise.all(
+        items.map(async (l) => {
+          if (!("urlKey" in l.op)) return l;
+          const { urlKey, urlEnc, ...rest } = l.op;
+          return { ...l, op: { ...rest, url: await this.openUrl({ urlKey, urlEnc }) } };
+        })
+      );
     }
     async openSession(s) {
+      for (const e of s.entries) checkWire(e, true);
       const entries = await Promise.all(
         s.entries.map(async ({ urlKey, urlEnc, ...rest }) => ({ ...rest, url: await this.openUrl({ urlKey, urlEnc }) }))
       );
@@ -853,7 +893,14 @@
   var MAX_URL_BYTES = 2048;
   var encoder3 = new TextEncoder();
   var BAD_ESCAPE = /%(?![0-9A-Fa-f]{2})/;
-  function isShareableUrl(url) {
+  function originOf(url) {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return null;
+    }
+  }
+  function isShareableUrl(url, serverUrl2 = "") {
     if (!url) return false;
     if (!url.startsWith("http://") && !url.startsWith("https://")) return false;
     if (BAD_ESCAPE.test(url)) return false;
@@ -861,14 +908,15 @@
       const parsed = new URL(url);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
       if (!parsed.hostname) return false;
+      if (serverUrl2 && parsed.origin === originOf(serverUrl2)) return false;
     } catch {
       return false;
     }
     return encoder3.encode(url).length <= MAX_URL_BYTES;
   }
-  function eligibleTabs(tabs, windows) {
+  function eligibleTabs(tabs, windows, serverUrl2 = "") {
     const normal = new Set(windows.filter((w) => w.type === "normal" && !w.incognito).map((w) => w.id));
-    return tabs.filter((t) => !t.incognito && normal.has(t.windowId) && isShareableUrl(t.url)).sort((a, b) => a.windowId - b.windowId || a.index - b.index);
+    return tabs.filter((t) => !t.incognito && normal.has(t.windowId) && isShareableUrl(t.url, serverUrl2)).sort((a, b) => a.windowId - b.windowId || a.index - b.index);
   }
 
   // src/core/state.ts
@@ -880,6 +928,7 @@
       deviceId: null,
       token: null,
       syncKey: null,
+      keyVerified: false,
       pairedAt: null,
       lastRevision: 0,
       generation: null,
@@ -940,6 +989,8 @@
       deviceId: null,
       token: null,
       syncKey: null,
+      keyVerified: false,
+      pendingPair: null,
       pairedAt: null,
       lastRevision: 0,
       generation: null,
@@ -982,7 +1033,7 @@
   function classify(e, hasPermission2) {
     if (!(e instanceof ApiError)) return null;
     if (e.code === "device_revoked") return "device_revoked";
-    if (e.code === "key_mismatch") return "key";
+    if (e.code === "key_mismatch" || e.code === "bad_wire") return "key";
     if (e.code === "unauthorized" && e.status === 401) return "unauthorized";
     if (e.code === "network_error") return hasPermission2 ? "unreachable" : "permission";
     if (e.status >= 500) return "server";
@@ -1053,6 +1104,17 @@
   function requirePaired(s) {
     if (!isPaired(s)) throw new Error("This device is not paired");
   }
+  function requireKey(s) {
+    requirePaired(s);
+    if (!s.syncKey || !s.keyVerified) throw new ApiError(0, "key_mismatch", KEY_MISMATCH_MESSAGE);
+  }
+  function keyBlocked(s) {
+    return isPaired(s) && (s.errorKind === "key" || !s.keyVerified);
+  }
+  async function dropCredentials(store, patch) {
+    forgetCiphers();
+    await store.set({ ...clearedCredentials(), ...patch });
+  }
   function ownerLabel(o) {
     return o ? `${o.name} (generation ${o.generation})` : "another device";
   }
@@ -1089,7 +1151,7 @@
     const kind = classify(e, e instanceof ApiError && e.code === "network_error" ? await hasPermission(store.deps, store.s.serverUrl) : true);
     const message = kind ? errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0) : null;
     if (kind === "device_revoked") {
-      await store.set({ ...clearedCredentials(), statusText: "Disconnected", lastError: message, errorKind: kind });
+      await dropCredentials(store, { statusText: "Disconnected", lastError: message, errorKind: kind });
     } else if (isRetryable(e)) {
       const retryAttempts = store.s.retryAttempts + 1;
       await store.set({
@@ -1099,7 +1161,9 @@
         errorKind: kind,
         lastError: message
       });
-    } else if (e instanceof ApiError && (e.status > 0 || kind === "key")) {
+    } else if (kind === "key") {
+      await store.set({ online: true, nextRetryAt: null, retryAttempts: 0, errorKind: kind, lastError: message, keyVerified: false });
+    } else if (e instanceof ApiError && e.status > 0) {
       await store.set({ online: true, nextRetryAt: null, retryAttempts: 0, errorKind: kind, lastError: message ?? e.message });
     } else {
       await store.set({ lastError: message ?? (e instanceof Error ? e.message : String(e)) });
@@ -1111,13 +1175,13 @@
   function removingTabIds(expected, now) {
     return new Set(expected.flatMap((e) => e.kind === "remove" && e.until > now ? [e.tabId] : []));
   }
-  async function captureTabs(adapter2, removing2 = /* @__PURE__ */ new Set()) {
+  async function captureTabs(adapter2, serverUrl2, removing2 = /* @__PURE__ */ new Set()) {
     const [tabs, windows] = await Promise.all([adapter2.queryTabs(), adapter2.getWindows()]);
     const all = removing2.size > 0 ? tabs.filter((t) => !removing2.has(t.id)) : tabs;
-    return { all, eligible: eligibleTabs(all, windows) };
+    return { all, eligible: eligibleTabs(all, windows, serverUrl2) };
   }
   function captureLive(store) {
-    return captureTabs(store.deps.adapter, removingTabIds(store.s.expected, nowMs(store.deps)));
+    return captureTabs(store.deps.adapter, store.s.serverUrl, removingTabIds(store.s.expected, nowMs(store.deps)));
   }
   function pendingClosedIds(journal, held = [], mappings) {
     const ids = new Set(journal.filter((p) => p.op.type === "close").map((p) => p.op.entryId));
@@ -1702,6 +1766,7 @@
     if (!isPaired(store.s)) return store.s;
     const generation = store.s.generation;
     try {
+      requireKey(store.s);
       if (generation !== null) await ownerRun(store);
       else await followerRun(store);
     } catch (e) {
@@ -1714,7 +1779,7 @@
   async function handOver(deps2) {
     const store = await Store.open(deps2);
     try {
-      requirePaired(store.s);
+      requireKey(store.s);
       const generation = store.s.generation;
       if (generation === null) throw new Error("This device is not the owner. Use Continue here to take control first.");
       await materialize(store, null, true);
@@ -1739,9 +1804,10 @@
   async function continueHere(deps2) {
     const store = await Store.open(deps2);
     try {
-      requirePaired(store.s);
+      requireKey(store.s);
       await store.set({ lastTakeoverAt: nowMs(deps2), suppressAutoTakeover: false, freshPending: false });
       const api = apiFor(deps2, store.s);
+      await api.session();
       const merged = await submitJournal(store);
       if (store.s.lastRevision > 0) {
         try {
@@ -1792,7 +1858,7 @@
       if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
       if (!code) throw new Error("Pairing code is required");
       const res = await deps2.api({ baseUrl: serverUrl2, token: null }).pair({ code, name: deviceName, browser: deps2.browser });
-      const syncKey = input.key || await keyForFirstBrowser(store, deps2, serverUrl2, res);
+      const syncKey = await verifyKey(store, deps2.api({ baseUrl: serverUrl2, token: res.token }), res.deviceId, input.key);
       const name = res.name ?? deviceName;
       const renamed = name !== deviceName ? ` as "${name}" (another device is named "${deviceName}")` : "";
       await store.set({
@@ -1802,6 +1868,7 @@
         deviceId: res.deviceId,
         token: res.token,
         syncKey,
+        keyVerified: true,
         pairedAt: nowIso(deps2),
         mappings: emptyMappings(),
         ...succeeded(deps2),
@@ -1813,20 +1880,36 @@
       return fail(store, e);
     }
   }
-  async function keyForFirstBrowser(store, deps2, baseUrl, paired) {
-    const api = deps2.api({ baseUrl, token: paired.token });
-    const revoke = () => api.deleteDevice(paired.deviceId).catch(() => void 0);
-    let revision;
+  async function verifyKey(store, api, deviceId, linkKey) {
+    const refuse = async (message) => {
+      await api.deleteDevice(deviceId).catch(() => void 0);
+      await dropCredentials(store, { errorKind: "key", statusText: null });
+      throw new Error(message);
+    };
     try {
-      revision = await api.sessionRevision();
+      let key = linkKey;
+      if (!key) {
+        const [check, devices] = await Promise.all([api.sessionKeyCheck(), api.devices()]);
+        const self = devices.findIndex((d) => d.isSelf);
+        const older = devices.slice(0, self < 0 ? devices.length : self).some((d) => !d.revokedAt);
+        if (check !== null || older) return await refuse(KEY_REQUIRED_MESSAGE);
+        key = generateKey();
+      }
+      await api.putKeyCheck(await keyCheck(key));
+      return key;
     } catch (e) {
-      await revoke();
+      if (e instanceof ApiError && e.code === "key_set") return refuse(KEY_REQUIRED_MESSAGE);
+      if (!(e instanceof ApiError)) throw e;
+      await api.deleteDevice(deviceId).catch(() => void 0);
+      await dropCredentials(store, {});
       throw e;
     }
-    if (revision === 0) return generateKey();
-    await revoke();
-    await store.set({ ...clearedCredentials(), errorKind: "key", statusText: null });
-    throw new Error(KEY_REQUIRED_MESSAGE);
+  }
+  async function dropExpiredPendingPair(deps2, now = Date.now()) {
+    const s = await loadState(deps2.adapter.storage);
+    if (s.pendingPair && now - s.pendingPair.createdAt > PENDING_PAIR_TTL_MS) {
+      await saveState(deps2.adapter.storage, { pendingPair: null });
+    }
   }
   async function pairFromPending(deps2, now = Date.now()) {
     const s = await loadState(deps2.adapter.storage);
@@ -1839,10 +1922,9 @@
   async function createPairingCode(deps2) {
     const store = await Store.open(deps2);
     try {
-      requirePaired(store.s);
+      requireKey(store.s);
       const res = await apiFor(deps2, store.s).createPairingCode();
-      const link = res.link ?? pairingLink(store.s.serverUrl, res.code);
-      return { code: res.code, expiresAt: res.expiresAt, link: store.s.syncKey ? `${link}.${store.s.syncKey}` : link };
+      return { code: res.code, expiresAt: res.expiresAt, link: pairingLink(store.s.serverUrl, res.code, store.s.syncKey) };
     } catch (e) {
       return fail(store, e);
     }
@@ -1854,12 +1936,12 @@
       if (store.s.generation !== null) await api.release(store.s.generation).catch(() => void 0);
       if (store.s.deviceId) await api.deleteDevice(store.s.deviceId).catch(() => void 0);
     }
-    await store.set({ ...clearedCredentials(), lastError: null, lastSuccessAt: null, statusText: "Disconnected" });
+    await dropCredentials(store, { lastError: null, lastSuccessAt: null, statusText: "Disconnected" });
     return store.s;
   }
   async function refreshOwner(deps2) {
     const store = await Store.open(deps2);
-    if (!isPaired(store.s)) return false;
+    if (!isPaired(store.s) || !store.s.keyVerified) return false;
     const api = apiFor(deps2, store.s);
     let owner;
     let minRevision;
@@ -1871,7 +1953,7 @@
         ({ owner, minRevision } = await api.session());
       }
     } catch (e) {
-      if (e instanceof ApiError && e.code === "device_revoked") await fail(store, e).catch(() => void 0);
+      if (e instanceof ApiError && (e.code === "device_revoked" || classify(e, true) === "key")) await fail(store, e).catch(() => void 0);
       return false;
     }
     const lostOwnership = store.s.generation !== null && (!owner || owner.deviceId !== store.s.deviceId || owner.generation !== store.s.generation);
@@ -1905,7 +1987,7 @@
   async function rematchTabs(deps2) {
     const store = await Store.open(deps2);
     if (!isPaired(store.s)) return;
-    const { all, eligible } = await captureTabs(deps2.adapter);
+    const { all, eligible } = await captureTabs(deps2.adapter, store.s.serverUrl);
     await currentMappings(store, all, eligible);
   }
 
@@ -1936,8 +2018,8 @@
       await store.set(succeeded(deps2));
       return result;
     } catch (e) {
-      if (e instanceof ApiError && e.code === "device_revoked") return fail(store, e);
       const kind = classify(e, true);
+      if (kind === "device_revoked" || kind === "key") return fail(store, e);
       throw kind ? new Error(errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0)) : e;
     }
   }
@@ -1989,7 +2071,11 @@
   }
   async function restoreSnapshot(deps2, snapshotId) {
     let store = await Store.open(deps2);
-    requirePaired(store.s);
+    try {
+      requireKey(store.s);
+    } catch (e) {
+      return fail(store, e);
+    }
     const tookOver = store.s.generation === null;
     if (tookOver) {
       await continueHere(deps2);
@@ -1999,7 +2085,10 @@
     let flushed = { rejected: 0, failed: 0 };
     try {
       if (generation === null || !isPaired(store.s)) throw new Error("This device is not the owner");
-      if (!tookOver) flushed = await flush(store);
+      if (!tookOver) {
+        await apiFor(deps2, store.s).session();
+        flushed = await flush(store);
+      }
       const res = await apiFor(deps2, store.s).restoreSnapshot(snapshotId, generation);
       const failed = await resync(store);
       const reopened = res.results.filter((r) => r.status === "applied").length;
@@ -2075,14 +2164,14 @@
       a.onTabCreated(
         (tab) => this.event(
           `created tab=${tab.id} win=${tab.windowId}`,
-          async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab), ctx), "created")
+          async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab, s.serverUrl), ctx), "created")
         )
       );
       a.onTabUpdated((tab, change) => {
         if (!isCommitted(tab, change)) return;
         this.event(
           `updated tab=${tab.id} win=${tab.windowId} status=${change.status ?? "-"}`,
-          async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab), ctx))
+          async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab, s.serverUrl), ctx))
         );
       });
       a.onTabRemoved(
@@ -2203,6 +2292,11 @@
           if (action === "syncNow") throw new Error(PAUSED_MESSAGE);
           return s;
         }
+        if (keyBlocked(s)) {
+          diag(`run ${action} skipped: key`);
+          if (action === "syncNow") throw new Error(s.lastError ?? KEY_MISMATCH_MESSAGE);
+          return s;
+        }
         if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) {
           diag(`run ${action} skipped: backing off`);
           return s;
@@ -2246,6 +2340,10 @@
         if (s.paused) {
           if (action === "takeover") return s;
           throw new Error(PAUSED_MESSAGE);
+        }
+        if (keyBlocked(s)) {
+          if (action === "takeover") return s;
+          throw new Error(s.lastError ?? KEY_MISMATCH_MESSAGE);
         }
         try {
           return await continueHere(this.deps);
@@ -2363,8 +2461,8 @@
         void this.runNow("verify").catch(ignore);
       } else if (isOwner && out.ops > 0) this.requestSync();
     }
-    async toEvent(tab) {
-      let eligible = !tab.incognito && isShareableUrl(tab.url);
+    async toEvent(tab, serverUrl2) {
+      let eligible = !tab.incognito && isShareableUrl(tab.url, serverUrl2);
       if (eligible) {
         const w = (await this.deps.adapter.getWindows()).find((x) => x.id === tab.windowId);
         eligible = Boolean(w && w.type === "normal" && !w.incognito);
@@ -2443,7 +2541,10 @@
     await adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
   }
   void adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
-  void engine.enqueue(() => saveState(adapter.storage, { runLock: null })).then(() => engine.resume());
+  void engine.enqueue(async () => {
+    await saveState(adapter.storage, { runLock: null });
+    await dropExpiredPendingPair(deps);
+  }).then(() => engine.resume());
   chrome.runtime.onInstalled.addListener((details) => {
     diag(`onInstalled ${details.reason}`);
     void setup();

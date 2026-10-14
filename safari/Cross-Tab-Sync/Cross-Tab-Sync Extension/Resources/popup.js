@@ -258,6 +258,7 @@
       deviceId: null,
       token: null,
       syncKey: null,
+      keyVerified: false,
       pairedAt: null,
       lastRevision: 0,
       generation: null,
@@ -679,7 +680,7 @@ Revision ${s.lastRevision}` + (s.minRevision !== null ? `, server history from r
     if (!res.ok || !res.pairingCode) return;
     const { link, expiresAt } = res.pairingCode;
     inviteLink.value = link;
-    $("invite-note").textContent = "This link contains your encryption key. Share it privately. It is valid 10 minutes.";
+    $("invite-note").textContent = "This link contains your encryption key. Share it privately. It is valid 10 minutes. Paste it into the other browser's extension; do not open it as a page.";
     $("invite-note").title = `Valid until ${clock(Date.parse(expiresAt))}, single use.`;
     $("invite-box").hidden = false;
     inviteLink.focus();

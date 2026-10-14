@@ -3,9 +3,10 @@
 
 import type { BrowserAdapter } from "../adapter/types.js";
 import { ApiError, originPattern, type ApiClient, type BrowserKind, type Owner } from "./client.js";
+import { forgetCiphers } from "./crypto.js";
 import { newOpId } from "./journal.js";
 import { clearedCredentials, isPaired, loadState, saveState, type State } from "./state.js";
-import { classify, errorMessage, isRetryable, retryDelay } from "./status.js";
+import { classify, errorMessage, isRetryable, KEY_MISMATCH_MESSAGE, retryDelay } from "./status.js";
 
 export type Api = Pick<
   ApiClient,
@@ -15,7 +16,8 @@ export type Api = Pick<
   | "renameDevice"
   | "deleteDevice"
   | "session"
-  | "sessionRevision"
+  | "sessionKeyCheck"
+  | "putKeyCheck"
   | "changes"
   | "acquire"
   | "release"
@@ -64,6 +66,23 @@ export function apiFor(deps: Deps, s: State): Api {
 
 export function requirePaired(s: State): void {
   if (!isPaired(s)) throw new Error("This device is not paired");
+}
+
+/** Paired with a verified key: nothing is sent or applied otherwise (fail() records kind "key"). */
+export function requireKey(s: State): void {
+  requirePaired(s);
+  if (!s.syncKey || !s.keyVerified) throw new ApiError(0, "key_mismatch", KEY_MISMATCH_MESSAGE);
+}
+
+/** Paired, but the key failed: automatic runs and takeovers stop until the browser pairs again. */
+export function keyBlocked(s: State): boolean {
+  return isPaired(s) && (s.errorKind === "key" || !s.keyVerified);
+}
+
+/** Forget credentials, key and derived keys in memory; `patch` is written with them. */
+export async function dropCredentials(store: Store, patch: Partial<State>): Promise<void> {
+  forgetCiphers();
+  await store.set({ ...clearedCredentials(), ...patch });
 }
 
 export function ownerLabel(o: Owner | null): string {
@@ -119,7 +138,7 @@ export async function fail(store: Store, e: unknown, sentGeneration?: number | n
   const kind = classify(e, e instanceof ApiError && e.code === "network_error" ? await hasPermission(store.deps, store.s.serverUrl) : true);
   const message = kind ? errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0) : null;
   if (kind === "device_revoked") {
-    await store.set({ ...clearedCredentials(), statusText: "Disconnected", lastError: message, errorKind: kind });
+    await dropCredentials(store, { statusText: "Disconnected", lastError: message, errorKind: kind });
   } else if (isRetryable(e)) {
     const retryAttempts = store.s.retryAttempts + 1;
     await store.set({
@@ -129,8 +148,12 @@ export async function fail(store: Store, e: unknown, sentGeneration?: number | n
       errorKind: kind,
       lastError: message,
     });
-  } else if (e instanceof ApiError && (e.status > 0 || kind === "key")) {
-    // The server answered (or no key: no request): retrying the same request would fail the same way.
+  } else if (kind === "key") {
+    // Another key, a forged or plaintext URL, or no verified key: nothing was applied, and nothing
+    // runs automatically until the browser pairs again.
+    await store.set({ online: true, nextRetryAt: null, retryAttempts: 0, errorKind: kind, lastError: message, keyVerified: false });
+  } else if (e instanceof ApiError && e.status > 0) {
+    // The server answered: reachable, and retrying the same request would fail the same way.
     await store.set({ online: true, nextRetryAt: null, retryAttempts: 0, errorKind: kind, lastError: message ?? e.message });
   } else {
     // A local precondition (e.g. not the owner): the backoff state is left as it is.

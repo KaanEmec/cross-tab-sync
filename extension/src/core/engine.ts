@@ -22,8 +22,8 @@ import { continueHere, handOver, rematchTabs, resetForBrowserStartup } from "./h
 import { withRunLock } from "./lock.js";
 import { restoreSnapshot } from "./recovery.js";
 import { isPaired, loadState, saveState, type State } from "./state.js";
-import { idGen, nowMs, type Deps } from "./store.js";
-import { isRetryableKind } from "./status.js";
+import { idGen, keyBlocked, nowMs, type Deps } from "./store.js";
+import { isRetryableKind, KEY_MISMATCH_MESSAGE } from "./status.js";
 import { syncRun } from "./sync.js";
 
 /** Local changes are sent about this long after the first one. */
@@ -122,13 +122,13 @@ export class SyncEngine {
     const a = this.deps.adapter;
     a.onTabCreated((tab) =>
       this.event(`created tab=${tab.id} win=${tab.windowId}`, async (s, ctx) =>
-        outcome(recordCreated(s, await this.toEvent(tab), ctx), "created"),
+        outcome(recordCreated(s, await this.toEvent(tab, s.serverUrl), ctx), "created"),
       ),
     );
     a.onTabUpdated((tab, change) => {
       if (!isCommitted(tab, change)) return;
       this.event(`updated tab=${tab.id} win=${tab.windowId} status=${change.status ?? "-"}`, async (s, ctx) =>
-        outcome(recordUpdated(s, await this.toEvent(tab), ctx)),
+        outcome(recordUpdated(s, await this.toEvent(tab, s.serverUrl), ctx)),
       );
     });
     a.onTabRemoved((tabId, windowClosing, windowId) =>
@@ -256,6 +256,12 @@ export class SyncEngine {
         if (action === "syncNow") throw new Error(PAUSED_MESSAGE);
         return s;
       }
+      // Another key: nothing runs automatically until the browser pairs again; Sync now says why.
+      if (keyBlocked(s)) {
+        diag(`run ${action} skipped: key`);
+        if (action === "syncNow") throw new Error(s.lastError ?? KEY_MISMATCH_MESSAGE);
+        return s;
+      }
       if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) {
         diag(`run ${action} skipped: backing off`);
         return s;
@@ -303,6 +309,11 @@ export class SyncEngine {
       if (s.paused) {
         if (action === "takeover") return s;
         throw new Error(PAUSED_MESSAGE);
+      }
+      // Another key: never acquire. Manual Continue here shows the message instead.
+      if (keyBlocked(s)) {
+        if (action === "takeover") return s;
+        throw new Error(s.lastError ?? KEY_MISMATCH_MESSAGE);
       }
       try {
         return await continueHere(this.deps);
@@ -438,8 +449,8 @@ export class SyncEngine {
     } else if (isOwner && out.ops > 0) this.requestSync();
   }
 
-  private async toEvent(tab: TabInfo): Promise<TabEvent> {
-    let eligible = !tab.incognito && isShareableUrl(tab.url);
+  private async toEvent(tab: TabInfo, serverUrl: string): Promise<TabEvent> {
+    let eligible = !tab.incognito && isShareableUrl(tab.url, serverUrl);
     if (eligible) {
       const w = (await this.deps.adapter.getWindows()).find((x) => x.id === tab.windowId);
       eligible = Boolean(w && w.type === "normal" && !w.incognito);

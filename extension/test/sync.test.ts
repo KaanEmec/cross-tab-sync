@@ -1,5 +1,5 @@
 // Scenarios for the v0.2 automatic sync: engine + fake browsers + fake server.
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isCommitted } from "../src/core/engine.js";
 import { list } from "../src/core/journal.js";
 import { BusyError } from "../src/core/lock.js";
@@ -14,6 +14,11 @@ beforeEach(() => {
   server = new FakeServer();
   clock = new Clock();
 });
+// Request bodies never carry a field named `url`: URLs travel sealed.
+afterEach(() => {
+  expect(server.leaks).toEqual([]);
+});
+
 
 const removals = (d: Dev) => d.b.calls.filter((c) => c.method === "removeTab").length;
 const entryOf = (url: string) => server.session().entries.find((e) => e.url === url)!.id;
@@ -479,8 +484,9 @@ describe("live testing fixes", () => {
       const calls = server.requests.slice(before).filter((r) => r.device === mac.id);
       const paths = calls.map((r) => r.path);
       const acquire = paths.indexOf("acquire");
-      // One empty batch (409 stale_owner), the follower pull of that run, then the takeover (catch-up, acquire).
-      expect(paths.slice(0, acquire)).toEqual(["operations", "changes", "changes"]);
+      // One empty batch (409 stale_owner), the follower pull of that run, then the takeover (session
+      // decrypted before anything is sent, catch-up, acquire).
+      expect(paths.slice(0, acquire)).toEqual(["operations", "changes", "session", "changes"]);
       expect(calls[0]!.body).toMatchObject({ generation, operations: [] });
       expect(paths.filter((p) => p === "acquire")).toHaveLength(1);
       expect((await mac.state()).generation).not.toBeNull();

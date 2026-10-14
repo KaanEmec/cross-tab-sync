@@ -66,16 +66,27 @@ function pad(url: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-/** Derive the HMAC and AES-GCM keys from the root key (HKDF-SHA256, empty salt). */
-export async function createCipher(key: string): Promise<Cipher> {
+/** HMAC and AES-GCM keys derived from the root key (HKDF-SHA256, empty salt). */
+async function deriveKeys(key: string): Promise<{ mac: CryptoKey; enc: CryptoKey }> {
   const root = await crypto.subtle.importKey("raw", decodeKey(key), "HKDF", false, ["deriveKey"]);
   const hkdf = (info: string) => ({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: encoder.encode(info) });
   const mac = await crypto.subtle.deriveKey(hkdf("cts-url-mac"), root, { name: "HMAC", hash: "SHA-256", length: 256 }, false, ["sign"]);
   const enc = await crypto.subtle.deriveKey(hkdf("cts-url-enc"), root, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  return { mac, enc };
+}
 
+const hmac = async (mac: CryptoKey, text: string) => base64url(new Uint8Array(await crypto.subtle.sign("HMAC", mac, encoder.encode(text))));
+
+/** The session's key check: proves a browser holds the same key without revealing it. */
+export async function keyCheck(key: string): Promise<string> {
+  return hmac((await deriveKeys(key)).mac, "cts-key-check");
+}
+
+export async function createCipher(key: string): Promise<Cipher> {
+  const { mac, enc } = await deriveKeys(key);
   return {
     async seal(url) {
-      const urlKey = base64url(new Uint8Array(await crypto.subtle.sign("HMAC", mac, encoder.encode(url))));
+      const urlKey = await hmac(mac, url);
       const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
       const params = { name: "AES-GCM", iv: nonce, additionalData: encoder.encode(urlKey) };
       const sealed = new Uint8Array(await crypto.subtle.encrypt(params, enc, pad(url)));
@@ -85,6 +96,7 @@ export async function createCipher(key: string): Promise<Cipher> {
       out.set(sealed, 1 + NONCE_BYTES);
       return { urlKey, urlEnc: base64url(out) };
     },
+    /** Authenticated decryption, then the URL must hash to `urlKey` (the AAD alone binds only the pair). */
     async open({ urlKey, urlEnc }) {
       try {
         const raw = fromBase64url(urlEnc);
@@ -93,7 +105,9 @@ export async function createCipher(key: string): Promise<Cipher> {
         const plain = new Uint8Array(await crypto.subtle.decrypt(params, enc, raw.slice(1 + NONCE_BYTES)));
         const length = (plain[0]! << 8) | plain[1]!;
         if (plain.length % BLOCK !== 0 || length + 2 > plain.length) throw new Error("length");
-        return decoder.decode(plain.subarray(2, 2 + length));
+        const url = decoder.decode(plain.subarray(2, 2 + length));
+        if ((await hmac(mac, url)) !== urlKey) throw new Error("urlKey");
+        return url;
       } catch {
         throw new KeyMismatchError();
       }
@@ -116,4 +130,9 @@ export function cipherFor(key: string): Cipher {
     ciphers.set(key, c);
   }
   return c;
+}
+
+/** Drop derived keys from memory (disconnect, revocation, refused pairing). */
+export function forgetCiphers(): void {
+  ciphers.clear();
 }

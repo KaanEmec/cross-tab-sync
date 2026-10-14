@@ -1,5 +1,5 @@
 // v1.0 recovery, devices, status strings and upgrade safety.
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { statusView } from "../src/core/messages.js";
 import { listDevices, listSnapshots, revokeDevice } from "../src/core/recovery.js";
 import { defaultState, loadState } from "../src/core/state.js";
@@ -14,6 +14,11 @@ beforeEach(() => {
   server = new FakeServer();
   clock = new Clock();
 });
+// Request bodies never carry a field named `url`: URLs travel sealed.
+afterEach(() => {
+  expect(server.leaks).toEqual([]);
+});
+
 
 async function owner(name: string, urls: string[]): Promise<Dev> {
   const d = await device(server, clock, name, { tabs: urls.map((url) => ({ url })) });

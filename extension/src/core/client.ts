@@ -23,6 +23,8 @@ export interface Entry {
 
 export interface Session {
   revision: number;
+  /** base64url(HMAC(K_mac, "cts-key-check")) stored by the first browser; null until then. */
+  keyCheck?: string | null;
   /** Oldest retained operation sequence number (v1.0). */
   minRevision?: number;
   owner: Owner | null;
@@ -116,7 +118,8 @@ export interface PairingCode {
 
 /**
  * Error codes from PROTOCOL.md plus client-only ones: `network_error` (no HTTP response),
- * `http_<status>`, and `key_mismatch` (a URL could not be decrypted: another key, or no key).
+ * `http_<status>`, `key_mismatch` (a URL could not be decrypted: another key, or no key) and
+ * `bad_wire` (a received operation or entry is not in sealed form). Both mean "key" to the user.
  */
 export type ErrorCode =
   | "invalid_request"
@@ -129,9 +132,11 @@ export type ErrorCode =
   | "stale_owner"
   | "history_expired"
   | "payload_too_large"
+  | "key_set"
   | "internal"
   | "network_error"
   | "key_mismatch"
+  | "bad_wire"
   | (string & {});
 
 export class ApiError extends Error {
@@ -195,6 +200,13 @@ export function originPattern(serverUrl: string): string | null {
   }
 }
 
+/** Throws `bad_wire` unless `item` has no `url` and, when `sealed`, string `urlKey` and `urlEnc`. */
+function checkWire(item: object, sealed: boolean): void {
+  const fields = item as Record<string, unknown>;
+  const ok = !("url" in fields) && (!sealed || (typeof fields["urlKey"] === "string" && typeof fields["urlEnc"] === "string"));
+  if (!ok) throw new ApiError(200, "bad_wire", "The server sent a tab that is not encrypted with this browser's key");
+}
+
 export class ApiClient {
   private readonly baseUrl: string;
   private readonly token: string | null;
@@ -237,9 +249,14 @@ export class ApiClient {
     return this.openSession(await this.request<WireSession>("GET", "/v2/session"));
   }
 
-  /** The session revision only, without decrypting entries (pairing checks whether the session is empty). */
-  async sessionRevision(): Promise<number> {
-    return (await this.request<{ revision: number }>("GET", "/v2/session")).revision;
+  /** The session's key check only, without decrypting entries (keyless pairing). */
+  async sessionKeyCheck(): Promise<string | null> {
+    return (await this.request<{ keyCheck?: string | null }>("GET", "/v2/session")).keyCheck ?? null;
+  }
+
+  /** Store the key check (first browser) or confirm it: `409 key_set` when another key's check is stored. */
+  async putKeyCheck(keyCheck: string): Promise<void> {
+    await this.request("PUT", "/v2/session/key", { keyCheck });
   }
 
   async changes(since: number): Promise<ChangesResponse> {
@@ -247,9 +264,15 @@ export class ApiClient {
     return { ...res, operations: await this.openLogged(res.operations) };
   }
 
+  /** A session this device cannot open gives the ownership straight back (best effort). */
   async acquire(force: boolean): Promise<{ generation: number; session: Session }> {
     const res = await this.request<{ generation: number; session: WireSession }>("POST", "/v2/session/acquire", { force });
-    return { ...res, session: await this.openSession(res.session) };
+    try {
+      return { ...res, session: await this.openSession(res.session) };
+    } catch (e) {
+      await this.release(res.generation).catch(() => undefined);
+      throw e;
+    }
   }
 
   async release(generation: number): Promise<void> {
@@ -290,13 +313,16 @@ export class ApiClient {
     return this.cipher;
   }
 
-  /** Seal the URL of every `open`/`navigate`; other fields (e.g. `baseRevision`) pass through. */
+  /**
+   * Seal the URL of every `open`/`navigate`; other fields (e.g. `baseRevision`) pass through. A
+   * `url` field never leaves, whatever the operation type.
+   */
   private sealAll<T extends Operation>(ops: T[]): Promise<Sealed<T>[]> {
     return Promise.all(
       ops.map(async (op) => {
-        if (!("url" in op)) return op as Sealed<T>;
-        const { url, ...rest } = op;
-        return { ...rest, ...(await this.sealUrl(url)) } as Sealed<T>;
+        const { url, ...rest } = op as T & { url?: string };
+        if (op.type !== "open" && op.type !== "navigate") return rest as Sealed<T>;
+        return { ...rest, ...(await this.sealUrl(url ?? "")) } as Sealed<T>;
       }),
     );
   }
@@ -322,17 +348,24 @@ export class ApiClient {
     }
   }
 
-  private openOp(op: WireOperation): Promise<Operation> {
-    if (!("urlKey" in op)) return Promise.resolve(op);
-    const { urlKey, urlEnc, ...rest } = op;
-    return this.openUrl({ urlKey, urlEnc }).then((url) => ({ ...rest, url }) as Operation);
-  }
-
+  /**
+   * Received operations, decided by type: `open`/`navigate` must carry exactly the sealed fields
+   * (a plaintext `url` would be a forgery: the server cannot make one we could verify), nothing
+   * carries `url`. The whole response is refused before anything is decrypted or applied.
+   */
   private openLogged(items: WireLoggedOperation[]): Promise<LoggedOperation[]> {
-    return Promise.all(items.map(async (l) => ({ ...l, op: await this.openOp(l.op) })));
+    for (const { op } of items) checkWire(op, op.type === "open" || op.type === "navigate");
+    return Promise.all(
+      items.map(async (l) => {
+        if (!("urlKey" in l.op)) return l as LoggedOperation;
+        const { urlKey, urlEnc, ...rest } = l.op;
+        return { ...l, op: { ...rest, url: await this.openUrl({ urlKey, urlEnc }) } as Operation };
+      }),
+    );
   }
 
   private async openSession(s: WireSession): Promise<Session> {
+    for (const e of s.entries) checkWire(e, true);
     const entries = await Promise.all(
       s.entries.map(async ({ urlKey, urlEnc, ...rest }) => ({ ...rest, url: await this.openUrl({ urlKey, urlEnc }) })),
     );

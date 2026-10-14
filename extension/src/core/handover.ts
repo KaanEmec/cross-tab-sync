@@ -5,12 +5,13 @@
 import { applyRemote, captureTabs, currentMappings } from "./apply.js";
 import { materialize } from "./materialize.js";
 import { ApiError, normalizeServerUrl, type Owner } from "./client.js";
-import { generateKey } from "./crypto.js";
+import { generateKey, keyCheck } from "./crypto.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 import { pairingLink } from "./pairing.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
-import { apiFor, fail, nowIso, nowMs, ownerLabel, requirePaired, Store, succeeded, type Deps } from "./store.js";
+import { apiFor, dropCredentials, fail, nowIso, nowMs, ownerLabel, requireKey, Store, succeeded, type Api, type Deps } from "./store.js";
 import { submitJournal } from "./merge.js";
+import { classify } from "./status.js";
 import { createFailedMessage, flush, rejectedMessage } from "./sync.js";
 
 export type { Api, Deps } from "./store.js";
@@ -23,7 +24,7 @@ export { applyResults, resolveReceivingWindow } from "./apply.js";
 export async function handOver(deps: Deps): Promise<State> {
   const store = await Store.open(deps);
   try {
-    requirePaired(store.s);
+    requireKey(store.s);
     const generation = store.s.generation;
     if (generation === null) throw new Error("This device is not the owner. Use Continue here to take control first.");
 
@@ -56,9 +57,11 @@ export async function handOver(deps: Deps): Promise<State> {
 export async function continueHere(deps: Deps): Promise<State> {
   const store = await Store.open(deps);
   try {
-    requirePaired(store.s);
+    requireKey(store.s);
     await store.set({ lastTakeoverAt: nowMs(deps), suppressAutoTakeover: false, freshPending: false });
     const api = apiFor(deps, store.s);
+    // Decrypt the session first: with another key nothing is sent and ownership never moves.
+    await api.session();
     // Changes journaled while following go through merge (causal checks), never `operations`.
     const merged = await submitJournal(store);
     // Catch up first: remote navigations and closures since the last applied revision reach this
@@ -128,7 +131,7 @@ export async function pair(
     if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
     if (!code) throw new Error("Pairing code is required");
     const res = await deps.api({ baseUrl: serverUrl, token: null }).pair({ code, name: deviceName, browser: deps.browser });
-    const syncKey = input.key || (await keyForFirstBrowser(store, deps, serverUrl, res));
+    const syncKey = await verifyKey(store, deps.api({ baseUrl: serverUrl, token: res.token }), res.deviceId, input.key);
     // The server suffixes the name when another active device uses it ("Brave on macOS 2").
     const name = res.name ?? deviceName;
     const renamed = name !== deviceName ? ` as "${name}" (another device is named "${deviceName}")` : "";
@@ -139,6 +142,7 @@ export async function pair(
       deviceId: res.deviceId,
       token: res.token,
       syncKey,
+      keyVerified: true,
       pairedAt: nowIso(deps),
       mappings: emptyMappings(),
       ...succeeded(deps),
@@ -152,24 +156,44 @@ export async function pair(
 }
 
 /**
- * Keyless pairing: a new key for an empty session. A session with history was encrypted with a key
- * this browser cannot know: the fresh device is revoked again (best effort) and the error has its
- * own class. A failed check also revokes, since the device would have no key.
+ * The key this new device uses, verified against the session's key check (PROTOCOL.md
+ * "Encryption"). An invite key must match the stored check (`PUT` 204; it stores the check if none
+ * is set yet). Without a key, this browser may only start a session that has no check and no older
+ * active device (of two keyless browsers racing, the older one wins; a `409 key_set` settles the
+ * rest). A refused or failed check revokes the fresh device (best effort) and forgets everything.
  */
-async function keyForFirstBrowser(store: Store, deps: Deps, baseUrl: string, paired: { deviceId: string; token: string }): Promise<string> {
-  const api = deps.api({ baseUrl, token: paired.token });
-  const revoke = () => api.deleteDevice(paired.deviceId).catch(() => undefined);
-  let revision: number;
+async function verifyKey(store: Store, api: Api, deviceId: string, linkKey: string | undefined): Promise<string> {
+  const refuse = async (message: string): Promise<never> => {
+    await api.deleteDevice(deviceId).catch(() => undefined);
+    await dropCredentials(store, { errorKind: "key", statusText: null });
+    throw new Error(message);
+  };
   try {
-    revision = await api.sessionRevision();
+    let key = linkKey;
+    if (!key) {
+      const [check, devices] = await Promise.all([api.sessionKeyCheck(), api.devices()]);
+      const self = devices.findIndex((d) => d.isSelf);
+      const older = devices.slice(0, self < 0 ? devices.length : self).some((d) => !d.revokedAt);
+      if (check !== null || older) return await refuse(KEY_REQUIRED_MESSAGE);
+      key = generateKey();
+    }
+    await api.putKeyCheck(await keyCheck(key));
+    return key;
   } catch (e) {
-    await revoke();
+    if (e instanceof ApiError && e.code === "key_set") return refuse(KEY_REQUIRED_MESSAGE);
+    if (!(e instanceof ApiError)) throw e; // already refused (or a local failure)
+    await api.deleteDevice(deviceId).catch(() => undefined);
+    await dropCredentials(store, {});
     throw e;
   }
-  if (revision === 0) return generateKey();
-  await revoke();
-  await store.set({ ...clearedCredentials(), errorKind: "key", statusText: null });
-  throw new Error(KEY_REQUIRED_MESSAGE);
+}
+
+/** A pairing form saved by the popup that can no longer be used (codes last 10 minutes) is dropped. */
+export async function dropExpiredPendingPair(deps: Deps, now = Date.now()): Promise<void> {
+  const s = await loadState(deps.adapter.storage);
+  if (s.pendingPair && now - s.pendingPair.createdAt > PENDING_PAIR_TTL_MS) {
+    await saveState(deps.adapter.storage, { pendingPair: null });
+  }
 }
 
 /**
@@ -186,16 +210,16 @@ export async function pairFromPending(deps: Deps, now = Date.now()): Promise<Sta
 }
 
 /**
- * A single-use code for another browser, with its invite link: the server's link (built locally
- * for older servers) plus `.<key>`. The only place the key is shown.
+ * A single-use code for another browser, with its invite link `#CODE.KEY`, the only place the key
+ * is shown. Built from the stored server URL, never from the server's `link`: a page at the link's
+ * origin could read the fragment.
  */
 export async function createPairingCode(deps: Deps): Promise<{ code: string; expiresAt: string; link: string }> {
   const store = await Store.open(deps);
   try {
-    requirePaired(store.s);
+    requireKey(store.s);
     const res = await apiFor(deps, store.s).createPairingCode();
-    const link = res.link ?? pairingLink(store.s.serverUrl, res.code);
-    return { code: res.code, expiresAt: res.expiresAt, link: store.s.syncKey ? `${link}.${store.s.syncKey}` : link };
+    return { code: res.code, expiresAt: res.expiresAt, link: pairingLink(store.s.serverUrl, res.code, store.s.syncKey!) };
   } catch (e) {
     return fail(store, e);
   }
@@ -209,14 +233,14 @@ export async function disconnect(deps: Deps): Promise<State> {
     if (store.s.generation !== null) await api.release(store.s.generation).catch(() => undefined);
     if (store.s.deviceId) await api.deleteDevice(store.s.deviceId).catch(() => undefined);
   }
-  await store.set({ ...clearedCredentials(), lastError: null, lastSuccessAt: null, statusText: "Disconnected" });
+  await dropCredentials(store, { lastError: null, lastSuccessAt: null, statusText: "Disconnected" });
   return store.s;
 }
 
 /** Refresh the known owner without applying changes (popup). Returns whether the server was reachable. */
 export async function refreshOwner(deps: Deps): Promise<boolean> {
   const store = await Store.open(deps);
-  if (!isPaired(store.s)) return false;
+  if (!isPaired(store.s) || !store.s.keyVerified) return false;
   const api = apiFor(deps, store.s);
   let owner: Owner | null;
   let minRevision: number | undefined;
@@ -228,7 +252,7 @@ export async function refreshOwner(deps: Deps): Promise<boolean> {
       ({ owner, minRevision } = await api.session());
     }
   } catch (e) {
-    if (e instanceof ApiError && e.code === "device_revoked") await fail(store, e).catch(() => undefined);
+    if (e instanceof ApiError && (e.code === "device_revoked" || classify(e, true) === "key")) await fail(store, e).catch(() => undefined);
     return false;
   }
   const lostOwnership =
@@ -274,6 +298,6 @@ export async function resetForBrowserStartup(deps: Deps): Promise<void> {
 export async function rematchTabs(deps: Deps): Promise<void> {
   const store = await Store.open(deps);
   if (!isPaired(store.s)) return;
-  const { all, eligible } = await captureTabs(deps.adapter);
+  const { all, eligible } = await captureTabs(deps.adapter, store.s.serverUrl);
   await currentMappings(store, all, eligible);
 }

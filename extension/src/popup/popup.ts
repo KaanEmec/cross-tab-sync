@@ -461,7 +461,9 @@ $("invite").addEventListener("click", async () => {
   const { link, expiresAt } = res.pairingCode;
   inviteLink.value = link;
   // The link carries the encryption key (`#CODE.KEY`).
-  $("invite-note").textContent = "This link contains your encryption key. Share it privately. It is valid 10 minutes.";
+  $("invite-note").textContent =
+    "This link contains your encryption key. Share it privately. It is valid 10 minutes. " +
+    "Paste it into the other browser's extension; do not open it as a page.";
   $("invite-note").title = `Valid until ${clock(Date.parse(expiresAt))}, single use.`;
   $("invite-box").hidden = false;
   inviteLink.focus();

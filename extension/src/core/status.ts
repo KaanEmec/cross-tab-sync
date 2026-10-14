@@ -27,7 +27,7 @@ export function isRetryable(e: unknown): boolean {
 export function classify(e: unknown, hasPermission: boolean): ErrorKind | null {
   if (!(e instanceof ApiError)) return null;
   if (e.code === "device_revoked") return "device_revoked";
-  if (e.code === "key_mismatch") return "key";
+  if (e.code === "key_mismatch" || e.code === "bad_wire") return "key";
   if (e.code === "unauthorized" && e.status === 401) return "unauthorized";
   if (e.code === "network_error") return hasPermission ? "unreachable" : "permission";
   if (e.status >= 500) return "server";

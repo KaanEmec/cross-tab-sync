@@ -163,7 +163,8 @@ describe("pairing from a link", () => {
     const brave = browser();
     await pair(mac, { serverUrl: "https://sync.example", deviceName: "Safari on macOS", code: "GOODCODE" });
     server.codes.add("SECOND22");
-    await pair(brave, { serverUrl: "https://sync.example", deviceName: "Brave on Windows", code: "SECOND22" });
+    const key = (await loadState(mac.adapter.storage)).syncKey!;
+    await pair(brave, { serverUrl: "https://sync.example", deviceName: "Brave on Windows", code: "SECOND22", key });
     await saveState(mac.adapter.storage, { owner: { deviceId: "dev-1", name: "Safari on macOS", generation: 1, lastSeenAt: "t" } });
 
     let s = await renameDevice(mac, "  Work Mac ");

@@ -1,6 +1,6 @@
 // Review fixes: retry timer after non-retryable errors, 403 vs malformed batches, takeover merges
 // the follower journal first, worker restart, and the expired-base own-entry exemption.
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SyncEngine } from "../src/core/engine.js";
 import { saveState } from "../src/core/state.js";
 import { Clock, device, ManualTimers, type Dev } from "./support/devices.js";
@@ -13,6 +13,11 @@ beforeEach(() => {
   server = new FakeServer();
   clock = new Clock();
 });
+// Request bodies never carry a field named `url`: URLs travel sealed.
+afterEach(() => {
+  expect(server.leaks).toEqual([]);
+});
+
 
 const entryOf = (url: string) => server.session().entries.find((e) => e.url === url)!.id;
 
@@ -31,6 +36,35 @@ async function follower(name: string): Promise<Dev> {
   await d.quiet();
   return d;
 }
+
+describe("encryption key failures", () => {
+  it("after a key mismatch, activity never takes over again and automatic runs stop", async () => {
+    await owner("Brave", ["https://a/"]);
+    const mac = await follower("Mac Safari");
+    await saveState(mac.b.storage, { syncKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
+    clock.advance(120_000); // the next signal is a fresh interaction
+    mac.b.userActivate(mac.tab("https://a/"));
+    await mac.settle();
+    let s = await mac.state();
+    expect(s).toMatchObject({ errorKind: "key", keyVerified: false, generation: null });
+    expect(server.owner?.name).toBe("Brave");
+    expect(mac.acquires()).toBe(0);
+
+    const before = server.requests.length;
+    for (let i = 0; i < 3; i++) {
+      clock.advance(120_000);
+      mac.b.userActivate(mac.tab("https://a/"));
+      await mac.settle();
+    }
+    await mac.engine.runNow("alarm");
+    await expect(mac.engine.runNow("syncNow")).rejects.toThrow(/Different encryption key/);
+    await expect(mac.engine.takeover("continueHere")).rejects.toThrow(/Different encryption key/);
+    expect(server.requests.length).toBe(before);
+    expect(mac.acquires()).toBe(0);
+    s = await mac.state();
+    expect(s.generation).toBeNull();
+  });
+});
 
 describe("retry timer", () => {
   it("a non-retryable answer after a backoff leaves no retry scheduled", async () => {

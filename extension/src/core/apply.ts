@@ -39,16 +39,17 @@ export function removingTabIds(expected: Expectation[], now: number): Set<number
  */
 export async function captureTabs(
   adapter: BrowserAdapter,
+  serverUrl: string,
   removing: Set<number> = new Set(),
 ): Promise<{ all: TabInfo[]; eligible: EligibleTab[] }> {
   const [tabs, windows] = await Promise.all([adapter.queryTabs(), adapter.getWindows()]);
   const all = removing.size > 0 ? tabs.filter((t) => !removing.has(t.id)) : tabs;
-  return { all, eligible: eligibleTabs(all, windows) };
+  return { all, eligible: eligibleTabs(all, windows, serverUrl) };
 }
 
 /** `captureTabs` without the tabs this store's expectations say are being removed. */
 export function captureLive(store: Store): Promise<{ all: TabInfo[]; eligible: EligibleTab[] }> {
-  return captureTabs(store.deps.adapter, removingTabIds(store.s.expected, nowMs(store.deps)));
+  return captureTabs(store.deps.adapter, store.s.serverUrl, removingTabIds(store.s.expected, nowMs(store.deps)));
 }
 
 /**

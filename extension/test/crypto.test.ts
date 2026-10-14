@@ -4,15 +4,45 @@ import {
   base64url,
   cipherFor,
   createCipher,
+  forgetCiphers,
   decodeKey,
   fromBase64url,
   generateKey,
+  keyCheck,
   KeyMismatchError,
 } from "../src/core/crypto.js";
 
 const URL_KEY = /^[A-Za-z0-9_-]{43}$/;
 const B64URL = /^[A-Za-z0-9_-]+$/;
 const encoder = new TextEncoder();
+
+/** HKDF-derived raw key bytes, independent of the implementation under test. */
+async function derived(key: string, info: string): Promise<ArrayBuffer> {
+  const root = await crypto.subtle.importKey("raw", decodeKey(key), "HKDF", false, ["deriveBits"]);
+  return crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: encoder.encode(info) }, root, 256);
+}
+
+async function hmacOf(key: string, text: string): Promise<string> {
+  const mac = await crypto.subtle.importKey("raw", await derived(key, "cts-url-mac"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return base64url(new Uint8Array(await crypto.subtle.sign("HMAC", mac, encoder.encode(text))));
+}
+
+/** An authentic ciphertext (right key, right AAD) of arbitrary plaintext bytes. */
+async function sealRaw(key: string, plain: Uint8Array<ArrayBuffer>, urlKey: string): Promise<{ urlKey: string; urlEnc: string }> {
+  const enc = await crypto.subtle.importKey("raw", await derived(key, "cts-url-enc"), "AES-GCM", false, ["encrypt"]);
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: encoder.encode(urlKey) }, enc, plain));
+  return { urlKey, urlEnc: base64url(Uint8Array.from([1, ...nonce, ...ct])) };
+}
+
+/** pad() written out: 2-byte length, bytes, zeros to `size`. */
+function padded(bytes: Uint8Array, size: number, length = bytes.length): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(size);
+  out[0] = length >> 8;
+  out[1] = length & 0xff;
+  out.set(bytes, 2);
+  return out;
+}
 
 /** Plaintext bytes inside a sealed URL: version, nonce and the 16-byte tag removed. */
 const paddedLength = (urlEnc: string) => fromBase64url(urlEnc).length - 1 - 12 - 16;
@@ -136,9 +166,45 @@ describe("cipher", () => {
     expect(await c.open(sealed)).toBe(long);
   });
 
+  it("rejects authentic ciphertexts whose plaintext is malformed or does not match urlKey", async () => {
+    const key = generateKey();
+    const c = await createCipher(key);
+    const url = "https://a.example/";
+    const bytes = encoder.encode(url);
+    const urlKey = await hmacOf(key, url);
+    // Control: a well-formed plaintext built here opens.
+    expect(await c.open(await sealRaw(key, padded(bytes, 64), urlKey))).toBe(url);
+    // Length prefix beyond the end.
+    await expect(c.open(await sealRaw(key, padded(bytes, 64, 63), urlKey))).rejects.toBeInstanceOf(KeyMismatchError);
+    // Padding not a multiple of 64 bytes.
+    await expect(c.open(await sealRaw(key, padded(bytes, 65), urlKey))).rejects.toBeInstanceOf(KeyMismatchError);
+    await expect(c.open(await sealRaw(key, padded(bytes, 40), urlKey))).rejects.toBeInstanceOf(KeyMismatchError);
+    // Invalid UTF-8 (with urlKey over the same bytes as the URL would be).
+    const badUtf8 = Uint8Array.from([...bytes, 0xc3]);
+    await expect(c.open(await sealRaw(key, padded(badUtf8, 64), urlKey))).rejects.toBeInstanceOf(KeyMismatchError);
+    // Authentic ciphertext of another URL under this urlKey (AAD and urlKey agree, the HMAC does not).
+    const other = encoder.encode("https://b.example/");
+    await expect(c.open(await sealRaw(key, padded(other, 64), urlKey))).rejects.toBeInstanceOf(KeyMismatchError);
+    expect(await c.open(await sealRaw(key, padded(other, 64), await hmacOf(key, "https://b.example/")))).toBe("https://b.example/");
+  });
+
+  it("derives a key check that is stable per key and differs between keys", async () => {
+    const key = generateKey();
+    const check = await keyCheck(key);
+    expect(check).toMatch(URL_KEY);
+    expect(await keyCheck(key)).toBe(check);
+    expect(await hmacOf(key, "cts-key-check")).toBe(check);
+    expect(await keyCheck(generateKey())).not.toBe(check);
+    // Never equal to the urlKey of any URL-shaped string with the same key: different input.
+    expect((await (await createCipher(key)).seal("https://a/")).urlKey).not.toBe(check);
+  });
+
   it("cipherFor derives once per key and reports a bad key on use", async () => {
     const key = generateKey();
     expect(cipherFor(key)).toBe(cipherFor(key));
+    const first = cipherFor(key);
+    forgetCiphers();
+    expect(cipherFor(key)).not.toBe(first);
     const sealed = await cipherFor(key).seal(url);
     expect(await (await createCipher(key)).open(sealed)).toBe(url);
     await expect(cipherFor("nope").seal(url)).rejects.toThrow(/Invalid encryption key/);

@@ -81,6 +81,13 @@ export async function uuidv5(ns: string, name: string): Promise<string> {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/** Whether any object inside `v` has a key named `url`. */
+function hasUrlField(v: unknown): boolean {
+  if (Array.isArray(v)) return v.some(hasUrlField);
+  if (!v || typeof v !== "object") return false;
+  return Object.entries(v).some(([k, x]) => k === "url" || hasUrlField(x));
+}
+
 const bad = (msg: string) => new ApiError(400, "invalid_request", msg);
 
 /** Shape checks as the server does them: ids, `urlKey`/`urlEnc` length and alphabet, never decoded. */
@@ -148,6 +155,12 @@ export class FakeServer {
   /** Answer the next N authenticated requests with this HTTP status and error code (default `internal`). */
   failNext: { status: number; count: number; code?: string } | null = null;
   snapshots: WireSnapshot[] = [];
+  /** Key check stored by the first browser (`PUT /v2/session/key`). */
+  keyCheck: string | null = null;
+  /** Origin of the `link` returned by `POST /v2/pairing-codes` (default: the request's). */
+  linkOrigin: string | null = null;
+  /** Requests whose JSON body had a key named `url` anywhere (must stay empty: URLs are sealed). */
+  leaks: string[] = [];
   /** Restore ids per (snapshot, generation, index): a retry in the same generation replays. */
   private restoreIds = new Map<string, { opId: string; entryId: string }>();
 
@@ -209,6 +222,7 @@ export class FakeServer {
     return {
       revision: this.revision,
       minRevision: this.minRevision,
+      keyCheck: this.keyCheck,
       owner: this.owner ? { ...this.owner } : null,
       entries: this.entries
         .filter((e) => e.open)
@@ -411,6 +425,7 @@ export class FakeServer {
       new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
     try {
       const body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      if (hasUrlField(body)) this.leaks.push(`${method} ${url.pathname}`);
       const out = await this.route(method, url, token, body, encoder.encode(text).length);
       if (out === undefined) return json(204, undefined);
       return json(out.status, out.body);
@@ -448,7 +463,7 @@ export class FakeServer {
       case "POST /v2/pairing-codes": {
         const code = `CODE${this.codes.size}`.padEnd(8, "X");
         this.codes.add(code);
-        const base = url.origin === "http://fake.invalid" ? "https://sync.example" : url.origin;
+        const base = this.linkOrigin ?? (url.origin === "http://fake.invalid" ? "https://sync.example" : url.origin);
         return ok({ code, expiresAt: new Date(this.now() + 600_000).toISOString(), link: `${base}#${code}` }, 201);
       }
       case "GET /v2/devices": {
@@ -472,6 +487,14 @@ export class FakeServer {
         x.revoked = true;
         x.revokedAt = new Date(this.now()).toISOString();
         if (this.owner?.deviceId === param) this.owner = null;
+        return undefined;
+      }
+      case "PUT /v2/session/key": {
+        const check = body["keyCheck"];
+        if (typeof check !== "string" || !URL_KEY.test(check)) throw bad("keyCheck must be 43 base64url characters");
+        this.requests.push({ path: "key", body: { keyCheck: check }, device: d.id });
+        if (this.keyCheck !== null && this.keyCheck !== check) throw new ApiError(409, "key_set", "another key check is stored", { owner: this.owner });
+        this.keyCheck = check;
         return undefined;
       }
       case "GET /v2/session":

@@ -153,10 +153,61 @@ describe("ApiClient encryption", () => {
     expect((await client(mockFetch(200, { revision: 3, owner: null, operations: [close] })).changes(2)).operations[0]!.op).toEqual(close.op);
   });
 
-  it("reads the session revision without decrypting (pairing check)", async () => {
-    const f = mockFetch(200, { revision: 5, owner: null, entries: [{ id: "e", urlKey: "x", urlEnc: "y" }] });
-    await expect(client(f, "cts_abc", null).sessionRevision()).resolves.toBe(5);
+  it("reads the key check without decrypting and stores one with PUT session/key", async () => {
+    const f = mockFetch(200, { revision: 5, keyCheck: null, owner: null, entries: [{ id: "e", urlKey: "x", urlEnc: "y" }] });
+    await expect(client(f, "cts_abc", null).sessionKeyCheck()).resolves.toBeNull();
     expect(f.mock.calls[0]![0]).toBe("https://sync.example/v2/session");
+    const put = mockFetch(204);
+    await client(put, "cts_abc", null).putKeyCheck("k".repeat(43));
+    expect(put.mock.calls[0]![0]).toBe("https://sync.example/v2/session/key");
+    expect(put.mock.calls[0]![1]?.method).toBe("PUT");
+    expect(sentBody(put)).toEqual({ keyCheck: "k".repeat(43) });
+    const conflict = mockFetch(409, { error: "key_set", message: "set", owner: null });
+    await expect(client(conflict).putKeyCheck("k".repeat(43))).rejects.toMatchObject({ status: 409, code: "key_set" });
+  });
+
+  it("never sends a url field: stray ones on close/update are stripped", async () => {
+    const f = mockFetch(200, { revision: 1, results: [] });
+    const close = { opId: "c", type: "close", entryId: "e", url: "https://leak.example/", baseRevision: 0 } as unknown as Operation & { baseRevision: number };
+    await client(f).merge([close]);
+    expect(sentBody(f).operations).toEqual([{ opId: "c", type: "close", entryId: "e", baseRevision: 0 }]);
+  });
+
+  it.each([
+    ["a plaintext url on an open", { type: "open", url: "https://evil.example/" }],
+    ["a url next to sealed fields", { type: "navigate", urlKey: "K", urlEnc: "E", url: "https://evil.example/" }],
+    ["an open without urlEnc", { type: "open", urlKey: "K" }],
+    ["a navigate without fields", { type: "navigate" }],
+    ["a url on a close", { type: "close", url: "https://evil.example/" }],
+  ])("refuses a received operation with %s (bad_wire), nothing of the response is returned", async (_name, op) => {
+    const good = { seq: 1, deviceId: "d", op: { opId: "g", type: "open", entryId: "g", ...(await cipher.seal("https://good.example/")) }, result: { status: "applied" } };
+    const forged = { seq: 2, deviceId: "d", op: { opId: "o", entryId: "e", ...op }, result: { status: "applied" } };
+    const changes = { revision: 2, owner: null, operations: [good, forged] };
+    await expect(client(mockFetch(200, changes)).changes(0)).rejects.toMatchObject({ status: 200, code: "bad_wire" });
+    const ops = { revision: 2, results: [], catchUp: { operations: [good, forged] } };
+    await expect(client(mockFetch(200, ops)).operations({ generation: 1, baseRevision: 0, operations: [] })).rejects.toMatchObject({
+      code: "bad_wire",
+    });
+  });
+
+  it("refuses session entries that carry a url or lack the sealed fields", async () => {
+    const sealed = await cipher.seal("https://a.example/");
+    for (const entry of [{ ...sealed, url: "https://evil/" }, { url: "https://evil/" }, { urlKey: sealed.urlKey }]) {
+      const session = { revision: 1, owner: null, entries: [{ id: "e", pinned: false, position: 0, updatedRevision: 1, ...entry }] };
+      await expect(client(mockFetch(200, session)).session()).rejects.toMatchObject({ code: "bad_wire" });
+    }
+  });
+
+  it("acquire gives the ownership back when the session cannot be opened", async () => {
+    const foreign = await (await createCipher(generateKey())).seal("https://secret.example/");
+    const f = vi.fn<FetchLike>(async (url) =>
+      String(url).endsWith("/acquire")
+        ? new Response(JSON.stringify({ generation: 7, session: { revision: 1, owner: null, entries: [{ id: "e", ...foreign, pinned: false, position: 0, updatedRevision: 1 }] } }), { status: 200 })
+        : new Response(null, { status: 204 }),
+    );
+    await expect(client(f).acquire(true)).rejects.toMatchObject({ code: "key_mismatch" });
+    expect(f.mock.calls.map((c) => c[0])).toEqual(["https://sync.example/v2/session/acquire", "https://sync.example/v2/session/release"]);
+    expect(JSON.parse(f.mock.calls[1]![1]?.body as string)).toEqual({ generation: 7 });
   });
 
   it("reports key_mismatch for data sealed with another key, a tampered ciphertext, or no key", async () => {

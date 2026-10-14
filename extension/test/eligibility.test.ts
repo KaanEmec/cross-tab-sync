@@ -9,6 +9,20 @@ const tab = (windowId: number, url: string | undefined, over: Partial<TabInfo> =
 });
 
 describe("isShareableUrl", () => {
+  it("excludes pages on the sync server's own origin (an opened invite link would leak its key)", () => {
+    const server = "https://tabs.example.com/cts";
+    expect(isShareableUrl("https://tabs.example.com/#ABCD2345.key", server)).toBe(false);
+    expect(isShareableUrl("https://tabs.example.com/cts/anything", server)).toBe(false);
+    expect(isShareableUrl("http://tabs.example.com/", server)).toBe(true); // another origin
+    expect(isShareableUrl("https://tabs.example.com:8443/", server)).toBe(true);
+    expect(isShareableUrl("https://other.example.com/", server)).toBe(true);
+    expect(isShareableUrl("https://tabs.example.com/", "")).toBe(true);
+    const w = win(1);
+    expect(eligibleTabs([tab(1, "https://tabs.example.com/#X"), tab(1, "https://a.example/")], [w], server).map((t) => t.url)).toEqual([
+      "https://a.example/",
+    ]);
+  });
+
   it.each([
     ["https://example.com/a?q=1#frag", true],
     ["http://localhost:8080/", true],

@@ -5,7 +5,7 @@ import { ApiError, type Device, type Snapshot } from "./client.js";
 import { continueHere } from "./handover.js";
 import { isPaired, type State } from "./state.js";
 import { classify, errorMessage } from "./status.js";
-import { apiFor, fail, requirePaired, Store, succeeded, type Deps } from "./store.js";
+import { apiFor, fail, requireKey, requirePaired, Store, succeeded, type Deps } from "./store.js";
 import { createFailedMessage, flush, rejectedMessage, resync } from "./sync.js";
 
 /** Read-only popup requests: a revoked device is cleared, other errors are explained, no backoff. */
@@ -17,8 +17,8 @@ async function read<T>(deps: Deps, fn: (store: Store) => Promise<T>): Promise<T>
     await store.set(succeeded(deps));
     return result;
   } catch (e) {
-    if (e instanceof ApiError && e.code === "device_revoked") return fail(store, e);
     const kind = classify(e, true);
+    if (kind === "device_revoked" || kind === "key") return fail(store, e);
     throw kind ? new Error(errorMessage(kind, store.s.serverUrl, e instanceof ApiError ? e.status : 0)) : e;
   }
 }
@@ -84,7 +84,11 @@ export async function revokeDevice(deps: Deps, deviceId: string): Promise<State>
  */
 export async function restoreSnapshot(deps: Deps, snapshotId: number): Promise<State> {
   let store = await Store.open(deps);
-  requirePaired(store.s);
+  try {
+    requireKey(store.s);
+  } catch (e) {
+    return fail(store, e);
+  }
   const tookOver = store.s.generation === null;
   if (tookOver) {
     await continueHere(deps); // records and rethrows its own failure
@@ -95,7 +99,11 @@ export async function restoreSnapshot(deps: Deps, snapshotId: number): Promise<S
   try {
     if (generation === null || !isPaired(store.s)) throw new Error("This device is not the owner");
     // Catch up first (Continue here just did), so the session rebuild below skips nothing unseen.
-    if (!tookOver) flushed = await flush(store);
+    // As in Continue here, the session must decrypt before anything is sent.
+    if (!tookOver) {
+      await apiFor(deps, store.s).session();
+      flushed = await flush(store);
+    }
     const res = await apiFor(deps, store.s).restoreSnapshot(snapshotId, generation);
     const failed = await resync(store);
     const reopened = res.results.filter((r) => r.status === "applied").length;

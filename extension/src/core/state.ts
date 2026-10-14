@@ -16,6 +16,11 @@ export interface State {
    * the credentials, shown only inside invite links, cleared with them.
    */
   syncKey: string | null;
+  /**
+   * The key's check matched the session's (`PUT /v2/session/key` answered 204 at pairing). Runs,
+   * takeovers and invites refuse without it; any decryption failure clears it.
+   */
+  keyVerified: boolean;
   /** ISO time this device paired (backfilled from the device list for devices paired before it was kept). */
   pairedAt: string | null;
   /** Last session revision this device applied. */
@@ -114,6 +119,7 @@ export function defaultState(): State {
     deviceId: null,
     token: null,
     syncKey: null,
+    keyVerified: false,
     pairedAt: null,
     lastRevision: 0,
     generation: null,
@@ -180,6 +186,8 @@ export function clearedCredentials(): Partial<State> {
     deviceId: null,
     token: null,
     syncKey: null,
+    keyVerified: false,
+    pendingPair: null,
     pairedAt: null,
     lastRevision: 0,
     generation: null,

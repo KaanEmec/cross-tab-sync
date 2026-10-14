@@ -1,5 +1,5 @@
 // v1.0 offline work: followers merge their journal, forks, backoff, reconnect, expired history, pause.
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PAUSED_MESSAGE } from "../src/core/engine.js";
 import { saveState } from "../src/core/state.js";
 import { RETRY_BASE_MS, RETRY_MAX_MS } from "../src/core/status.js";
@@ -13,6 +13,11 @@ beforeEach(() => {
   server = new FakeServer();
   clock = new Clock();
 });
+// Request bodies never carry a field named `url`: URLs travel sealed.
+afterEach(() => {
+  expect(server.leaks).toEqual([]);
+});
+
 
 const entryOf = (url: string) => server.session().entries.find((e) => e.url === url)!.id;
 const removals = (d: Dev) => d.b.calls.filter((c) => c.method === "removeTab").length;

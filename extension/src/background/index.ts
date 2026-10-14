@@ -6,7 +6,7 @@ import { ApiClient } from "../core/client.js";
 import { cipherFor } from "../core/crypto.js";
 import { diag, refreshDiagnostics } from "../core/diag.js";
 import { SyncEngine } from "../core/engine.js";
-import { createPairingCode, disconnect, pairFromPending, refreshOwner, type Deps } from "../core/handover.js";
+import { createPairingCode, disconnect, dropExpiredPendingPair, pairFromPending, refreshOwner, type Deps } from "../core/handover.js";
 import type { Device, Snapshot } from "../core/client.js";
 import { statusView, type Request, type Response } from "../core/messages.js";
 import { defaultDeviceName } from "../core/pairing.js";
@@ -61,7 +61,13 @@ void adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
 // There is one worker instance per extension, so a run lock found at worker start belongs to a
 // worker that was terminated mid-run. Clear it rather than waiting for the TTL, then send what
 // that worker journaled.
-void engine.enqueue(() => saveState(adapter.storage, { runLock: null })).then(() => engine.resume());
+// An expired saved pairing form is useless and only holds a key: drop it.
+void engine
+  .enqueue(async () => {
+    await saveState(adapter.storage, { runLock: null });
+    await dropExpiredPendingPair(deps);
+  })
+  .then(() => engine.resume());
 
 chrome.runtime.onInstalled.addListener((details) => {
   diag(`onInstalled ${details.reason}`);

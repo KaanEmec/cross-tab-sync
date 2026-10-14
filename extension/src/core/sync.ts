@@ -8,7 +8,7 @@ import { ApiError, type Operation, type OperationsResponse, type Owner } from ".
 import { acknowledge, batches, list } from "./journal.js";
 import { dropBatch, isMalformed, submitJournal } from "./merge.js";
 import { isPaired, type State } from "./state.js";
-import { apiFor, demote, fail, idGen, isStaleOwner, nowDate, Store, succeeded, type Deps } from "./store.js";
+import { apiFor, demote, fail, idGen, isStaleOwner, nowDate, requireKey, Store, succeeded, type Deps } from "./store.js";
 
 export function rejectedMessage(rejected: number): string | null {
   return rejected > 0 ? `${rejected} change(s) were rejected by the server and dropped` : null;
@@ -151,6 +151,7 @@ export async function syncRun(deps: Deps): Promise<State> {
   if (!isPaired(store.s)) return store.s;
   const generation = store.s.generation;
   try {
+    requireKey(store.s);
     if (generation !== null) await ownerRun(store);
     else await followerRun(store);
   } catch (e) {

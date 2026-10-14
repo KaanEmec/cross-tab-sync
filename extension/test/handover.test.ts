@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FakeBrowser } from "../src/adapter/fake.js";
 import { ApiError } from "../src/core/client.js";
 import {
@@ -7,6 +7,7 @@ import {
   disconnect,
   handOver,
   pair,
+  dropExpiredPendingPair,
   KEY_REQUIRED_MESSAGE,
   pairFromPending,
   refreshOwner,
@@ -19,8 +20,9 @@ import { syncRun } from "../src/core/sync.js";
 import { errorFix } from "../src/core/devices.js";
 import { statusView } from "../src/core/messages.js";
 import { KEY_MISMATCH_MESSAGE } from "../src/core/status.js";
-import { loadState, saveState } from "../src/core/state.js";
-import { FakeServer, TEST_KEY } from "./support/fakeServer.js";
+import { cipherFor, keyCheck } from "../src/core/crypto.js";
+import { clearedCredentials, loadState, saveState } from "../src/core/state.js";
+import { FakeServer, TEST_KEY, testCipher } from "./support/fakeServer.js";
 
 let server: FakeServer;
 let codeSeq = 0;
@@ -28,6 +30,11 @@ let codeSeq = 0;
 beforeEach(() => {
   server = new FakeServer();
 });
+// Request bodies never carry a field named `url`: URLs travel sealed.
+afterEach(() => {
+  expect(server.leaks).toEqual([]);
+});
+
 
 interface Dev {
   b: FakeBrowser;
@@ -99,7 +106,9 @@ describe("encryption keys at pairing", () => {
     const s = await first.run();
     expect(s.syncKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(s.token).toMatch(/^cts_/);
-    expect(server.requests.map((r) => r.path)).toEqual(["pair", "session"]);
+    expect(server.requests.map((r) => r.path)).toEqual(["pair", "session", "key"]);
+    expect(s.keyVerified).toBe(true);
+    expect(server.keyCheck).toBe(await keyCheck(s.syncKey!));
     // It can publish and read back its own tabs with that key.
     const owner = await continueHere(first.deps);
     expect(owner.lastError).toBeNull();
@@ -120,13 +129,14 @@ describe("encryption keys at pairing", () => {
     expect(late.b.calls.some((c) => c.method === "createTab")).toBe(false);
   });
 
-  it("a key from the invite link is stored without looking at the session", async () => {
+  it("a key from the invite link is verified against the key check, without reading the session", async () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
     await continueHere(mac.deps);
     const before = server.requests.length;
     const brave = await device("Brave", (b) => b.addWindow({ focused: true }));
     expect((await brave.state()).syncKey).toBe(TEST_KEY);
-    expect(server.requests.slice(before).map((r) => r.path)).toEqual(["pair"]);
+    expect(server.requests.slice(before).map((r) => r.path)).toEqual(["pair", "key"]);
+    expect((await brave.state()).keyVerified).toBe(true);
     await continueHere(brave.deps);
     expect(urls(brave.b)).toEqual(["https://a/"]);
   });
@@ -140,31 +150,136 @@ describe("encryption keys at pairing", () => {
     expect((await pairFromPending(deps))?.syncKey).toBe(TEST_KEY);
   });
 
-  it("a different key is reported as key_mismatch and nothing is applied locally", async () => {
+  it("a wrong invite key is refused by the key check: self-revoked, nothing sent, owner unchanged", async () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
     await continueHere(mac.deps);
+    const owner = server.owner;
+    const check = server.keyCheck;
+    const b = new FakeBrowser();
+    b.addWindow({ focused: true, tabs: [{ url: "https://b/" }] });
+    const deps: Deps = { adapter: b, api: server.api, browser: "brave" };
+    server.codes.add("WRONGKEY");
+    const wrongKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    await expect(pair(deps, { serverUrl: "https://sync.example", deviceName: "Brave", code: "WRONGKEY", key: wrongKey })).rejects.toThrow(
+      KEY_REQUIRED_MESSAGE,
+    );
+    const s = await loadState(b.storage);
+    expect(s).toMatchObject({ token: null, syncKey: null, keyVerified: false, errorKind: "key" });
+    expect(server.devices.at(-1)).toMatchObject({ name: "Brave", revoked: true });
+    expect(server.keyCheck).toBe(check);
+    expect(server.owner).toEqual(owner);
+    const refused = server.devices.at(-1)!.id;
+    expect(server.requests.filter((r) => r.device === refused).map((r) => r.path)).toEqual(["key"]);
+    expect(await syncRun(deps)).toMatchObject({ token: null }); // unpaired: nothing runs
+  });
+
+  it("two keyless first browsers racing: exactly one pairs, the other revokes itself", async () => {
+    const one = await keyless("RACE2345");
+    const two = await keyless("RACE6789");
+    const results = await Promise.allSettled([one.run(), two.run()]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(String(rejected.reason)).toContain(KEY_REQUIRED_MESSAGE);
+    const states = await Promise.all([one, two].map((d) => loadState(d.b.storage)));
+    const winner = states.find((x) => x.token)!;
+    expect(server.keyCheck).toBe(await keyCheck(winner.syncKey!));
+    expect(server.devices.filter((d) => !d.revoked)).toHaveLength(1);
+  });
+
+  it("a keyless browser is refused while another device is active, even before any key check", async () => {
+    server.addDevice("Old Safari", "safari"); // e.g. paired, but its key check never arrived
+    const late = await keyless("LATE2345");
+    await expect(late.run()).rejects.toThrow(KEY_REQUIRED_MESSAGE);
+    expect(server.keyCheck).toBeNull();
+    expect((await loadState(late.b.storage)).syncKey).toBeNull();
+  });
+
+  it("the invite link is built from the stored server URL, never from the server's link", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
+    server.linkOrigin = "https://evil.example";
+    const invite = await createPairingCode(mac.deps);
+    expect(invite.link).toBe(`https://sync.example#${invite.code}.${TEST_KEY}`);
+  });
+
+  it("without a verified key nothing runs, takes over or invites", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
+    await saveState(mac.b.storage, { keyVerified: false });
+    const before = server.requests.length;
+    await expect(syncRun(mac.deps)).rejects.toMatchObject({ code: "key_mismatch" });
+    await expect(continueHere(mac.deps)).rejects.toMatchObject({ code: "key_mismatch" });
+    await expect(createPairingCode(mac.deps)).rejects.toMatchObject({ code: "key_mismatch" });
+    expect(server.requests.length).toBe(before);
+    expect(server.owner).toBeNull();
+    expect(await mac.state()).toMatchObject({ errorKind: "key", lastError: KEY_MISMATCH_MESSAGE });
+  });
+
+  it("a key that stopped matching is reported, never moves ownership and applies nothing", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
+    await continueHere(mac.deps);
+    const owner = server.owner;
     const wrong = await device("Brave", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://b/" }] }));
+    // Verified at pairing, then the stored key changed (corruption, or a session re-keyed elsewhere).
     await saveState(wrong.b.storage, { syncKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
+    const before = server.requests.length;
 
     await expect(continueHere(wrong.deps)).rejects.toMatchObject({ code: "key_mismatch" });
-    let s = await wrong.state();
-    expect(s).toMatchObject({ errorKind: "key", lastError: KEY_MISMATCH_MESSAGE, online: true, nextRetryAt: null });
+    const s = await wrong.state();
+    expect(s).toMatchObject({ errorKind: "key", keyVerified: false, lastError: KEY_MISMATCH_MESSAGE, online: true, nextRetryAt: null });
     expect(errorFix(statusView(s))).toBeNull();
+    expect(server.owner).toEqual(owner);
+    expect(server.requests.slice(before).map((r) => r.path)).toEqual(["session"]);
     expect(urls(wrong.b)).toEqual(["https://b/"]);
     expect(createCalls(wrong.b)).toEqual([]);
+  });
 
-    // A follower run hits it too (on changes or the session), with the same class.
-    await saveState(wrong.b.storage, { errorKind: null, lastError: null });
-    await expect(syncRun(wrong.deps)).rejects.toMatchObject({ code: "key_mismatch" });
-    s = await wrong.state();
-    expect(s.errorKind).toBe("key");
-    expect(urls(wrong.b)).toEqual(["https://b/"]);
+  it("an operation from the server with a plaintext url or missing sealed fields is refused; nothing applies", async () => {
+    const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true, tabs: [{ url: "https://a/" }] }));
+    await continueHere(mac.deps);
+    const brave = await device("Brave", (b) => b.addWindow({ focused: true }));
+    await syncRun(brave.deps);
+    expect(urls(brave.b)).toEqual(["https://a/"]);
+    const sealed = server.log[0]!.op as { urlKey: string; urlEnc: string };
+    const forged = [
+      { opId: crypto.randomUUID(), type: "open", entryId: crypto.randomUUID(), url: "https://evil.example/" },
+      { opId: crypto.randomUUID(), type: "open", entryId: crypto.randomUUID(), urlKey: sealed.urlKey, urlEnc: sealed.urlEnc, url: "https://evil/" },
+      { opId: crypto.randomUUID(), type: "navigate", entryId: crypto.randomUUID(), urlKey: sealed.urlKey },
+      { opId: crypto.randomUUID(), type: "close", entryId: crypto.randomUUID(), url: "https://evil/" },
+    ];
+    // Each forged operation follows a valid one in the same response: neither is applied.
+    const good = { opId: crypto.randomUUID(), type: "open", entryId: crypto.randomUUID(), ...(await testCipher().seal("https://good/")) };
+    const base = server.revision;
+    for (const op of forged) {
+      await saveState(brave.b.storage, { errorKind: null, lastError: null, keyVerified: true });
+      server.log.push({ seq: base + 1, deviceId: "dev-x", op: good as never, result: { status: "applied", entryId: good.entryId } });
+      server.log.push({ seq: base + 2, deviceId: "dev-x", op: op as never, result: { status: "applied", entryId: op.entryId } });
+      server.revision = base + 2;
+      await expect(syncRun(brave.deps)).rejects.toMatchObject({ code: "bad_wire" });
+      const s = await brave.state();
+      expect(s).toMatchObject({ errorKind: "key", keyVerified: false, lastRevision: base });
+      expect(urls(brave.b)).toEqual(["https://a/"]);
+      server.log.splice(-2);
+      server.revision = base;
+    }
+  });
+
+  it("expired saved pairing forms are dropped at worker start; clearing credentials drops any", async () => {
+    const b = new FakeBrowser();
+    const deps: Deps = { adapter: b, api: server.api, browser: "brave" };
+    const form = { serverUrl: "https://sync.example", deviceName: "Brave", code: "GOODCODE", key: TEST_KEY };
+    await saveState(b.storage, { pendingPair: { ...form, createdAt: 1_000 } });
+    await dropExpiredPendingPair(deps, 1_000 + 5 * 60_000);
+    expect((await loadState(b.storage)).pendingPair).not.toBeNull(); // still valid
+    await dropExpiredPendingPair(deps, 1_000 + 11 * 60_000);
+    expect((await loadState(b.storage)).pendingPair).toBeNull();
+    expect(clearedCredentials()).toMatchObject({ pendingPair: null, keyVerified: false, syncKey: null });
   });
 
   it("disconnect forgets the key", async () => {
     const mac = await device("Mac Safari", (b) => b.addWindow({ focused: true }));
     expect((await mac.state()).syncKey).toBe(TEST_KEY);
+    const derived = cipherFor(TEST_KEY);
     const s = await disconnect(mac.deps);
+    expect(cipherFor(TEST_KEY)).not.toBe(derived); // derived keys dropped from memory
     expect(s.syncKey).toBeNull();
     expect(statusView(s).encrypted).toBe(false);
   });
