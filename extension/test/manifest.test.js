@@ -10,7 +10,7 @@ describe.each(["brave", "safari"])("dist/%s/manifest.json", (target) => {
   it.skipIf(!existsSync(file))("is a valid MV3 manifest with the expected fields", () => {
     const m = JSON.parse(readFileSync(file, "utf8"));
     expect(m.manifest_version).toBe(3);
-    expect(m.version).toBe("3.0.0");
+    expect(m.version).toBe("3.0.1");
     expect(m.background).toEqual({ service_worker: "background.js" });
     expect(m.permissions).toEqual(["tabs", "storage", "alarms"]);
     // Safari included: the diagnostics trace no longer goes to a native host.
