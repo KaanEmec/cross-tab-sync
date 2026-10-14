@@ -68,12 +68,15 @@ describe("additions", () => {
     expect(list(s.pending).map((o) => o.type === "open" && o.url)).toEqual(["https://x/", "https://y/"]);
   });
 
-  it("a created tab with a URL is an addition; without one it waits for onUpdated; both are activity", () => {
+  it("a created tab with a URL is an addition and activity; without an eligible one it waits for onUpdated and is not", () => {
     const withUrl = recordCreated(state(), tab(1, "https://x/"), ctx());
     expect(withUrl.ops).toHaveLength(1);
     expect(withUrl.activity).toBe(true);
     const blank = recordCreated(state(), tab(2, undefined), ctx());
-    expect(blank).toEqual({ patch: {}, ops: [], activity: true });
+    expect(blank).toEqual({ patch: {}, ops: [], activity: false });
+    for (const url of ["chrome://newtab/", "chrome-extension://abc/popup.html", "about:blank"]) {
+      expect(recordCreated(state(), tab(3, url), ctx()).activity).toBe(false);
+    }
   });
 
   it("ignores tabs the run already mapped, and ineligible URLs", () => {
@@ -83,9 +86,12 @@ describe("additions", () => {
     expect(recordUpdated(state(), tab(3, "https://private/", { eligible: false }), ctx()).ops).toEqual([]);
   });
 
-  it("navigation activity is reported only for the active tab", () => {
+  it("navigation and page loads are never activity, not even in the active tab", () => {
     expect(recordUpdated(state(), tab(1, "https://x/"), ctx()).activity).toBe(false);
-    expect(recordUpdated(state(), tab(1, "https://x/", { active: true }), ctx()).activity).toBe(true);
+    expect(recordUpdated(state(), tab(1, "https://x/", { active: true }), ctx()).activity).toBe(false);
+    const s = state({ mappings: mapped([[1, "E", "https://x/"]]) });
+    expect(recordUpdated(s, tab(1, "https://x/", { active: true }), ctx()).activity).toBe(false); // load complete
+    expect(recordUpdated(s, tab(1, "https://x/y", { active: true }), ctx()).activity).toBe(false);
   });
 });
 
@@ -122,6 +128,21 @@ describe("closures", () => {
     expect(next(s, o).heldCloses).toEqual([]);
   });
 
+  it("a burst made only of copies of one entry is one closure (Safari pinned tab in every window)", () => {
+    const copies = state({ mappings: mapped([[1, "E", "https://x/"], [2, "E", "https://x/"], [3, "E", "https://x/"]]) });
+    // Reported from three windows, or all from the window where it was closed.
+    for (const windows of [[1, 2, 3], [W, W, W]]) {
+      let s = copies;
+      for (const [i, id] of [1, 2, 3].entries()) s = next(s, recordRemoved(s, id, false, windows[i]!, ctx(T0 + i)));
+      const released = releaseHeld(s, new Set([1, 2, 3]), ctx(T0 + 2 + CLOSE_HOLD_MS));
+      expect(released.ops).toEqual([{ opId: "id1", type: "close", entryId: "E" }]);
+    }
+    // One other entry in the burst makes it a window closing again.
+    let mixed = state({ mappings: mapped([[1, "E", "https://x/"], [2, "E", "https://x/"], [3, "F", "https://y/"]]) });
+    for (const [i, id] of [1, 2, 3].entries()) mixed = next(mixed, recordRemoved(mixed, id, false, W, ctx(T0 + i)));
+    expect(releaseHeld(mixed, alive, ctx(T0 + 2 + CLOSE_HOLD_MS)).ops).toEqual([]);
+  });
+
   it("held closes are dropped when the window is gone, was reported removed, or closed in a burst", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"], [2, "F", "https://y/"], [3, "G", "https://z/"]]) });
     expect(closeTab(s, 1).ops).toHaveLength(1);
@@ -156,7 +177,7 @@ describe("navigation", () => {
     const o = recordUpdated(s, tab(1, "https://x/next?q=1#f", { active: true }), ctx());
     expect(o.ops).toEqual([{ opId: "id1", type: "navigate", entryId: "E", url: "https://x/next?q=1#f" }]);
     expect(next(s, o).mappings.tabs["1"]).toEqual({ entryId: "E", url: "https://x/next?q=1#f" });
-    expect(o.activity).toBe(true);
+    expect(o.activity).toBe(false);
   });
 
   it("one of several copies: detaches and is a fresh open", () => {
@@ -236,7 +257,15 @@ describe("detached tabs", () => {
     expect(recordUpdated(s(), tab(1, "https://x/"), ctx()).ops).toEqual([]);
   });
 
-  it("navigating publishes a fresh open and ends the detachment", () => {
+  it("a same-site URL change only updates the detached URL (feeds rewrite their URL constantly)", () => {
+    const o = recordUpdated(s(), tab(1, "https://x/feed?update=2", { active: true }), ctx());
+    expect(o).toEqual({ patch: { detached: { "1": "https://x/feed?update=2" } }, ops: [], activity: false });
+    // Another port or scheme is another site.
+    expect(recordUpdated(s(), tab(1, "https://x:8443/"), ctx()).ops.map((op) => op.type)).toEqual(["open"]);
+    expect(recordUpdated(s(), tab(1, "http://x/"), ctx()).ops.map((op) => op.type)).toEqual(["open"]);
+  });
+
+  it("moving to another site publishes a fresh open and ends the detachment", () => {
     const o = recordUpdated(s(), tab(1, "https://y/"), ctx());
     expect(o.ops.map((op) => op.type)).toEqual(["open"]);
     expect(o.patch.detached).toEqual({});
@@ -254,6 +283,7 @@ describe("after a browser restart", () => {
     const s = state({ staleMappings, startupAt: T0, detached: { "stale-0": "https://d/" } });
     const o = recordCreated(s, tab(5, "https://x/"), ctx(T0 + 1000));
     expect(o.ops).toEqual([]);
+    expect(o.activity).toBe(false); // restored, not created by the user
     expect(next(s, o).mappings.tabs["5"]?.entryId).toBe("E");
     expect(next(s, o).staleMappings).toBeNull();
 

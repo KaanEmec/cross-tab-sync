@@ -4,7 +4,7 @@
 // its own: everything it decides on is loaded from storage per event.
 
 import type { TabInfo } from "../adapter/types.js";
-import { onActivity } from "./activity.js";
+import { onActivity, onDemoted } from "./activity.js";
 import {
   CLOSE_HOLD_MS,
   recordCreated,
@@ -27,6 +27,8 @@ import { syncRun } from "./sync.js";
 
 /** Local changes are sent about this long after the first one. */
 export const SYNC_DEBOUNCE_MS = 2_000;
+/** Focus on a normal window makes an owner verify its ownership at most this often. */
+export const FOCUS_VERIFY_INTERVAL_MS = 10_000;
 
 /** Key in session storage present for the lifetime of one browser session. */
 export const SESSION_MARKER = "cts.browserSession";
@@ -60,6 +62,8 @@ interface Step {
   /** Number of journaled operations. */
   ops: number;
   activity: boolean;
+  /** Focus moved to a normal window: an owner verifies its ownership (rate limited). */
+  verify?: boolean;
 }
 
 export class SyncEngine {
@@ -68,6 +72,11 @@ export class SyncEngine {
   private cancelTimer: (() => void) | null = null;
   private cancelRelease: (() => void) | null = null;
   private cancelRetry: (() => void) | null = null;
+  /**
+   * Last ownership verification started by a signal. In memory only: a restarted worker may verify
+   * once more, which costs one empty batch.
+   */
+  private lastVerifyAt = -Infinity;
 
   /** `retrySchedule` runs the backoff retries (separate so tests can fire them on their own). */
   constructor(
@@ -156,8 +165,10 @@ export class SyncEngine {
   }
 
   /**
-   * Owner or follower run now (alarm, Sync now, debounced local changes, retry). Paused: nothing
-   * runs (Sync now reports it). Automatic runs before `nextRetryAt` wait for the retry timer.
+   * Owner or follower run now (alarm, Sync now, debounced local changes, retry, `verify` after a
+   * fresh interaction while owner). Paused: nothing runs (Sync now reports it). Automatic runs
+   * before `nextRetryAt` wait for the retry timer. A run that finds ownership lost takes over right
+   * after it when the user was active here moments ago (activity.onDemoted).
    */
   runNow(action = "sync"): Promise<State> {
     this.cancelTimer?.();
@@ -169,8 +180,23 @@ export class SyncEngine {
         return s;
       }
       if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) return s;
-      return syncRun(this.deps);
+      try {
+        return await syncRun(this.deps);
+      } finally {
+        if (s.generation !== null) await this.afterDemotion().catch(ignore);
+      }
     });
+  }
+
+  /** Called after a run that started as owner: take over again if it demoted a device in use. */
+  private async afterDemotion(): Promise<void> {
+    const storage = this.deps.adapter.storage;
+    const s = await loadState(storage);
+    if (!isPaired(s) || s.paused || s.generation !== null) return;
+    const d = onDemoted(s, nowMs(this.deps));
+    await saveState(storage, d.patch);
+    // Queued behind this run, so it starts once the run lock is released.
+    if (d.takeover) void this.takeover().catch(ignore);
   }
 
   /** Debounced run: the first request schedules it, later ones ride along. */
@@ -317,7 +343,14 @@ export class SyncEngine {
     if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
     if (s.paused) return;
     if (decision?.takeover) void this.takeover().catch(ignore);
-    else if (isOwner && (out.ops > 0 || decision?.fresh)) this.requestSync();
+    // A fresh interaction, or focus coming back to this browser (at most every
+    // FOCUS_VERIFY_INTERVAL_MS, regardless of the idle rule), makes an owner verify its ownership at
+    // once (empty batch when nothing is pending): if another device took over, the run's 409
+    // stale_owner demotes and the takeover follows (afterDemotion).
+    else if (isOwner && (decision?.fresh || (out.verify && decision?.counted && now - this.lastVerifyAt >= FOCUS_VERIFY_INTERVAL_MS))) {
+      this.lastVerifyAt = now;
+      void this.runNow("verify").catch(ignore);
+    } else if (isOwner && out.ops > 0) this.requestSync();
   }
 
   private async toEvent(tab: TabInfo): Promise<TabEvent> {
@@ -329,10 +362,14 @@ export class SyncEngine {
     return { id: tab.id, url: tab.url, pinned: tab.pinned, active: tab.active, eligible };
   }
 
-  /** Remember the last focused normal window: it receives tabs created by application. */
+  /**
+   * Remember the last focused normal window: it receives tabs created by application. Focus on a
+   * normal window is activity; devtools, popups and unknown windows are not.
+   */
   private async focused(s: State, windowId: number): Promise<Step> {
     const w = (await this.deps.adapter.getWindows()).find((x) => x.id === windowId);
-    const receiving = w && w.type === "normal" && !w.incognito && s.receivingWindowId !== w.id;
-    return { patch: receiving ? { receivingWindowId: w.id } : {}, ops: 0, activity: true };
+    const normal = w !== undefined && w.type === "normal";
+    const receiving = normal && !w.incognito && s.receivingWindowId !== w.id;
+    return { patch: receiving ? { receivingWindowId: w.id } : {}, ops: 0, activity: normal, verify: normal };
   }
 }

@@ -3,6 +3,8 @@ import {
   ACTIVITY_WRITE_GRANULARITY_MS,
   FRESH_IDLE_MS,
   onActivity,
+  onDemoted,
+  RECENT_ACTIVITY_MS,
   STARTUP_SUPPRESSION_MS,
   TAKEOVER_INTERVAL_MS,
   type ActivityState,
@@ -69,5 +71,14 @@ describe("activity", () => {
     expect(onActivity(s, { now: T0 + ACTIVITY_WRITE_GRANULARITY_MS, isOwner: true }).patch).toEqual({
       lastActivityAt: T0 + ACTIVITY_WRITE_GRANULARITY_MS,
     });
+  });
+
+  it("ownership found lost right after a signal here takes over; rate limited it stays pending", () => {
+    const s = st({ lastActivityAt: T0, lastTakeoverAt: T0 - TAKEOVER_INTERVAL_MS, freshPending: true });
+    expect(onDemoted(s, T0 + RECENT_ACTIVITY_MS - 1)).toEqual({ patch: { lastTakeoverAt: T0 + RECENT_ACTIVITY_MS - 1, freshPending: false }, takeover: true });
+    expect(onDemoted(s, T0 + RECENT_ACTIVITY_MS)).toEqual({ patch: {}, takeover: false });
+    expect(onDemoted(st({ freshPending: true }), T0)).toEqual({ patch: {}, takeover: false });
+    const limited = st({ lastActivityAt: T0, lastTakeoverAt: T0 - 1000, freshPending: true });
+    expect(onDemoted(limited, T0 + 1000)).toEqual({ patch: { freshPending: true }, takeover: false });
   });
 });

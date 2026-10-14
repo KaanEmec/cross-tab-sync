@@ -1,7 +1,7 @@
 // Materializing a full session locally (Continue here, Hand over, follower full resync).
 
 import type { Entry } from "./client.js";
-import { expectLoads } from "./changes.js";
+import { expectLoads, sameOrigin } from "./changes.js";
 import { append, pendingChanges, pendingEntryIds } from "./journal.js";
 import { remapEntry, removeMappings, serverUrl, setMapping, tabsForEntry } from "./mapping.js";
 import { plan, type OpenOp } from "./plan.js";
@@ -16,7 +16,8 @@ import { captureTabs, createTabs, currentMappings, expiry, forkEntry, pendingBas
  * pending change for the entry based on another URL: then both survive (forkEntry). Tabs mapped to
  * entries that left the session are detached, never republished, unless they carry an unsent
  * navigation (published as a fresh opening). With `publish`, other unmapped tabs are journaled as
- * `open`.
+ * `open`; a detached tab only once it shows a different site than when it was detached (a
+ * same-site URL change just updates the detached URL).
  */
 export async function materialize(
   store: Store,
@@ -48,7 +49,13 @@ export async function materialize(
     const m = before.tabs[key];
     return sessionIds !== null && m !== undefined && !sessionIds.has(m.entryId) && !pendingIds.has(m.entryId);
   };
-  const keep = (key: string) => !orphan(key) && detached[key] !== urlOf.get(key);
+  /** Detached and still on the same site: stays local, never republished. */
+  const stays = (key: string) => {
+    const was = detached[key];
+    const url = urlOf.get(key);
+    return was !== undefined && url !== undefined && sameOrigin(was, url);
+  };
+  const keep = (key: string) => !orphan(key) && !stays(key);
 
   const p = plan({
     entries: entries && entries.filter((e) => !closed.has(e.id)),
@@ -72,7 +79,7 @@ export async function materialize(
       continue;
     }
     mappings = removeMappings(mappings, keys.map(Number));
-    for (const k of keys) if (orphan(k)) detached[k] = op.url;
+    for (const k of keys) if (orphan(k) || stays(k)) detached[k] = op.url;
   }
   pending = append(pending, open, now, { baseRevision });
 

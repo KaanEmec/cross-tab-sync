@@ -252,6 +252,7 @@
   var FRESH_IDLE_MS = 6e4;
   var TAKEOVER_INTERVAL_MS = 3e4;
   var ACTIVITY_WRITE_GRANULARITY_MS = 5e3;
+  var RECENT_ACTIVITY_MS = 15e3;
   var within = (since, now, ms) => since !== null && now >= since && now - since < ms;
   function onActivity(s, ctx) {
     const { now } = ctx;
@@ -270,6 +271,11 @@
     }
     patch.lastTakeoverAt = now;
     return { patch, counted: true, fresh, takeover: true };
+  }
+  function onDemoted(s, now) {
+    if (!within(s.lastActivityAt, now, RECENT_ACTIVITY_MS)) return { patch: {}, takeover: false };
+    if (within(s.lastTakeoverAt, now, TAKEOVER_INTERVAL_MS)) return { patch: { freshPending: true }, takeover: false };
+    return { patch: { lastTakeoverAt: now, freshPending: false }, takeover: true };
   }
 
   // src/core/journal.ts
@@ -391,6 +397,13 @@
   function inStartupGrace(startupAt, now, windowMs = STARTUP_GRACE_MS) {
     return startupAt !== null && now >= startupAt && now - startupAt < windowMs;
   }
+  function sameOrigin(a, b) {
+    try {
+      return new URL(a).origin === new URL(b).origin;
+    } catch {
+      return false;
+    }
+  }
   function pruneExpected(expected, now) {
     const kept = expected.filter((e) => e.until > now);
     return kept.length === expected.length ? expected : kept;
@@ -476,32 +489,32 @@
       delete tabs[old[0]];
       d.set("staleMappings", Object.keys(tabs).length > 0 ? { ...stale, tabs } : null);
       d.map(tab.id, old[1].entryId, tab.url);
-      return;
+      return true;
     }
     const staleDetached = Object.entries(d.s.detached).find(([k, url]) => k.startsWith("stale-") && url === tab.url);
     if (staleDetached) {
       const detached = { ...d.s.detached, [String(tab.id)]: tab.url };
       delete detached[staleDetached[0]];
       d.set("detached", detached);
-      return;
+      return true;
     }
     const existing = mappedTabWithUrl(d.s.mappings, tab.url);
     if (existing) {
       d.map(tab.id, existing.entryId, tab.url);
-      return;
+      return false;
     }
     const entryId = d.ctx.newId();
     d.ops.push({ opId: d.ctx.newId(), type: "open", entryId, url: tab.url, pinned: tab.pinned });
     d.map(tab.id, entryId, tab.url);
+    return false;
   }
   function recordCreated(s, tab, ctx) {
     const d = new Draft(s, ctx);
     if (d.s.mappings.tabs[String(tab.id)]) return d.done(false);
-    if (!tab.eligible || !tab.url) return d.done(true);
+    if (!tab.eligible || !tab.url) return d.done(false);
     const withUrl = { ...tab, url: tab.url };
     if (takeCreate(d, withUrl)) return d.done(false);
-    addition(d, withUrl);
-    return d.done(true);
+    return d.done(!addition(d, withUrl));
   }
   function recordUpdated(s, tab, ctx) {
     const d = new Draft(s, ctx);
@@ -524,15 +537,17 @@
     const withUrl = { ...tab, url: tab.url };
     const detachedUrl = d.s.detached[key];
     if (detachedUrl !== void 0) {
-      if (detachedUrl === tab.url) return d.done(false);
+      if (sameOrigin(detachedUrl, tab.url)) {
+        if (detachedUrl !== tab.url) d.set("detached", { ...d.s.detached, [key]: tab.url });
+        return d.done(false);
+      }
       d.undetach(key);
       addition(d, withUrl);
-      return d.done(tab.active);
+      return d.done(false);
     }
     if (!mapped) {
-      if (takeCreate(d, withUrl)) return d.done(false);
-      addition(d, withUrl);
-      return d.done(tab.active);
+      if (!takeCreate(d, withUrl)) addition(d, withUrl);
+      return d.done(false);
     }
     if (mapped.url === tab.url) return d.done(false);
     const copies = tabsForEntry(d.s.mappings, mapped.entryId);
@@ -550,7 +565,7 @@
       d.ops.push({ opId: ctx.newId(), type: "open", entryId, url: tab.url, pinned: tab.pinned });
       d.map(tab.id, entryId, tab.url);
     }
-    return d.done(tab.active);
+    return d.done(false);
   }
   function recordRemoved(s, tabId, windowClosing, windowId, ctx) {
     const d = new Draft(s, ctx);
@@ -579,9 +594,10 @@
     if (due.length > 0 || kept.length !== held.length) d.set("heldCloses", kept);
     const closed = /* @__PURE__ */ new Set();
     for (const h of due) {
-      const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS).length;
+      const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS);
+      const windowClosing = burst.length >= BURST_REMOVALS && burst.some((o) => o.entryId !== h.entryId);
       const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== void 0;
-      if (windowGone || burst >= BURST_REMOVALS || closed.has(h.entryId)) continue;
+      if (windowGone || windowClosing || closed.has(h.entryId)) continue;
       if (tabsForEntry(d.s.mappings, h.entryId).length > 0) continue;
       closed.add(h.entryId);
       d.ops.push({ opId: ctx.newId(), type: "close", entryId: h.entryId });
@@ -1179,7 +1195,12 @@
       const m = before.tabs[key];
       return sessionIds !== null && m !== void 0 && !sessionIds.has(m.entryId) && !pendingIds.has(m.entryId);
     };
-    const keep = (key) => !orphan(key) && detached[key] !== urlOf.get(key);
+    const stays = (key) => {
+      const was = detached[key];
+      const url = urlOf.get(key);
+      return was !== void 0 && url !== void 0 && sameOrigin(was, url);
+    };
+    const keep = (key) => !orphan(key) && !stays(key);
     const p = plan({
       entries: entries && entries.filter((e) => !closed.has(e.id)),
       tabs: eligible,
@@ -1201,7 +1222,7 @@
         continue;
       }
       mappings = removeMappings(mappings, keys.map(Number));
-      for (const k of keys) if (orphan(k)) detached[k] = op.url;
+      for (const k of keys) if (orphan(k) || stays(k)) detached[k] = op.url;
     }
     pending = append(pending, open, now, { baseRevision });
     const create = [...p.create];
@@ -1666,6 +1687,7 @@
 
   // src/core/engine.ts
   var SYNC_DEBOUNCE_MS = 2e3;
+  var FOCUS_VERIFY_INTERVAL_MS = 1e4;
   var SESSION_MARKER = "cts.browserSession";
   var PAUSED_MESSAGE = "Sync is paused. Resume to sync again.";
   var BACKED_OFF = /* @__PURE__ */ new Set(["sync", "alarm"]);
@@ -1695,6 +1717,11 @@
     cancelTimer = null;
     cancelRelease = null;
     cancelRetry = null;
+    /**
+     * Last ownership verification started by a signal. In memory only: a restarted worker may verify
+     * once more, which costs one empty batch.
+     */
+    lastVerifyAt = -Infinity;
     /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
     attach() {
       const a = this.deps.adapter;
@@ -1768,8 +1795,10 @@
       await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
     }
     /**
-     * Owner or follower run now (alarm, Sync now, debounced local changes, retry). Paused: nothing
-     * runs (Sync now reports it). Automatic runs before `nextRetryAt` wait for the retry timer.
+     * Owner or follower run now (alarm, Sync now, debounced local changes, retry, `verify` after a
+     * fresh interaction while owner). Paused: nothing runs (Sync now reports it). Automatic runs
+     * before `nextRetryAt` wait for the retry timer. A run that finds ownership lost takes over right
+     * after it when the user was active here moments ago (activity.onDemoted).
      */
     runNow(action = "sync") {
       this.cancelTimer?.();
@@ -1781,8 +1810,21 @@
           return s;
         }
         if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) return s;
-        return syncRun(this.deps);
+        try {
+          return await syncRun(this.deps);
+        } finally {
+          if (s.generation !== null) await this.afterDemotion().catch(ignore);
+        }
       });
+    }
+    /** Called after a run that started as owner: take over again if it demoted a device in use. */
+    async afterDemotion() {
+      const storage = this.deps.adapter.storage;
+      const s = await loadState(storage);
+      if (!isPaired(s) || s.paused || s.generation !== null) return;
+      const d = onDemoted(s, nowMs(this.deps));
+      await saveState(storage, d.patch);
+      if (d.takeover) void this.takeover().catch(ignore);
     }
     /** Debounced run: the first request schedules it, later ones ride along. */
     requestSync() {
@@ -1913,7 +1955,10 @@
       if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
       if (s.paused) return;
       if (decision?.takeover) void this.takeover().catch(ignore);
-      else if (isOwner && (out.ops > 0 || decision?.fresh)) this.requestSync();
+      else if (isOwner && (decision?.fresh || out.verify && decision?.counted && now - this.lastVerifyAt >= FOCUS_VERIFY_INTERVAL_MS)) {
+        this.lastVerifyAt = now;
+        void this.runNow("verify").catch(ignore);
+      } else if (isOwner && out.ops > 0) this.requestSync();
     }
     async toEvent(tab) {
       let eligible = !tab.incognito && isShareableUrl(tab.url);
@@ -1923,11 +1968,15 @@
       }
       return { id: tab.id, url: tab.url, pinned: tab.pinned, active: tab.active, eligible };
     }
-    /** Remember the last focused normal window: it receives tabs created by application. */
+    /**
+     * Remember the last focused normal window: it receives tabs created by application. Focus on a
+     * normal window is activity; devtools, popups and unknown windows are not.
+     */
     async focused(s, windowId) {
       const w = (await this.deps.adapter.getWindows()).find((x) => x.id === windowId);
-      const receiving = w && w.type === "normal" && !w.incognito && s.receivingWindowId !== w.id;
-      return { patch: receiving ? { receivingWindowId: w.id } : {}, ops: 0, activity: true };
+      const normal = w !== void 0 && w.type === "normal";
+      const receiving = normal && !w.incognito && s.receivingWindowId !== w.id;
+      return { patch: receiving ? { receivingWindowId: w.id } : {}, ops: 0, activity: normal, verify: normal };
     }
   };
 

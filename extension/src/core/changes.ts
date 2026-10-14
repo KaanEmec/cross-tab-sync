@@ -1,6 +1,7 @@
 // Recording local tab changes (PROTOCOL.md "Recording local changes"). Pure: every function takes
 // the persisted slice plus one browser event and returns the changed fields, the operations it
-// journaled, and whether the event counts as local activity.
+// journaled, and whether the event counts as local activity (only a user-created tab does here;
+// navigation never does, see activity.ts).
 
 import type { Operation } from "./client.js";
 import { append, type Journal } from "./journal.js";
@@ -15,7 +16,10 @@ export const EXPECT_TTL_MS = 30_000;
 export const LOAD_GRACE_MS = 10_000;
 /** Closes are held this long: a window closing or browser quitting shows up as a burst first. */
 export const CLOSE_HOLD_MS = 2_000;
-/** This many removals from one window within CLOSE_HOLD_MS are treated as the window going away. */
+/**
+ * This many removals from one window within CLOSE_HOLD_MS are treated as the window going away,
+ * unless they are all copies of one entry (Safari reports a pinned tab once per window).
+ */
 export const BURST_REMOVALS = 3;
 /** Removals right after browser startup are restore/shutdown noise: unmap only. */
 export const STARTUP_GRACE_MS = 10_000;
@@ -76,12 +80,21 @@ export interface Outcome {
   patch: Partial<LocalState>;
   /** Operations appended to the journal. */
   ops: Operation[];
-  /** The event is a local activity signal (not caused by the extension). */
+  /** The event is a local activity signal: a tab the user created with an eligible URL. */
   activity: boolean;
 }
 
 export function inStartupGrace(startupAt: number | null, now: number, windowMs = STARTUP_GRACE_MS): boolean {
   return startupAt !== null && now >= startupAt && now - startupAt < windowMs;
+}
+
+/** Same scheme, host and port. Unparsable URLs are never the same origin. */
+export function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
 }
 
 export function pruneExpected(expected: Expectation[], now: number): Expectation[] {
@@ -178,8 +191,9 @@ function takeCreate(d: Draft, tab: TabEvent & { url: string }): boolean {
 /**
  * A tab with a new eligible URL that is not mapped: re-match a restored tab from the previous
  * browser session, join an entry already mapped locally (another copy, no operation), or `open`.
+ * Returns whether it was a restored tab.
  */
-function addition(d: Draft, tab: TabEvent & { url: string }): void {
+function addition(d: Draft, tab: TabEvent & { url: string }): boolean {
   const stale = d.s.staleMappings;
   const old = stale && Object.entries(stale.tabs).find(([, v]) => v.url === tab.url);
   if (stale && old) {
@@ -187,38 +201,44 @@ function addition(d: Draft, tab: TabEvent & { url: string }): void {
     delete tabs[old[0]];
     d.set("staleMappings", Object.keys(tabs).length > 0 ? { ...stale, tabs } : null);
     d.map(tab.id, old[1].entryId, tab.url);
-    return;
+    return true;
   }
   const staleDetached = Object.entries(d.s.detached).find(([k, url]) => k.startsWith("stale-") && url === tab.url);
   if (staleDetached) {
     const detached = { ...d.s.detached, [String(tab.id)]: tab.url };
     delete detached[staleDetached[0]];
     d.set("detached", detached);
-    return;
+    return true;
   }
   const existing = mappedTabWithUrl(d.s.mappings, tab.url);
   if (existing) {
     d.map(tab.id, existing.entryId, tab.url);
-    return;
+    return false;
   }
   const entryId = d.ctx.newId();
   d.ops.push({ opId: d.ctx.newId(), type: "open", entryId, url: tab.url, pinned: tab.pinned });
   d.map(tab.id, entryId, tab.url);
+  return false;
 }
 
-/** `tabs.onCreated`. */
+/**
+ * `tabs.onCreated`. Activity only for a tab the user created with an eligible URL: not one the
+ * extension created, not a restored tab, not a blank or browser page (new tab page, extension page).
+ */
 export function recordCreated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
   const d = new Draft(s, ctx);
   // Created by a sync run: the run mapped it before this event was processed.
   if (d.s.mappings.tabs[String(tab.id)]) return d.done(false);
-  if (!tab.eligible || !tab.url) return d.done(true); // URL arrives with tabs.onUpdated
+  if (!tab.eligible || !tab.url) return d.done(false); // URL arrives with tabs.onUpdated
   const withUrl = { ...tab, url: tab.url };
   if (takeCreate(d, withUrl)) return d.done(false);
-  addition(d, withUrl);
-  return d.done(true);
+  return d.done(!addition(d, withUrl));
 }
 
-/** `tabs.onUpdated` with a committed URL (load complete). */
+/**
+ * `tabs.onUpdated` with a committed URL (load complete). Never activity: restored tabs finish
+ * loading long after startup, and pages rewrite their own URLs.
+ */
 export function recordUpdated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
   const d = new Draft(s, ctx);
   const key = String(tab.id);
@@ -243,18 +263,21 @@ export function recordUpdated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
   if (!tab.eligible || !tab.url) return d.done(false);
   const withUrl = { ...tab, url: tab.url };
 
+  // A detached tab stays local until it moves to a different site (feeds rewrite their URL constantly).
   const detachedUrl = d.s.detached[key];
   if (detachedUrl !== undefined) {
-    if (detachedUrl === tab.url) return d.done(false);
+    if (sameOrigin(detachedUrl, tab.url)) {
+      if (detachedUrl !== tab.url) d.set("detached", { ...d.s.detached, [key]: tab.url });
+      return d.done(false);
+    }
     d.undetach(key);
     addition(d, withUrl);
-    return d.done(tab.active);
+    return d.done(false);
   }
 
   if (!mapped) {
-    if (takeCreate(d, withUrl)) return d.done(false);
-    addition(d, withUrl);
-    return d.done(tab.active);
+    if (!takeCreate(d, withUrl)) addition(d, withUrl);
+    return d.done(false);
   }
   if (mapped.url === tab.url) return d.done(false);
 
@@ -275,7 +298,7 @@ export function recordUpdated(s: LocalState, tab: TabEvent, ctx: Ctx): Outcome {
     d.ops.push({ opId: ctx.newId(), type: "open", entryId, url: tab.url, pinned: tab.pinned });
     d.map(tab.id, entryId, tab.url);
   }
-  return d.done(tab.active);
+  return d.done(false);
 }
 
 /**
@@ -306,7 +329,8 @@ export function recordWindowRemoved(s: LocalState, windowId: number, ctx: Ctx): 
 /**
  * Turn held removals older than CLOSE_HOLD_MS into `close` operations, one per entry that still has
  * no local copy. Dropped (unmap only): the tab's window no longer exists or was reported removed,
- * or BURST_REMOVALS or more removals came from that window within CLOSE_HOLD_MS.
+ * or BURST_REMOVALS or more removals came from that window within CLOSE_HOLD_MS. A burst made only
+ * of copies of one entry is one closure (Safari reports a pinned tab once per window).
  */
 export function releaseHeld(s: LocalState, aliveWindows: Set<number>, ctx: Ctx): Outcome & { waiting: boolean } {
   const d = new Draft(s, ctx);
@@ -319,9 +343,10 @@ export function releaseHeld(s: LocalState, aliveWindows: Set<number>, ctx: Ctx):
   if (due.length > 0 || kept.length !== held.length) d.set("heldCloses", kept);
   const closed = new Set<string>();
   for (const h of due) {
-    const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS).length;
+    const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS);
+    const windowClosing = burst.length >= BURST_REMOVALS && burst.some((o) => o.entryId !== h.entryId);
     const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== undefined;
-    if (windowGone || burst >= BURST_REMOVALS || closed.has(h.entryId)) continue;
+    if (windowGone || windowClosing || closed.has(h.entryId)) continue;
     if (tabsForEntry(d.s.mappings, h.entryId).length > 0) continue;
     closed.add(h.entryId);
     d.ops.push({ opId: ctx.newId(), type: "close", entryId: h.entryId });

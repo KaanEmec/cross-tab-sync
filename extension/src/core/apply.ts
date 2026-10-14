@@ -320,7 +320,8 @@ export async function applyRemote(
           const live = byId.get(id)?.url;
           const m = mappings.tabs[String(id)]!;
           if (live !== undefined && live !== m.url && !loading(id)) {
-            // Navigated by the user, event not recorded yet: keep it; the event publishes it.
+            // Navigated by the user, event not recorded yet: keep it detached at the mapped URL; the
+            // event publishes it if it moved to another site (changes.recordUpdated).
             mappings = removeMappings(mappings, [id]);
             detached[String(id)] = m.url;
           } else {

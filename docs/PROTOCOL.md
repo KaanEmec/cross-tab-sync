@@ -157,28 +157,28 @@ Builds on the v0.1 rules. The server is unchanged: an empty `operations` batch i
 
 - `open`: reuse an eligible local tab with the same URL, else create in the background in the receiving window.
 - `navigate`: update every mapped local copy; if the destination is already open locally, the copies are closed (background copies only) and the entry maps to the existing tab.
-- `close`: close the mapped background copies. If the active tab is among them, it stays open, is unmapped, and is put in a `detached` set so it is not republished as a new opening until it navigates or closes.
+- `close`: close the mapped background copies. If the active tab is among them, it stays open, is unmapped, and is put in a `detached` set. A detached tab stays local until it moves to a different site or closes: a URL change within the same origin (scheme, host, port), such as a feed rewriting its URL, only updates the detached URL; a different origin is published as a fresh `open`. Materializing (Continue here, Hand over) applies the same rule.
 - `update`: apply pinned state; position is a hint only.
 - The active tab and focused window never change as a result of application.
 
 ### Automatic ownership
 
-- **Activity signals**: `tabs.onActivated`, `windows.onFocusChanged` to a real window, user-created tabs, and user navigation. Signals in the first 10 s after startup and signals caused by remote application are not activity. Heartbeats are never activity.
+- **Activity signals**: `tabs.onActivated` (not for tabs the extension created), `windows.onFocusChanged` to a normal window, and user-created tabs whose URL is eligible (http/https; a new tab page or extension page is not). Navigation and page loads are never activity: restored tabs finish loading long after startup. Signals in the first 10 s after startup, restored tabs, and signals caused by remote application are not activity. Heartbeats are never activity.
 - **Fresh interaction**: a signal after at least 60 s without signals, or the first signal after this device lost ownership. A browser that merely stays focused produces none.
 - **Takeover**: on a fresh interaction while not owner, run Continue here (`acquire {force:true}`, reconcile, flush the journal). At most one attempt per 30 s.
 - **Manual Hand over** counts as the latest interaction and suppresses the "ownership lost" rule; only 60 s of quiet followed by a signal takes over again.
 - A fresh interaction inside the 30 s rate limit, or a failed takeover, stays pending and fires on the next signal after the limit.
-- Navigation counts as activity only in the active tab; every user-created tab counts.
 - A freshly paired device (revision 0) rebuilds from the full session instead of replaying history.
 - A load the extension started stays its own until 10 s after its first committed event (redirects, post-load URL rewrites); user navigation inside that window is not published.
 - A new browser session is detected by a marker in `storage.session` before any event is handled; the startup reset then runs even if the restored tabs' events arrive before `runtime.onStartup`.
 - Continue here first applies `changes?since=lastRevision` (410 → full session), then materializes. Materializing navigates mapped tabs whose entry URL moved when nothing local is pending for that entry.
 - Divergence: when a remote navigate or close meets a local pending navigate for the same entry, local copies are forked to a fresh entry (`open` of the local URL) and the remote URL gets its own background tab; nothing is overwritten.
-- `close` operations are held for 2 s and dropped (unmap only) if the window disappeared, `windows.onRemoved` fired, three or more removals came from that window, or a new browser session started.
+- `close` operations are held for 2 s and dropped (unmap only) if the window disappeared, `windows.onRemoved` fired, three or more removals of more than one entry came from that window, or a new browser session started. Removals that are all copies of one entry are one closure (Safari reports a pinned tab once per window).
 - Tabs mapped to entries that are no longer in the session are detached, not republished. Continue here never recreates entries this device has a pending `close` for.
 - Previous-session mappings and the detached set survive a restart for 60 s so late-restored tabs still match.
 - Local pin changes are not published in v0.2.
 - The superseded owner learns of the change from `409 stale_owner` on its next run, keeps its journal, and follows; its pending work goes through `merge` on that run. The cadence bounds the window in which the prior owner's unpublished changes are invisible to the new owner.
+- A device that believes it is owner verifies ownership at once (no debounce; an empty batch when nothing is pending) on a fresh interaction, and on `windows.onFocusChanged` to a normal window at most once per 10 s regardless of the 60 s idle rule. When a run demotes the device and the last activity signal is less than 15 s old (not paused), it takes over right after the run, subject to the 30 s limit (a rate-limited takeover stays pending).
 
 ## Client behavior (v1.0 offline merging, recovery, controls)
 

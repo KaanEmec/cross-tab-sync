@@ -155,7 +155,7 @@ describe("follower application", () => {
     expect(s.statusText).toBe(`Following Brave, revision ${server.revision}`);
   });
 
-  it("a close keeps the active tab open and detached; it is not republished until it navigates", async () => {
+  it("a close keeps the active tab open and detached; it is not republished until it moves to another site", async () => {
     const brave = await owner("Brave", ["https://a/", "https://b/"]);
     const mac = await follower("Mac Safari");
     await mac.quiet();
@@ -180,12 +180,48 @@ describe("follower application", () => {
     expect(mac.acquires()).toBe(1);
     expect(server.openUrls()).toEqual([]);
 
-    // Navigating it is a fresh opening.
+    // A same-site URL change (a feed rewriting its URL) keeps it local.
     mac.b.userNavigate(mac.tab("https://a/"), "https://a/other");
+    mac.b.pageRewritesUrl(mac.tab("https://a/other"), "https://a/other?feed=2");
     await mac.settle();
-    expect(server.openUrls()).toEqual(["https://a/other"]);
+    expect(server.openUrls()).toEqual([]);
+    expect(Object.values((await mac.state()).detached)).toEqual(["https://a/other?feed=2"]);
+
+    // Moving to another site is a fresh opening.
+    mac.b.userNavigate(mac.tab("https://a/other?feed=2"), "https://elsewhere/");
+    await mac.settle();
+    expect(server.openUrls()).toEqual(["https://elsewhere/"]);
     s = await mac.state();
     expect(s.detached).toEqual({});
+  });
+
+  it("takeover republishes a detached tab only when it shows another site", async () => {
+    const brave = await owner("Brave", ["https://a/", "https://b/", "https://c/"]);
+    const mac = await follower("Mac Safari");
+    await mac.quiet();
+    const w2 = mac.b.addWindow();
+    const [a, b] = [mac.tab("https://a/"), mac.tab("https://b/")];
+    // a and b become the active tabs of their windows, so a remote close detaches them.
+    mac.b.userActivate(a);
+    mac.b.tabs.find((t) => t.id === b)!.windowId = w2;
+    mac.b.userActivate(b);
+    await mac.settle();
+    brave.b.userCloseTab(brave.tab("https://a/"));
+    brave.b.userCloseTab(brave.tab("https://b/"));
+    await brave.settle();
+    await mac.engine.runNow();
+    await mac.settle();
+    expect(Object.values((await mac.state()).detached).sort()).toEqual(["https://a/", "https://b/"]);
+
+    // URL changes whose events were missed (e.g. the worker was asleep).
+    mac.b.tabs.find((t) => t.id === a)!.url = "https://a/feed?x=1";
+    mac.b.tabs.find((t) => t.id === b)!.url = "https://other-site/";
+    clock.advance(61_000);
+    mac.b.userFocusWindow(mac.win);
+    await mac.settle();
+    expect(mac.acquires()).toBe(1);
+    expect(server.openUrls().sort()).toEqual(["https://c/", "https://other-site/"]);
+    expect((await mac.state()).detached).toEqual({ [String(a)]: "https://a/feed?x=1" });
   });
 
   it("navigate onto a URL already open locally closes background copies and keeps the active one", async () => {
@@ -370,6 +406,116 @@ describe("automatic ownership", () => {
   });
 });
 
+describe("live testing fixes", () => {
+  it("a restored tab finishing its load long after browser startup does not take over", async () => {
+    await owner("Brave", ["https://a/", "https://b/"]);
+    const mac = await follower("Mac Safari");
+    clock.advance(120_000);
+    mac.b.restart();
+    const win = mac.b.addWindow({ focused: true });
+    const a = mac.b.restoreTab(win, "https://a/");
+    mac.b.events.startup.emit();
+    await mac.settle();
+
+    // ~35 s later the active restored tab finishes loading and the page rewrites its URL; another
+    // restored tab is created late. None of it is the user.
+    clock.advance(35_000);
+    const t = mac.b.tabs.find((x) => x.id === a.id)!;
+    t.active = true;
+    mac.b.events.tabUpdated.emit({ ...t }, { status: "complete" });
+    mac.b.pageRewritesUrl(a.id, "https://a/#restored");
+    const b = mac.b.restoreTab(win, "https://b/");
+    // Focus moving to a popup or devtools window is not activity either.
+    mac.b.userFocusWindow(mac.b.addWindow({ type: "popup" }));
+    await mac.settle();
+    expect(mac.acquires()).toBe(0);
+    expect((await mac.state()).generation).toBeNull();
+
+    mac.b.userActivate(b.id); // the user
+    await mac.settle();
+    expect(mac.acquires()).toBe(1);
+  });
+
+  it("a click on a device that silently lost ownership takes over right after the run that finds out", async () => {
+    const mac = await owner("Mac Safari", ["https://a/", "https://b/"]);
+    const brave = await device(server, clock, "Brave");
+    await brave.engine.takeover();
+    await brave.settle();
+    expect((await mac.state()).generation).not.toBeNull(); // mac has not noticed
+    const sent = mac.sent().length;
+
+    clock.advance(61_000);
+    mac.b.userActivate(mac.tab("https://b/"));
+    await mac.engine.idle(); // no debounce timer fired: the run and the takeover are immediate
+    expect(mac.timers.size).toBe(0);
+    const s = await mac.state();
+    expect(s.generation).not.toBeNull();
+    expect(server.owner?.deviceId).toBe(mac.id);
+    expect(mac.acquires()).toBe(2);
+    expect(mac.sent().length).toBe(sent); // the verifying run was an empty batch
+  });
+
+  it("focus on a window makes a silently superseded owner verify at once and take over, even inside the idle window", async () => {
+    const mac = await owner("Mac Safari", ["https://a/"]);
+    const generation = (await mac.state()).generation;
+    clock.advance(30_000); // past the takeover rate limit of mac's own takeover
+    await mac.quiet();
+    const brave = await device(server, clock, "Brave");
+    await brave.engine.takeover();
+    await brave.settle();
+
+    clock.advance(20_000); // not a fresh interaction: within 60 s of the last activity
+    const before = server.requests.length;
+    mac.b.userFocusWindow(mac.win);
+    await mac.engine.idle();
+    const calls = server.requests.slice(before).filter((r) => r.device === mac.id);
+    const paths = calls.map((r) => r.path);
+    const acquire = paths.indexOf("acquire");
+    // One empty batch (409 stale_owner), the follower pull of that run, then the takeover (catch-up, acquire).
+    expect(paths.slice(0, acquire)).toEqual(["operations", "changes", "changes"]);
+    expect(calls[0]!.body).toMatchObject({ generation, operations: [] });
+    expect(paths.filter((p) => p === "acquire")).toHaveLength(1);
+    expect((await mac.state()).generation).not.toBeNull();
+    expect(server.owner?.deviceId).toBe(mac.id);
+
+    // Rate limited: focus again within 10 s does not verify again.
+    clock.advance(5_000);
+    const after = server.requests.length;
+    mac.b.userFocusWindow(mac.win);
+    await mac.engine.idle();
+    expect(server.requests.length).toBe(after);
+  });
+
+  it("a run that finds ownership lost without recent activity here only follows", async () => {
+    const mac = await owner("Mac Safari", ["https://a/"]);
+    await mac.quiet();
+    const brave = await device(server, clock, "Brave");
+    await brave.engine.takeover();
+    await brave.settle();
+    clock.advance(16_000);
+    await mac.engine.runNow("alarm");
+    await mac.settle();
+    const s = await mac.state();
+    expect(s.generation).toBeNull();
+    expect(s.freshPending).toBe(true);
+    expect(mac.acquires()).toBe(1);
+  });
+
+  it("closing a Safari pinned tab, reported once per window, closes its entry once", async () => {
+    const mac = await device(server, clock, "Mac Safari", { tabs: [{ url: "https://pinned/", pinned: true }, { url: "https://keep/" }] });
+    mac.b.addWindow({ tabs: [{ url: "https://pinned/", pinned: true }] });
+    mac.b.addWindow({ tabs: [{ url: "https://pinned/", pinned: true }] });
+    await mac.engine.takeover();
+    await mac.settle();
+    expect(server.openUrls().sort()).toEqual(["https://keep/", "https://pinned/"]);
+
+    for (const t of mac.b.tabs.filter((x) => x.url === "https://pinned/")) mac.b.userCloseTab(t.id);
+    await mac.settle();
+    expect(mac.sent().filter((o) => o.type === "close")).toHaveLength(1);
+    expect(server.openUrls()).toEqual(["https://keep/"]);
+  });
+});
+
 describe("review fixes", () => {
   it("takeover applies a remote navigation made since the last follower run", async () => {
     const brave = await owner("Brave", ["https://a/", "https://b/"]);
@@ -469,21 +615,21 @@ describe("review fixes", () => {
     await mac.settle();
     expect(server.openUrls()).toEqual([]);
 
-    // The b tab navigates while the run is queued: its event is recorded only after the run.
+    // The b tab moves to another site while the run is queued: its event is recorded only after the run.
     const run = mac.engine.runNow();
-    mac.b.userNavigate(mac.tab("https://b/"), "https://b/local");
+    mac.b.userNavigate(mac.tab("https://b/"), "https://b2/local");
     await run;
     await mac.settle();
     expect(removals(mac)).toBe(0);
-    expect(await mac.urls()).toEqual(["https://a/local", "https://b/local"]);
+    expect(await mac.urls()).toEqual(["https://a/local", "https://b2/local"]);
 
     clock.advance(61_000);
     mac.b.userActivate(mac.tab("https://a/local"));
     await mac.settle();
-    expect(server.openUrls().sort()).toEqual(["https://a/local", "https://b/local"]);
+    expect(server.openUrls().sort()).toEqual(["https://a/local", "https://b2/local"]);
     await brave.engine.runNow();
     await brave.settle();
-    expect(await brave.urls()).toEqual(["https://a/local", "https://b/local"]);
+    expect(await brave.urls()).toEqual(["https://a/local", "https://b2/local"]);
   });
 
   it("post-load URL rewrites of a page the extension loaded are not journaled", async () => {
@@ -573,12 +719,10 @@ describe("two devices", () => {
     await both();
 
     clock.advance(61_000);
-    mac.b.userActivate(mac.tab("https://m1/")); // mac still believes it owns: run, stale_owner, follow
-    await both();
-    expect((await mac.state()).generation).toBeNull();
-    mac.b.userActivate(mac.tab("https://x2/")); // first signal after losing ownership: takeover
+    mac.b.userActivate(mac.tab("https://m1/")); // mac still believes it owns: run, stale_owner, takeover
     await both();
     expect((await mac.state()).generation).not.toBeNull();
+    expect(mac.acquires()).toBe(2);
     mac.b.userOpenTab(mac.win, "https://w/", { active: true });
     mac.b.userCloseTab(mac.tab("https://b1/"));
     await both();
