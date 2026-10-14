@@ -15,6 +15,7 @@ func TestRoutesRequireToken(t *testing.T) {
 	routes := []struct{ method, path string }{
 		{"POST", "/v1/pairing-codes"},
 		{"GET", "/v1/devices"},
+		{"PATCH", "/v1/devices/00000000-0000-4000-8000-000000000001"},
 		{"DELETE", "/v1/devices/00000000-0000-4000-8000-000000000001"},
 		{"GET", "/v1/session"},
 		{"GET", "/v1/session/changes?since=0"},

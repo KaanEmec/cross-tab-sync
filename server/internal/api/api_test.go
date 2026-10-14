@@ -124,8 +124,9 @@ func TestPairingAndRevocation(t *testing.T) {
 	if er.Error != "not_found" {
 		t.Fatalf("double revoke: %+v", er)
 	}
+	// The revoked device stays listed (with revokedAt) for 7 days, after the active ones.
 	e.expect(http.StatusOK, "GET", "/v1/devices", b.Token, nil, &list)
-	if len(list.Devices) != 1 {
+	if len(list.Devices) != 2 || list.Devices[0].ID != b.ID || list.Devices[1].ID != a.ID {
 		t.Fatalf("devices after revoke %+v", list)
 	}
 }

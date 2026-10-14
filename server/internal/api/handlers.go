@@ -84,7 +84,7 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 		invalid(w, "browser must be 1..32 printable characters")
 		return
 	}
-	id, token, err := s.store.Pair(r.Context(), req.Code, name, browser, s.now())
+	dev, token, err := s.store.Pair(r.Context(), req.Code, name, browser, s.now())
 	if errors.Is(err, store.ErrInvalidCode) {
 		writeError(w, http.StatusBadRequest, "invalid_code", "pairing code is invalid, used or expired", nil)
 		return
@@ -94,9 +94,28 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if info, ok := r.Context().Value(infoKey).(*reqInfo); ok {
-		info.deviceID = id
+		info.deviceID = dev.ID
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"deviceId": id, "token": token})
+	writeJSON(w, http.StatusCreated, map[string]string{"deviceId": dev.ID, "token": token, "name": dev.Name})
+}
+
+// PairingLink is the link a new browser pastes to pair: the server's public
+// base URL with the code as the fragment.
+func PairingLink(base, code string) string {
+	return base + "#" + code
+}
+
+// publicBase is CTS_PUBLIC_URL, or else the scheme (TLS or X-Forwarded-Proto)
+// and Host the request arrived with.
+func (s *Server) publicBase(r *http.Request) string {
+	if s.cfg.PublicURL != "" {
+		return s.cfg.PublicURL
+	}
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 func (s *Server) createPairingCode(w http.ResponseWriter, r *http.Request) {
@@ -105,29 +124,68 @@ func (s *Server) createPairingCode(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"code": code, "expiresAt": store.Timestamp{Time: expires}})
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"code": code, "expiresAt": store.Timestamp{Time: expires}, "link": PairingLink(s.publicBase(r), code),
+	})
+}
+
+type deviceJSON struct {
+	ID         string           `json:"id"`
+	Name       string           `json:"name"`
+	Browser    string           `json:"browser"`
+	CreatedAt  store.Timestamp  `json:"createdAt"`
+	LastSeenAt store.Timestamp  `json:"lastSeenAt"`
+	IsSelf     bool             `json:"isSelf"`
+	RevokedAt  *store.Timestamp `json:"revokedAt,omitempty"`
+}
+
+func toDeviceJSON(d store.Device, self string) deviceJSON {
+	out := deviceJSON{ID: d.ID, Name: d.Name, Browser: d.Browser, CreatedAt: store.Timestamp{Time: d.CreatedAt},
+		LastSeenAt: store.Timestamp{Time: d.LastSeenAt}, IsSelf: d.ID == self}
+	if !d.RevokedAt.IsZero() {
+		out.RevokedAt = &store.Timestamp{Time: d.RevokedAt}
+	}
+	return out
 }
 
 func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
-	ds, err := s.store.ListDevices(r.Context())
+	ds, err := s.store.ListDevices(r.Context(), s.now())
 	if err != nil {
 		s.internal(w, r, err)
 		return
 	}
-	type deviceJSON struct {
-		ID         string          `json:"id"`
-		Name       string          `json:"name"`
-		Browser    string          `json:"browser"`
-		CreatedAt  store.Timestamp `json:"createdAt"`
-		LastSeenAt store.Timestamp `json:"lastSeenAt"`
-		IsSelf     bool            `json:"isSelf"`
-	}
 	self := device(r).ID
 	out := make([]deviceJSON, len(ds))
 	for i, d := range ds {
-		out[i] = deviceJSON{ID: d.ID, Name: d.Name, Browser: d.Browser, CreatedAt: store.Timestamp{Time: d.CreatedAt}, LastSeenAt: store.Timestamp{Time: d.LastSeenAt}, IsSelf: d.ID == self}
+		out[i] = toDeviceJSON(d, self)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
+}
+
+// renameDevice renames the calling device; other devices are 403 forbidden.
+func (s *Server) renameDevice(w http.ResponseWriter, r *http.Request) {
+	self := device(r).ID
+	if r.PathValue("id") != self {
+		writeError(w, http.StatusForbidden, "forbidden", "a device can only rename itself", nil)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if !decode(w, r, &req, false) {
+		return
+	}
+	name, ok := validLabel(req.Name, session.MaxNameLength)
+	if !ok {
+		invalid(w, fmt.Sprintf("name must be 1..%d printable characters", session.MaxNameLength))
+		return
+	}
+	d, err := s.store.RenameDevice(r.Context(), self, name)
+	if err != nil {
+		s.storeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toDeviceJSON(d, self))
 }
 
 func (s *Server) revokeDevice(w http.ResponseWriter, r *http.Request) {

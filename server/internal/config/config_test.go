@@ -27,11 +27,12 @@ func TestLoad(t *testing.T) {
 		"CTS_OWNER_LIVENESS":     "90s",
 		"CTS_SNAPSHOT_RETENTION": "5",
 		"CTS_HISTORY_RETENTION":  "48h",
+		"CTS_PUBLIC_URL":         "https://tabs.example.com/",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{Addr: "127.0.0.1:9000", DBPath: "/data/x.db", AllowInsecure: true, OwnerLiveness: 90 * time.Second, SnapshotRetention: 5, HistoryRetention: 48 * time.Hour}
+	want := Config{Addr: "127.0.0.1:9000", DBPath: "/data/x.db", AllowInsecure: true, OwnerLiveness: 90 * time.Second, SnapshotRetention: 5, HistoryRetention: 48 * time.Hour, PublicURL: "https://tabs.example.com"}
 	if c != want {
 		t.Fatalf("got %+v, want %+v", c, want)
 	}
@@ -43,6 +44,10 @@ func TestLoad(t *testing.T) {
 		{"CTS_SNAPSHOT_RETENTION": "0"},
 		{"CTS_HISTORY_RETENTION": "0s"},
 		{"CTS_HISTORY_RETENTION": "month"},
+		{"CTS_PUBLIC_URL": "tabs.example.com"},
+		{"CTS_PUBLIC_URL": "ftp://tabs.example.com"},
+		{"CTS_PUBLIC_URL": "https://tabs.example.com/#x"},
+		{"CTS_PUBLIC_URL": "https://tabs.example.com/?a=1"},
 	} {
 		if _, err := Load(env(bad)); err == nil {
 			t.Errorf("Load(%v): expected error", bad)

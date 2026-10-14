@@ -14,9 +14,10 @@ go test -race ./... && golangci-lint run
 ```sh
 CTS_ALLOW_INSECURE=1 ./bin/cross-tab-sync serve     # local development over plain HTTP
 ./bin/cross-tab-sync pair-code                      # prints a single-use code (stdout), expiry on stderr
+CTS_PUBLIC_URL=http://127.0.0.1:8080 ./bin/cross-tab-sync pair-code   # prints http://127.0.0.1:8080#ABCD2345
 ```
 
-`pair-code` opens the same database as `serve` (it may run while the server is up). In Docker: `docker compose exec cts /cross-tab-sync pair-code`. See [deploy/](../deploy) for the Compose + Caddy setup (`CTS_DOMAIN=tabs.example.com docker compose up -d`).
+`pair-code` prints a pairing link (`CTS_PUBLIC_URL#CODE`) when `CTS_PUBLIC_URL` is set, otherwise the bare code and a hint on stderr; paste either into the extension popup (a bare code only once the browser knows the server URL). `pair-code` opens the same database as `serve` (it may run while the server is up). In Docker: `docker compose exec cts /cross-tab-sync pair-code`. See [deploy/](../deploy) for the Compose + Caddy setup (`CTS_DOMAIN=tabs.example.com docker compose up -d`).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -26,6 +27,7 @@ CTS_ALLOW_INSECURE=1 ./bin/cross-tab-sync serve     # local development over pla
 | `CTS_OWNER_LIVENESS` | `10m` | Owner is stale after this long without heartbeat or operations |
 | `CTS_SNAPSHOT_RETENTION` | `20` | Recovery snapshots kept |
 | `CTS_HISTORY_RETENTION` | `720h` | Operation log and tombstones kept (Go duration) |
+| `CTS_PUBLIC_URL` | unset | Public base URL, e.g. `https://tabs.example.com` (http/https, no query or fragment). Used for pairing links from `POST /v1/pairing-codes` and `pair-code`. Unset: the API derives it from the request (TLS or `X-Forwarded-Proto` scheme + `Host`) and the CLI prints bare codes |
 
 Logs are JSON on stdout with method, route pattern, status, device id and latency only. History older than `CTS_HISTORY_RETENTION` is pruned at startup and hourly (open entries are always kept); clients behind `minRevision` get `410 history_expired` or `fullResync: true` and reload the session. Operations older than the retention window are treated as new if resubmitted, so a resent opening of a pruned closed entry recreates it.
 
@@ -34,7 +36,8 @@ Logs are JSON on stdout with method, route pattern, status, device id and latenc
 ```sh
 S=http://localhost:8080
 curl -s -X POST $S/v1/pair -d '{"code":"ABCD2345","name":"MacBook Safari","browser":"safari"}'
-T=cts_...   # token from the response
+T=cts_...   # token from the response; "name" is the stored name ("MacBook Safari 2" if taken)
+curl -s -X PATCH $S/v1/devices/<deviceId> -H "Authorization: Bearer $T" -d '{"name":"Work Mac"}'   # self only
 curl -s -X POST $S/v1/session/acquire -H "Authorization: Bearer $T" -d '{"force":true}'
 curl -s -X POST $S/v1/session/operations -H "Authorization: Bearer $T" -d '{
   "generation": 1, "baseRevision": 0,

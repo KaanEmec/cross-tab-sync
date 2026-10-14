@@ -36,6 +36,7 @@ func New(st *store.Store, cfg config.Config, log *slog.Logger, now func() time.T
 	mux.HandleFunc("POST /v1/pair", s.pair)
 	mux.Handle("POST /v1/pairing-codes", s.auth(s.createPairingCode))
 	mux.Handle("GET /v1/devices", s.auth(s.listDevices))
+	mux.Handle("PATCH /v1/devices/{id}", s.auth(s.renameDevice))
 	mux.Handle("DELETE /v1/devices/{id}", s.auth(s.revokeDevice))
 	mux.Handle("GET /v1/session", s.auth(s.getSession))
 	mux.Handle("GET /v1/session/changes", s.auth(s.changes))

@@ -10,10 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kaanemec/cross-tab-sync/server/internal/session"
 )
 
 // Pairing and token parameters.
@@ -23,16 +26,58 @@ const (
 	CodeTTL      = 10 * time.Minute
 	TokenPrefix  = "cts_"
 
+	// RevokedListWindow is how long a revoked device stays in ListDevices.
+	RevokedListWindow = 7 * 24 * time.Hour
+
 	lastSeenResolution = time.Minute
 )
 
-// Device is a paired, non-revoked browser.
+// Device is a paired browser. RevokedAt is zero for active devices.
 type Device struct {
 	ID         string
 	Name       string
 	Browser    string
 	CreatedAt  time.Time
 	LastSeenAt time.Time
+	RevokedAt  time.Time
+}
+
+// uniqueName returns name unchanged when no other active device (exceptID
+// aside) uses it, ignoring case. Otherwise it appends the lowest free " N"
+// (N >= 2), shortening the base so the result stays within
+// session.MaxNameLength runes.
+func uniqueName(ctx context.Context, tx *sql.Tx, name, exceptID string) (string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM devices WHERE revoked_at IS NULL AND id != ?`, exceptID)
+	if err != nil {
+		return "", fmt.Errorf("listing device names: %w", err)
+	}
+	defer rows.Close()
+	taken := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return "", fmt.Errorf("scanning device name: %w", err)
+		}
+		taken[strings.ToLower(n)] = true
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("listing device names: %w", err)
+	}
+	if !taken[strings.ToLower(name)] {
+		return name, nil
+	}
+	base := []rune(name)
+	for n := 2; ; n++ {
+		suffix := " " + strconv.Itoa(n)
+		b := base
+		if keep := session.MaxNameLength - len(suffix); len(b) > keep {
+			b = b[:keep]
+		}
+		candidate := strings.TrimRight(string(b), " ") + suffix
+		if !taken[strings.ToLower(candidate)] {
+			return candidate, nil
+		}
+	}
 }
 
 func newCode() (string, error) {
@@ -99,8 +144,9 @@ func (s *Store) CreatePairingCode(ctx context.Context, createdBy string, now tim
 }
 
 // Pair consumes a pairing code and registers a device. It returns the new
-// device id and its bearer token; only the token hash is stored.
-func (s *Store) Pair(ctx context.Context, code, name, browser string, now time.Time) (string, string, error) {
+// device and its bearer token; only the token hash is stored. The name gets a
+// numeric suffix when another active device already uses it (uniqueName).
+func (s *Store) Pair(ctx context.Context, code, name, browser string, now time.Time) (Device, string, error) {
 	want := hash(NormalizeCode(code))
 	id := uuid.NewString()
 	raw := make([]byte, 32)
@@ -137,6 +183,9 @@ func (s *Store) Pair(ctx context.Context, code, name, browser string, now time.T
 		if _, err := tx.ExecContext(ctx, `UPDATE pairing_codes SET used_at = ? WHERE code_hash = ?`, ms(now), match); err != nil {
 			return err
 		}
+		if name, err = uniqueName(ctx, tx, name, id); err != nil {
+			return err
+		}
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO devices (id, name, browser, token_hash, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)`,
 			id, name, browser, hash(token), ms(now), ms(now))
@@ -144,11 +193,12 @@ func (s *Store) Pair(ctx context.Context, code, name, browser string, now time.T
 	})
 	if err != nil {
 		if errors.Is(err, ErrInvalidCode) {
-			return "", "", err
+			return Device{}, "", err
 		}
-		return "", "", fmt.Errorf("pairing device: %w", err)
+		return Device{}, "", fmt.Errorf("pairing device: %w", err)
 	}
-	return id, token, nil
+	at := fromMS(ms(now))
+	return Device{ID: id, Name: name, Browser: browser, CreatedAt: at, LastSeenAt: at}, token, nil
 }
 
 // Authenticate resolves a bearer token to its device and refreshes the
@@ -184,10 +234,13 @@ func (s *Store) Authenticate(ctx context.Context, token string, now time.Time) (
 	return d, nil
 }
 
-// ListDevices returns all non-revoked devices, oldest first.
-func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
+// ListDevices returns active devices (oldest first), then devices revoked
+// within RevokedListWindow before now (most recently revoked first).
+func (s *Store) ListDevices(ctx context.Context, now time.Time) ([]Device, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, browser, created_at, last_seen_at FROM devices WHERE revoked_at IS NULL ORDER BY created_at, id`)
+		`SELECT id, name, browser, created_at, last_seen_at, revoked_at FROM devices
+		WHERE revoked_at IS NULL OR revoked_at > ?
+		ORDER BY revoked_at IS NOT NULL, revoked_at DESC, created_at, id`, ms(now.Add(-RevokedListWindow)))
 	if err != nil {
 		return nil, fmt.Errorf("listing devices: %w", err)
 	}
@@ -197,17 +250,48 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 		var (
 			d                 Device
 			created, lastSeen int64
+			revoked           sql.NullInt64
 		)
-		if err := rows.Scan(&d.ID, &d.Name, &d.Browser, &created, &lastSeen); err != nil {
+		if err := rows.Scan(&d.ID, &d.Name, &d.Browser, &created, &lastSeen, &revoked); err != nil {
 			return nil, fmt.Errorf("scanning device: %w", err)
 		}
 		d.CreatedAt, d.LastSeenAt = fromMS(created), fromMS(lastSeen)
+		if revoked.Valid {
+			d.RevokedAt = fromMS(revoked.Int64)
+		}
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("listing devices: %w", err)
 	}
 	return out, nil
+}
+
+// RenameDevice renames the active device id, suffixing the name like Pair
+// when another active device already uses it. It returns the updated device.
+func (s *Store) RenameDevice(ctx context.Context, id, name string) (Device, error) {
+	var d Device
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveDevice(ctx, tx, id); err != nil {
+			return err
+		}
+		unique, err := uniqueName(ctx, tx, name, id)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE devices SET name = ? WHERE id = ?`, unique, id); err != nil {
+			return fmt.Errorf("renaming device: %w", err)
+		}
+		var created, lastSeen int64
+		err = tx.QueryRowContext(ctx, `SELECT id, name, browser, created_at, last_seen_at FROM devices WHERE id = ?`, id).
+			Scan(&d.ID, &d.Name, &d.Browser, &created, &lastSeen)
+		if err != nil {
+			return fmt.Errorf("reading device: %w", err)
+		}
+		d.CreatedAt, d.LastSeenAt = fromMS(created), fromMS(lastSeen)
+		return nil
+	})
+	return d, err
 }
 
 // RevokeDevice revokes device id on behalf of callerID (which may be the same

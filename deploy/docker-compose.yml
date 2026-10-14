@@ -10,6 +10,7 @@ services:
     restart: unless-stopped
     environment:
       CTS_DB_PATH: /data/cts.db
+      CTS_PUBLIC_URL: https://${CTS_DOMAIN:?set CTS_DOMAIN to the public hostname}
       CTS_OWNER_LIVENESS: ${CTS_OWNER_LIVENESS:-10m}
       CTS_SNAPSHOT_RETENTION: ${CTS_SNAPSHOT_RETENTION:-20}
     volumes:

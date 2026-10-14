@@ -48,10 +48,11 @@ func TestMigrationsFreshAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := st.Pair(ctx, code, "Mac", "safari", now)
+	dev, _, err := st.Pair(ctx, code, "Mac", "safari", now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	id := dev.ID
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestMigrationsFreshAndIdempotent(t *testing.T) {
 	if got := countVersions(st); got != len(ms) {
 		t.Fatalf("after restart %d migration rows, want %d", got, len(ms))
 	}
-	ds, err := st.ListDevices(ctx)
+	ds, err := st.ListDevices(ctx, now)
 	if err != nil || len(ds) != 1 || ds[0].ID != id {
 		t.Fatalf("devices after restart: %+v %v", ds, err)
 	}
@@ -106,11 +107,11 @@ func TestRevokedDeviceCannotWrite(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		id, _, err := st.Pair(ctx, code, name, "brave", now)
+		dev, _, err := st.Pair(ctx, code, name, "brave", now)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return id
+		return dev.ID
 	}
 	a, b := pair("A"), pair("B")
 	gen, _, err := st.Acquire(ctx, a, false, now, time.Minute)

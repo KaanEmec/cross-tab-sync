@@ -3,7 +3,9 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -15,6 +17,7 @@ type Config struct {
 	OwnerLiveness     time.Duration // CTS_OWNER_LIVENESS
 	SnapshotRetention int           // CTS_SNAPSHOT_RETENTION
 	HistoryRetention  time.Duration // CTS_HISTORY_RETENTION
+	PublicURL         string        // CTS_PUBLIC_URL, e.g. https://tabs.example.com (no trailing slash); "" when unset
 }
 
 // Default returns the configuration used when no variables are set.
@@ -74,5 +77,28 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 		c.HistoryRetention = d
 	}
+	if v := getenv("CTS_PUBLIC_URL"); v != "" {
+		u, err := parsePublicURL(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("CTS_PUBLIC_URL: %w", err)
+		}
+		c.PublicURL = u
+	}
 	return c, nil
+}
+
+// parsePublicURL accepts an absolute http(s) URL without query or fragment and
+// returns it without a trailing slash.
+func parsePublicURL(v string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(v))
+	if err != nil {
+		return "", err
+	}
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return "", fmt.Errorf("must be an absolute http(s) URL, got %q", v)
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", fmt.Errorf("must not contain credentials, a query or a fragment, got %q", v)
+	}
+	return strings.TrimRight(u.Scheme+"://"+u.Host+u.EscapedPath(), "/"), nil
 }

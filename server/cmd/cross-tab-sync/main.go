@@ -22,7 +22,8 @@ const usage = `Usage: cross-tab-sync <command>
 
 Commands:
   serve       run the HTTP service
-  pair-code   create a single-use pairing code (valid 10 minutes)
+  pair-code   create a single-use pairing code (valid 10 minutes); prints the
+              pairing link (CTS_PUBLIC_URL#CODE) when CTS_PUBLIC_URL is set
 
 Configuration (environment):
   CTS_ADDR                listen address (default :8080)
@@ -31,6 +32,8 @@ Configuration (environment):
   CTS_OWNER_LIVENESS      owner liveness window (default 10m)
   CTS_SNAPSHOT_RETENTION  recovery snapshots kept (default 20)
   CTS_HISTORY_RETENTION   operation and tombstone history kept (default 720h)
+  CTS_PUBLIC_URL          public base URL of the service, e.g. https://tabs.example.com
+                          (default: derived from each request; the CLI prints bare codes)
 `
 
 func main() {
@@ -136,7 +139,12 @@ func pairCode(cfg config.Config, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, code)
+	if cfg.PublicURL != "" {
+		fmt.Fprintln(stdout, api.PairingLink(cfg.PublicURL, code))
+	} else {
+		fmt.Fprintln(stdout, code)
+		fmt.Fprintln(stderr, "set CTS_PUBLIC_URL (e.g. https://tabs.example.com) to print a pairing link to paste instead")
+	}
 	fmt.Fprintf(stderr, "single use, valid until %s\n", expires.Local().Format(time.DateTime))
 	return nil
 }

@@ -43,11 +43,11 @@ func newHistoryFixture(t *testing.T) *historyFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gen, _, err := st.Acquire(ctx, dev, false, now, time.Hour)
+	gen, _, err := st.Acquire(ctx, dev.ID, false, now, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &historyFixture{t: t, st: st, dev: dev, gen: gen}
+	return &historyFixture{t: t, st: st, dev: dev.ID, gen: gen}
 }
 
 func (f *historyFixture) id() string {
