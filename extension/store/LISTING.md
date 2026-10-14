@@ -18,6 +18,7 @@ Upload: `cross-tab-sync-brave-<version>.zip` from the GitHub release, or `pnpm b
   > Uses the free hosted server by default; you can run your own with Docker (open source, MIT): https://github.com/KaanEmec/cross-tab-sync
 - **Icon:** 128×128, `dist/brave/icons/icon-128.png`.
 - **Screenshots:** 1 to 5, exactly 1280×800 or 640×400 (PNG or JPEG). Suggested: the popup with Start syncing; the popup after sync with Devices and the invite link; Brave and Safari side by side showing the same tabs.
+  Ready-made: `store/assets/` has `screenshot-1.png` to `screenshot-3.png` (1280×800), `marquee-1400x560.png` and `small-tile-440x280.png`.
 - **Homepage:** https://github.com/KaanEmec/cross-tab-sync. **Support:** https://github.com/KaanEmec/cross-tab-sync/issues.
 
 ## Privacy practices tab
