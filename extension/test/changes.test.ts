@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  BURST_REMOVALS,
   CLOSE_HOLD_MS,
   EXPECT_TTL_MS,
   LOAD_GRACE_MS,
@@ -128,7 +127,7 @@ describe("closures", () => {
     expect(next(s, o).heldCloses).toEqual([]);
   });
 
-  it("a burst made only of copies of one entry is one closure (Safari pinned tab in every window)", () => {
+  it("copies of one entry closed together are one closure (Safari pinned tab in every window)", () => {
     const copies = state({ mappings: mapped([[1, "E", "https://x/"], [2, "E", "https://x/"], [3, "E", "https://x/"]]) });
     // Reported from three windows, or all from the window where it was closed.
     for (const windows of [[1, 2, 3], [W, W, W]]) {
@@ -137,13 +136,13 @@ describe("closures", () => {
       const released = releaseHeld(s, new Set([1, 2, 3]), ctx(T0 + 2 + CLOSE_HOLD_MS));
       expect(released.ops).toEqual([{ opId: "id1", type: "close", entryId: "E" }]);
     }
-    // One other entry in the burst makes it a window closing again.
+    // With another entry among them: one close per entry.
     let mixed = state({ mappings: mapped([[1, "E", "https://x/"], [2, "E", "https://x/"], [3, "F", "https://y/"]]) });
     for (const [i, id] of [1, 2, 3].entries()) mixed = next(mixed, recordRemoved(mixed, id, false, W, ctx(T0 + i)));
-    expect(releaseHeld(mixed, alive, ctx(T0 + 2 + CLOSE_HOLD_MS)).ops).toEqual([]);
+    expect(releaseHeld(mixed, alive, ctx(T0 + 2 + CLOSE_HOLD_MS)).ops.map((o) => o.entryId)).toEqual(["E", "F"]);
   });
 
-  it("held closes are dropped when the window is gone, was reported removed, or closed in a burst", () => {
+  it("held closes are dropped when the window is gone or was reported removed; rapid closes are not", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"], [2, "F", "https://y/"], [3, "G", "https://z/"]]) });
     expect(closeTab(s, 1).ops).toHaveLength(1);
     const removed = next(s, recordRemoved(s, 1, false, W, ctx()));
@@ -151,13 +150,18 @@ describe("closures", () => {
     const reported = next(removed, recordWindowRemoved(removed, W, ctx(T0 + 10)));
     expect(releaseHeld(reported, alive, ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
 
-    let burst = s;
-    for (const [i, id] of [1, 2, 3].entries()) burst = next(burst, recordRemoved(burst, id, false, W, ctx(T0 + i * 300)));
-    expect(BURST_REMOVALS).toBe(3);
-    // Released in two steps: the early removal still counts toward the burst.
-    const early = releaseHeld(burst, alive, ctx(T0 + CLOSE_HOLD_MS));
-    expect(early.ops).toEqual([]);
-    expect(releaseHeld(next(burst, early), alive, ctx(T0 + 600 + CLOSE_HOLD_MS)).ops).toEqual([]);
+    // Three different tabs closed within 600 ms (cmd-W, cmd-W, cmd-W): three closes, in two releases.
+    let rapid = s;
+    for (const [i, id] of [1, 2, 3].entries()) rapid = next(rapid, recordRemoved(rapid, id, false, W, ctx(T0 + i * 300)));
+    const early = releaseHeld(rapid, alive, ctx(T0 + CLOSE_HOLD_MS));
+    expect(early.ops.map((o) => o.entryId)).toEqual(["E"]);
+    rapid = next(rapid, early);
+    expect(rapid.heldCloses.map((h) => h.entryId)).toEqual(["F", "G"]); // released holds are not kept
+    const late = releaseHeld(rapid, alive, ctx(T0 + 600 + CLOSE_HOLD_MS));
+    expect(late.ops.map((o) => o.entryId)).toEqual(["F", "G"]);
+    expect(next(rapid, late).heldCloses).toEqual([]);
+    // The same removals from a window that is gone by the release: none.
+    expect(releaseHeld(next(s, recordRemoved(s, 1, false, W, ctx())), new Set(), ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
   });
 
   it("removals during the startup grace only unmap", () => {

@@ -435,7 +435,6 @@
   var EXPECT_TTL_MS = 3e4;
   var LOAD_GRACE_MS = 1e4;
   var CLOSE_HOLD_MS = 2e3;
-  var BURST_REMOVALS = 3;
   var STARTUP_GRACE_MS = 1e4;
   var STALE_MAPPINGS_TTL_MS = 6e4;
   function inStartupGrace(startupAt, now, windowMs = STARTUP_GRACE_MS) {
@@ -624,8 +623,8 @@
     if (!mapped) return d.done(false);
     d.unmap(tabId);
     if (ours || windowClosing || inStartupGrace(d.s.startupAt, ctx.now)) return d.done(false);
-    const recent = d.s.heldCloses.filter((h) => !h.done || ctx.now - h.at < 2 * CLOSE_HOLD_MS);
-    d.set("heldCloses", [...recent, { entryId: mapped.entryId, tabId, windowId, at: ctx.now }]);
+    const holding = d.s.heldCloses.filter((h) => !h.done);
+    d.set("heldCloses", [...holding, { entryId: mapped.entryId, tabId, windowId, at: ctx.now }]);
     diag(`held close created entry=${short(mapped.entryId)} tab=${tabId} win=${windowId}`);
     return d.done(false);
   }
@@ -639,14 +638,12 @@
     const held = d.s.heldCloses;
     const due = held.filter((h) => !h.done && ctx.now - h.at >= CLOSE_HOLD_MS);
     const waiting = held.some((h) => !h.done && ctx.now - h.at < CLOSE_HOLD_MS);
-    const kept = held.filter((h) => ctx.now - h.at < 2 * CLOSE_HOLD_MS || !h.done && !due.includes(h)).map((h) => due.includes(h) ? { ...h, done: true } : h);
-    if (due.length > 0 || kept.length !== held.length) d.set("heldCloses", kept);
+    const kept = held.filter((h) => !h.done && !due.includes(h));
+    if (kept.length !== held.length) d.set("heldCloses", kept);
     const closed = /* @__PURE__ */ new Set();
     for (const h of due) {
-      const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS);
-      const windowClosing = burst.length >= BURST_REMOVALS && burst.some((o) => o.entryId !== h.entryId);
       const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== void 0;
-      const dropped = windowGone ? "window gone" : windowClosing ? `burst of ${burst.length} removals` : closed.has(h.entryId) ? "entry already closed in this release" : tabsForEntry(d.s.mappings, h.entryId).length > 0 ? "entry still has a local copy" : null;
+      const dropped = windowGone ? "window gone" : closed.has(h.entryId) ? "entry already closed in this release" : tabsForEntry(d.s.mappings, h.entryId).length > 0 ? "entry still has a local copy" : null;
       if (dropped) {
         diag(`held close dropped entry=${short(h.entryId)} tab=${h.tabId}: ${dropped}`);
         continue;

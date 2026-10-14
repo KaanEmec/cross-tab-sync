@@ -739,7 +739,7 @@ describe("review fixes", () => {
     expect(s.pending.map((p) => [p.op.type, p.base])).toEqual([["navigate", "https://a2/"]]);
   });
 
-  it("a window closing as individual tab removals produces no close ops", async () => {
+  it("a window closing as individual tab removals produces no close ops; rapid individual closes do", async () => {
     const mac = await owner("Mac Safari", ["https://keep/"]);
     const w2 = mac.b.addWindow({ tabs: [{ url: "https://w1/" }, { url: "https://w2/" }] });
     const w3 = mac.b.addWindow({ tabs: [{ url: "https://w3/" }, { url: "https://w4/" }, { url: "https://w5/" }] });
@@ -751,16 +751,20 @@ describe("review fixes", () => {
 
     // Engine reports isWindowClosing false and no windows.onRemoved: the window is gone at release.
     mac.b.userCloseWindow(w2, { reportsWindowClosing: false, windowEvent: false });
-    // Window still listed, but three removals in one burst.
-    for (const id of mac.b.tabs.filter((t) => t.windowId === w3).map((t) => t.id)) mac.b.userCloseTab(id);
     await mac.settle();
     expect(server.openUrls()).toHaveLength(6);
     expect(mac.sent().filter((o) => o.type === "close")).toEqual([]);
-    expect((await mac.state()).heldCloses.every((h) => h.done)).toBe(true);
+    expect((await mac.state()).heldCloses).toEqual([]);
 
-    mac.b.userCloseTab(mac.tab("https://keep/")); // a single close still closes
+    // Three tabs of a window that stays open, closed one after another within 2 s: three closes.
+    for (const id of mac.b.tabs.filter((t) => t.windowId === w3).map((t) => t.id)) {
+      mac.b.userCloseTab(id);
+      clock.advance(300);
+    }
     await mac.settle();
-    expect(server.openUrls()).not.toContain("https://keep/");
+    expect(mac.sent().filter((o) => o.type === "close")).toHaveLength(3);
+    expect(server.openUrls().sort()).toEqual(["https://keep/", "https://w1/", "https://w2/"]); // the closed window's entries stay
+    expect((await mac.state()).heldCloses).toEqual([]);
   });
 
   it("a failed create clears its expectation", async () => {

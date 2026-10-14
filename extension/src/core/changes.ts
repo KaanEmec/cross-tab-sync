@@ -15,13 +15,11 @@ export const EXPECT_TTL_MS = 30_000;
  * post-load URL rewrites (replaceState, hash changes, script redirects) are not published.
  */
 export const LOAD_GRACE_MS = 10_000;
-/** Closes are held this long: a window closing or browser quitting shows up as a burst first. */
-export const CLOSE_HOLD_MS = 2_000;
 /**
- * This many removals from one window within CLOSE_HOLD_MS are treated as the window going away,
- * unless they are all copies of one entry (Safari reports a pinned tab once per window).
+ * Closes are held this long: a window closing or browser quitting reports its tabs as removals
+ * before the window is gone or `windows.onRemoved` arrives.
  */
-export const BURST_REMOVALS = 3;
+export const CLOSE_HOLD_MS = 2_000;
 /** Removals right after browser startup are restore/shutdown noise: unmap only. */
 export const STARTUP_GRACE_MS = 10_000;
 /** Mappings from the previous browser session that found no tab by then are forgotten. */
@@ -44,7 +42,7 @@ export interface HeldClose {
   tabId: number;
   windowId: number;
   at: number;
-  /** Already released; kept until 2 x CLOSE_HOLD_MS old to count bursts. */
+  /** Legacy: released holds were kept to count removal bursts. Such entries are dropped unused. */
   done?: boolean;
 }
 
@@ -322,8 +320,8 @@ export function recordRemoved(s: LocalState, tabId: number, windowClosing: boole
   if (!mapped) return d.done(false);
   d.unmap(tabId);
   if (ours || windowClosing || inStartupGrace(d.s.startupAt, ctx.now)) return d.done(false);
-  const recent = d.s.heldCloses.filter((h) => !h.done || ctx.now - h.at < 2 * CLOSE_HOLD_MS);
-  d.set("heldCloses", [...recent, { entryId: mapped.entryId, tabId, windowId, at: ctx.now }]);
+  const holding = d.s.heldCloses.filter((h) => !h.done);
+  d.set("heldCloses", [...holding, { entryId: mapped.entryId, tabId, windowId, at: ctx.now }]);
   diag(`held close created entry=${short(mapped.entryId)} tab=${tabId} win=${windowId}`);
   return d.done(false);
 }
@@ -337,29 +335,23 @@ export function recordWindowRemoved(s: LocalState, windowId: number, ctx: Ctx): 
 
 /**
  * Turn held removals older than CLOSE_HOLD_MS into `close` operations, one per entry that still has
- * no local copy. Dropped (unmap only): the tab's window no longer exists or was reported removed,
- * or BURST_REMOVALS or more removals came from that window within CLOSE_HOLD_MS. A burst made only
- * of copies of one entry is one closure (Safari reports a pinned tab once per window).
+ * no local copy (copies closed together, such as a Safari pinned tab reported once per window, are
+ * one closure). Dropped (unmap only): the tab's window no longer exists or was reported removed.
+ * Rapid individual closes are ordinary user behavior and are never dropped as a group.
  */
 export function releaseHeld(s: LocalState, aliveWindows: Set<number>, ctx: Ctx): Outcome & { waiting: boolean } {
   const d = new Draft(s, ctx);
   const held = d.s.heldCloses;
   const due = held.filter((h) => !h.done && ctx.now - h.at >= CLOSE_HOLD_MS);
   const waiting = held.some((h) => !h.done && ctx.now - h.at < CLOSE_HOLD_MS);
-  const kept = held
-    .filter((h) => ctx.now - h.at < 2 * CLOSE_HOLD_MS || (!h.done && !due.includes(h)))
-    .map((h) => (due.includes(h) ? { ...h, done: true } : h));
-  if (due.length > 0 || kept.length !== held.length) d.set("heldCloses", kept);
+  const kept = held.filter((h) => !h.done && !due.includes(h));
+  if (kept.length !== held.length) d.set("heldCloses", kept);
   const closed = new Set<string>();
   for (const h of due) {
-    const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS);
-    const windowClosing = burst.length >= BURST_REMOVALS && burst.some((o) => o.entryId !== h.entryId);
     const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== undefined;
     const dropped = windowGone
       ? "window gone"
-      : windowClosing
-        ? `burst of ${burst.length} removals`
-        : closed.has(h.entryId)
+      : closed.has(h.entryId)
           ? "entry already closed in this release"
           : tabsForEntry(d.s.mappings, h.entryId).length > 0
             ? "entry still has a local copy"
