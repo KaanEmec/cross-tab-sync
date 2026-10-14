@@ -28,3 +28,6 @@ safari/**/build/
 .claude/settings.local.json
 safari/**/dd/
 safari/**/*.xcworkspace/xcuserdata/
+
+# Local server runtime data (database, debug log)
+server/data/
