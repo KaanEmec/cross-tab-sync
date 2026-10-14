@@ -17,6 +17,7 @@ export type Request =
   | { type: "listSnapshots" }
   | { type: "restoreSnapshot"; id: number }
   | { type: "listDevices" }
+  | { type: "renameDevice"; name: string }
   | { type: "revokeDevice"; id: string }
   | { type: "createPairingCode" }
   | { type: "disconnect" };
@@ -26,6 +27,7 @@ export interface StatusView {
   serverUrl: string;
   deviceName: string;
   deviceId: string | null;
+  pairedAt: string | null;
   owner: Owner | null;
   isOwner: boolean;
   generation: number | null;
@@ -53,7 +55,7 @@ export type Response =
   | {
       ok: true;
       status: StatusView;
-      pairingCode?: { code: string; expiresAt: string };
+      pairingCode?: { code: string; expiresAt: string; link: string };
       snapshots?: Snapshot[];
       devices?: Device[];
     }
@@ -66,6 +68,7 @@ export function statusView(s: State, now = Date.now()): StatusView {
     serverUrl: s.serverUrl,
     deviceName: s.deviceName,
     deviceId: s.deviceId,
+    pairedAt: s.pairedAt,
     owner: s.owner,
     isOwner: s.generation !== null,
     generation: s.generation,

@@ -1,8 +1,10 @@
 import { storageLocal } from "../adapter/webext.js";
-import { originPattern, type Device, type Snapshot } from "../core/client.js";
+import { originPattern, type Snapshot } from "../core/client.js";
+import { deviceRows, ownerLine, relativeTime, shortId } from "../core/devices.js";
 import type { Request, Response, StatusView } from "../core/messages.js";
+import { browserLabel, resolvePairingForm, type PairingTarget } from "../core/pairing.js";
 import { saveState } from "../core/state.js";
-import { APPLIED_ELSEWHERE_NOTE, RESTORE_NOTE } from "../core/status.js";
+import { APPLIED_ELSEWHERE_NOTE, clock, RESTORE_NOTE } from "../core/status.js";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -10,11 +12,17 @@ const pairView = $<HTMLFormElement>("pair-view");
 const mainView = $("main-view");
 const errorEl = $("error");
 const badge = $("badge");
+const pairLink = $<HTMLInputElement>("pair-link");
+const pairTarget = $("pair-target");
+const pairHint = pairTarget.innerHTML;
 const serverUrl = $<HTMLInputElement>("server-url");
 const deviceName = $<HTMLInputElement>("device-name");
 const pairCode = $<HTMLInputElement>("pair-code");
 const recover = $<HTMLDetailsElement>("recover-section");
+const deviceSection = $<HTMLDetailsElement>("device-section");
 const devicesSection = $<HTMLDetailsElement>("devices-section");
+const renameForm = $<HTMLFormElement>("rename-form");
+const renameInput = $<HTMLInputElement>("rename-input");
 const buttons = () => Array.from(document.querySelectorAll("button"));
 
 let busy = false;
@@ -32,14 +40,7 @@ async function send(req: Request): Promise<Response> {
   }
 }
 
-function relative(iso: string | null): string {
-  if (!iso) return "never";
-  const secs = Math.round((Date.now() - Date.parse(iso)) / 1000);
-  if (secs < 45) return "just now";
-  if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
-  if (secs < 86400) return `${Math.round(secs / 3600)} h ago`;
-  return new Date(iso).toLocaleString();
-}
+const relative = (iso: string | null | undefined) => relativeTime(iso, Date.now());
 
 const ACTIVITY_WORDS: Record<string, string> = { activated: "tab switch", focus: "window focus", created: "new tab" };
 
@@ -61,6 +62,7 @@ function render(s: StatusView): void {
   mainView.hidden = !s.paired;
   badge.hidden = !s.paired;
   if (!s.paired) {
+    // Known from a previous pairing: a bare code is then enough.
     if (!serverUrl.value) serverUrl.value = s.serverUrl;
     if (!deviceName.value) deviceName.value = s.deviceName;
     showError(s.lastError);
@@ -73,20 +75,15 @@ function render(s: StatusView): void {
   badge.classList.toggle("owner", s.isOwner && !offline && !s.paused);
 
   $("role").textContent = s.isOwner ? "Owner (publishes changes)" : "Follower (applies changes)";
-  const o = s.owner;
-  $("owner").textContent = !o
-    ? "No owner"
-    : o.deviceId === s.deviceId
-      ? `This device (gen. ${o.generation})`
-      : `${o.name} (gen. ${o.generation})`;
+  $("owner").textContent = ownerLine(s.owner, s.deviceId);
+  $("owner").title = s.owner ? `Generation ${s.owner.generation}` : "";
   $("last-sync").textContent = relative(s.lastSuccessAt);
   $("last-sync").title = `Revision ${s.lastRevision}` + (s.minRevision !== null ? `; server history from revision ${s.minRevision}` : "");
   $("sync-state").textContent = s.summary;
   $("status-text").textContent = s.running ? "Working…" : (s.statusText ?? "");
   $("last-activity").textContent = lastActivity(s);
   $("last-activity").hidden = s.lastActivityAt === null;
-  $("identity").textContent = `${s.deviceName} · ${hostOf(s.serverUrl)}`;
-  $("identity").title = s.serverUrl;
+  renderIdentity(s);
 
   const handOver = $<HTMLButtonElement>("hand-over");
   const continueHere = $<HTMLButtonElement>("continue-here");
@@ -106,12 +103,36 @@ function render(s: StatusView): void {
   showError(s.lastError);
 }
 
-function hostOf(url: string): string {
-  try {
-    return new URL(url).host;
-  } catch {
-    return url;
-  }
+/** The "This device" block: name (rename), browser, short id (copy), server, paired since. */
+function renderIdentity(s: StatusView): void {
+  const id = s.deviceId ?? "";
+  $("self-summary").textContent = `· ${s.deviceName} (${shortId(id)})`;
+  $("self-name").textContent = s.deviceName;
+  $("self-browser").textContent = browserLabel(__BROWSER__);
+  $("self-id").textContent = shortId(id);
+  $("self-id").title = id;
+  $("self-server").textContent = s.serverUrl;
+  $("self-since").textContent = s.pairedAt ? new Date(s.pairedAt).toLocaleString() : "unknown";
+}
+
+/** Copy inside the click handler (user gesture); if the clipboard is unavailable, select the text instead. */
+function copyText(text: string, source: HTMLElement, btn: HTMLButtonElement): void {
+  const label = btn.textContent;
+  const flash = (msg: string) => {
+    btn.textContent = msg;
+    setTimeout(() => (btn.textContent = label), 2000);
+  };
+  const select = () => {
+    if (source instanceof HTMLInputElement) {
+      source.focus();
+      source.select();
+    } else {
+      window.getSelection()?.selectAllChildren(source);
+    }
+    flash(navigator.userAgent.includes("Mac") ? "Press ⌘C" : "Press Ctrl+C");
+  };
+  if (!navigator.clipboard?.writeText) return select();
+  navigator.clipboard.writeText(text).then(() => flash("Copied"), select);
 }
 
 function setBusy(value: boolean): void {
@@ -165,8 +186,9 @@ async function requestOrigin(url: string): Promise<boolean> {
   }
 }
 
-function item(text: string, detail: string, button?: HTMLButtonElement): HTMLLIElement {
+function item(text: string, detail: string, button?: HTMLButtonElement, className = ""): HTMLLIElement {
   const li = document.createElement("li");
+  if (className) li.className = className;
   const span = document.createElement("span");
   span.textContent = text;
   const small = document.createElement("small");
@@ -220,22 +242,46 @@ async function revoke(id: string): Promise<void> {
 async function loadDevices(): Promise<void> {
   const res = await send({ type: "listDevices" });
   if (!res.ok) return showError(res.error);
-  const rows = (res.devices ?? []).map((d: Device) => {
-    const action = d.isSelf ? undefined : button("Revoke", "Confirm revoke", () => void revoke(d.id), true);
-    return item(d.isSelf ? `${d.name} (this device)` : d.name, `${d.browser}, last seen ${relative(d.lastSeenAt)}`, action);
+  const rows = deviceRows(res.devices ?? [], Date.now()).map((d) => {
+    const action = d.canRevoke ? button("Revoke", "Confirm revoke", () => void revoke(d.id), true) : undefined;
+    return item(d.title, d.detail, action, d.revoked ? "revoked" : "");
   });
   fill($("devices"), rows, "No devices");
 }
 
+function pairingTarget(): PairingTarget {
+  return resolvePairingForm({ link: pairLink.value, serverUrl: serverUrl.value, code: pairCode.value }, last?.serverUrl ?? "");
+}
+
+pairLink.addEventListener("input", () => {
+  let host = "";
+  try {
+    host = new URL(pairingTarget().serverUrl).host;
+  } catch {
+    /* not a complete link yet */
+  }
+  if (host) pairTarget.textContent = `Pairs with ${host}.`;
+  else pairTarget.innerHTML = pairHint;
+});
+
 pairView.addEventListener("submit", (ev) => {
   ev.preventDefault();
+  let target: PairingTarget;
+  try {
+    target = pairingTarget();
+  } catch (e) {
+    showError(e instanceof Error ? e.message : String(e));
+    return;
+  }
+  if (!deviceName.value.trim()) return showError("Enter a device name");
+  showError(null);
   // Save the form first (the prompt may close this popup; the worker then pairs on
   // permissions.onAdded), then request permission synchronously inside the user gesture.
   const saved = saveState(storageLocal, {
-    pendingPair: { serverUrl: serverUrl.value, deviceName: deviceName.value, code: pairCode.value, createdAt: Date.now() },
+    pendingPair: { serverUrl: target.serverUrl, deviceName: deviceName.value, code: target.code, createdAt: Date.now() },
     lastError: null,
   });
-  const granted = requestOrigin(serverUrl.value);
+  const granted = requestOrigin(target.serverUrl);
   void Promise.all([saved, granted]).then(async ([, ok]) => {
     if (!ok) {
       await saveState(storageLocal, { pendingPair: null });
@@ -243,7 +289,7 @@ pairView.addEventListener("submit", (ev) => {
       return;
     }
     const res = await run({ type: "pair" });
-    if (res.ok) pairCode.value = "";
+    if (res.ok) pairLink.value = pairCode.value = "";
   });
 });
 
@@ -258,23 +304,49 @@ $("grant").addEventListener("click", () => {
 });
 recover.addEventListener("toggle", () => void (recover.open && loadSnapshots()));
 devicesSection.addEventListener("toggle", () => void (devicesSection.open && loadDevices()));
+// Devices paired before pairedAt was kept: the device list backfills it (storage change re-renders).
+deviceSection.addEventListener("toggle", () => void (deviceSection.open && last?.paired && !last.pairedAt && send({ type: "listDevices" })));
 
-$("create-code").addEventListener("click", async () => {
-  const res = await run({ type: "createPairingCode" });
-  const el = $("pairing-code");
-  if (res.ok && res.pairingCode) {
-    const expires = new Date(res.pairingCode.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    el.textContent = res.pairingCode.code;
-    const small = document.createElement("small");
-    small.textContent = `Enter on the other device. Valid until ${expires}, single use.`;
-    el.append(small);
-    el.hidden = false;
+$("copy-id").addEventListener("click", (ev) => copyText(last?.deviceId ?? "", $("self-id"), ev.currentTarget as HTMLButtonElement));
+
+function showRename(open: boolean): void {
+  renameForm.hidden = !open;
+  $("rename").hidden = open;
+  if (open) {
+    renameInput.value = last?.deviceName ?? "";
+    renameInput.focus();
+    renameInput.select();
   }
+}
+$("rename").addEventListener("click", () => showRename(true));
+$("rename-cancel").addEventListener("click", () => showRename(false));
+renameForm.addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const name = renameInput.value.trim();
+  if (!name) return showError("Enter a device name");
+  void run({ type: "renameDevice", name }).then(async (res) => {
+    if (!res.ok) return;
+    showRename(false);
+    if (devicesSection.open) await loadDevices();
+  });
 });
 
+const inviteLink = $<HTMLInputElement>("invite-link");
+$("invite").addEventListener("click", async () => {
+  const res = await run({ type: "createPairingCode" });
+  if (!res.ok || !res.pairingCode) return;
+  const { link, expiresAt } = res.pairingCode;
+  const expires = clock(Date.parse(expiresAt));
+  inviteLink.value = link;
+  $("invite-note").textContent = `Valid until ${expires}, single use. In the other browser, open Cross-Tab-Sync and paste this link.`;
+  $("invite-box").hidden = false;
+  $("invite").textContent = "New invitation link";
+});
+$("copy-link").addEventListener("click", (ev) => copyText(inviteLink.value, inviteLink, ev.currentTarget as HTMLButtonElement));
+
 const disconnect = $<HTMLButtonElement>("disconnect");
-disconnect.title = "Your tabs stay open";
-confirmTwice(disconnect, "Click again to disconnect", () => void run({ type: "disconnect" }));
+disconnect.title = "Releases ownership and revokes this device on the server. Your tabs stay open.";
+confirmTwice(disconnect, "Click again to disconnect. Pairing again gives this browser a new identity.", () => void run({ type: "disconnect" }));
 
 chrome.storage.onChanged.addListener((_changes, area) => {
   if (area !== "local" || busy) return;

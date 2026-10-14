@@ -8,7 +8,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { FakeBrowser } from "../../src/adapter/fake.js";
 import { ApiClient, type BrowserKind, type ChangesResponse, type Session } from "../../src/core/client.js";
 import { SyncEngine } from "../../src/core/engine.js";
-import { continueHere, handOver, pair, type Deps } from "../../src/core/handover.js";
+import { continueHere, createPairingCode, disconnect, handOver, pair, type Deps } from "../../src/core/handover.js";
+import { parsePairingInput } from "../../src/core/pairing.js";
+import { listDevices, renameDevice } from "../../src/core/recovery.js";
 import { loadState } from "../../src/core/state.js";
 
 const SERVER_DIR = resolve(import.meta.dirname, "../../../server");
@@ -249,5 +251,36 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     expect(entryUrls(session)).toEqual(["https://a.example/brave", "https://a.example/safari"]);
     expect(session.owner?.name).toBe("Safari");
     expect(urlsOf(brave.b)).toEqual(["https://a.example/brave", "https://a.example/safari"]);
+  });
+
+  it("pairing link: invite, duplicate names, rename, revoked devices listed", async () => {
+    await startServer();
+    const mac = await device("Brave on macOS", "brave", []);
+
+    // CLI: a link with CTS_PUBLIC_URL, a bare code without it.
+    const cli = execFileSync(binary, ["pair-code"], { env: serverEnv({ CTS_PUBLIC_URL: baseUrl }), stdio: ["ignore", "pipe", "ignore"] });
+    expect(cli.toString().trim()).toMatch(new RegExp(`^${baseUrl.replace(/\./g, "\\.")}#[A-Z2-9]{8}$`));
+
+    // Invite: the server derives the link from the request (no CTS_PUBLIC_URL on the server).
+    const invite = await createPairingCode(mac.deps);
+    expect(invite.link).toBe(`${baseUrl}#${invite.code}`);
+    const b = new FakeBrowser();
+    const deps: Deps = { adapter: b, browser: "brave", api: (cfg) => new ApiClient({ baseUrl: cfg.baseUrl, token: cfg.token, timeoutMs: 10_000 }) };
+    const target = parsePairingInput(invite.link);
+    expect(target.serverUrl).toBe(baseUrl);
+    const second = await pair(deps, { ...target, deviceName: "Brave on macOS" });
+    expect(second.deviceName).toBe("Brave on macOS 2");
+
+    const renamed = await renameDevice(deps, "Work Brave");
+    expect(renamed.deviceName).toBe("Work Brave");
+    expect((await listDevices(mac.deps)).map((d) => d.name)).toEqual(["Brave on macOS", "Work Brave"]);
+    await expect((await api(mac)).renameDevice(second.deviceId!, "Mine")).rejects.toMatchObject({ status: 403, code: "forbidden" });
+
+    await disconnect(deps);
+    const devices = await listDevices(mac.deps);
+    expect(devices.map((d) => [d.name, Boolean(d.revokedAt)])).toEqual([
+      ["Brave on macOS", false],
+      ["Work Brave", true],
+    ]);
   });
 });

@@ -164,11 +164,16 @@
       this.fetchImpl = opts.fetch ?? ((input, init) => fetch(input, init));
       this.timeoutMs = opts.timeoutMs ?? 15e3;
     }
+    /** `name` in the response is the stored name, suffixed when another device uses it (absent on older servers). */
     pair(body) {
       return this.request("POST", "/v1/pair", body, false);
     }
     createPairingCode() {
       return this.request("POST", "/v1/pairing-codes");
+    }
+    /** Rename this device (self only); the response carries the stored, possibly suffixed, name. */
+    renameDevice(id, name) {
+      return this.request("PATCH", `/v1/devices/${encodeURIComponent(id)}`, { name });
     }
     async devices() {
       const res = await this.request("GET", "/v1/devices");
@@ -247,6 +252,41 @@
     }
   };
 
+  // src/core/diag.ts
+  var enabled = false;
+  var URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/\S*/gi;
+  function isLoopbackUrl(url) {
+    try {
+      const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
+      return host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+    } catch {
+      return false;
+    }
+  }
+  function diagnosticsOn(s) {
+    return s.diagnostics ?? isLoopbackUrl(s.serverUrl);
+  }
+  async function refreshDiagnostics(storage) {
+    const raw = await storage.get(["cts.serverUrl", "cts.diagnostics"]);
+    const serverUrl2 = typeof raw["cts.serverUrl"] === "string" ? raw["cts.serverUrl"] : "";
+    const flag = raw["cts.diagnostics"];
+    enabled = diagnosticsOn({ serverUrl: serverUrl2, diagnostics: typeof flag === "boolean" ? flag : null });
+  }
+  var short = (id) => id ? id.slice(0, 8) : "-";
+  var errText = (e) => e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+  function diag(msg) {
+    if (!enabled) return;
+    const line = msg.replace(URL_LIKE, "<url>");
+    console.log("[cts] " + line);
+    try {
+      const runtime = typeof chrome !== "undefined" ? chrome.runtime : void 0;
+      if (typeof runtime?.sendNativeMessage !== "function") return;
+      const sent = runtime.sendNativeMessage("application.id", { diag: line });
+      if (sent instanceof Promise) sent.catch(() => void 0);
+    } catch {
+    }
+  }
+
   // src/core/activity.ts
   var STARTUP_SUPPRESSION_MS = 3e4;
   var FRESH_IDLE_MS = 6e4;
@@ -294,6 +334,7 @@
       if (meta.baseRevision !== void 0) p.baseRevision = meta.baseRevision;
       return p;
     });
+    if (added.length > 0) diag(`journal + ${added.map((p) => `${p.op.type}:${short(p.op.entryId)}`).join(" ")} (now ${journal.length + added.length})`);
     return [...journal, ...added];
   }
   function pendingChanges(journal, entryId) {
@@ -585,6 +626,7 @@
     if (ours || windowClosing || inStartupGrace(d.s.startupAt, ctx.now)) return d.done(false);
     const recent = d.s.heldCloses.filter((h) => !h.done || ctx.now - h.at < 2 * CLOSE_HOLD_MS);
     d.set("heldCloses", [...recent, { entryId: mapped.entryId, tabId, windowId, at: ctx.now }]);
+    diag(`held close created entry=${short(mapped.entryId)} tab=${tabId} win=${windowId}`);
     return d.done(false);
   }
   function recordWindowRemoved(s, windowId, ctx) {
@@ -604,8 +646,12 @@
       const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS);
       const windowClosing = burst.length >= BURST_REMOVALS && burst.some((o) => o.entryId !== h.entryId);
       const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== void 0;
-      if (windowGone || windowClosing || closed.has(h.entryId)) continue;
-      if (tabsForEntry(d.s.mappings, h.entryId).length > 0) continue;
+      const dropped = windowGone ? "window gone" : windowClosing ? `burst of ${burst.length} removals` : closed.has(h.entryId) ? "entry already closed in this release" : tabsForEntry(d.s.mappings, h.entryId).length > 0 ? "entry still has a local copy" : null;
+      if (dropped) {
+        diag(`held close dropped entry=${short(h.entryId)} tab=${h.tabId}: ${dropped}`);
+        continue;
+      }
+      diag(`held close released entry=${short(h.entryId)} tab=${h.tabId}`);
       closed.add(h.entryId);
       d.ops.push({ opId: ctx.newId(), type: "close", entryId: h.entryId });
     }
@@ -644,6 +690,7 @@
       deviceName: "",
       deviceId: null,
       token: null,
+      pairedAt: null,
       lastRevision: 0,
       generation: null,
       owner: null,
@@ -672,7 +719,8 @@
       nextRetryAt: null,
       retryAttempts: 0,
       paused: false,
-      minRevision: null
+      minRevision: null,
+      diagnostics: null
     };
   }
   var PREFIX = "cts.";
@@ -701,6 +749,7 @@
     return {
       deviceId: null,
       token: null,
+      pairedAt: null,
       lastRevision: 0,
       generation: null,
       owner: null,
@@ -1275,6 +1324,20 @@
     return { open, failed };
   }
 
+  // src/core/pairing.ts
+  function pairingLink(serverUrl2, code) {
+    return `${serverUrl2}#${code}`;
+  }
+  function browserLabel(browser) {
+    if (browser === "safari") return "Safari";
+    if (browser === "brave") return "Brave";
+    return browser ? browser[0].toUpperCase() + browser.slice(1) : "Browser";
+  }
+  function defaultDeviceName(browser, os) {
+    const osName = { mac: "macOS", win: "Windows", linux: "Linux", cros: "ChromeOS" }[os] ?? "";
+    return osName ? `${browserLabel(browser)} on ${osName}` : browserLabel(browser);
+  }
+
   // src/core/merge.ts
   function isMalformed(e) {
     return e instanceof ApiError && (e.status === 400 && e.code === "invalid_request" || e.status === 413 && e.code === "payload_too_large");
@@ -1533,16 +1596,19 @@
       if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
       if (!code) throw new Error("Pairing code is required");
       const res = await deps2.api({ baseUrl: serverUrl2, token: null }).pair({ code, name: deviceName, browser: deps2.browser });
+      const name = res.name ?? deviceName;
+      const renamed = name !== deviceName ? ` as "${name}" (another device is named "${deviceName}")` : "";
       await store.set({
         ...clearedCredentials(),
         serverUrl: serverUrl2,
-        deviceName,
+        deviceName: name,
         deviceId: res.deviceId,
         token: res.token,
+        pairedAt: nowIso(deps2),
         mappings: emptyMappings(),
         ...succeeded(deps2),
         lastError: null,
-        statusText: "Paired. This browser follows the shared tabs and takes over when you use it."
+        statusText: `Paired${renamed}. This browser follows the shared tabs and takes over when you use it.`
       });
       return store.s;
     } catch (e) {
@@ -1561,7 +1627,8 @@
     const store = await Store.open(deps2);
     try {
       requirePaired(store.s);
-      return await apiFor(deps2, store.s).createPairingCode();
+      const res = await apiFor(deps2, store.s).createPairingCode();
+      return { code: res.code, expiresAt: res.expiresAt, link: res.link ?? pairingLink(store.s.serverUrl, res.code) };
     } catch (e) {
       return fail(store, e);
     }
@@ -1664,7 +1731,35 @@
     return read(deps2, (store) => apiFor(deps2, store.s).snapshots());
   }
   function listDevices(deps2) {
-    return read(deps2, (store) => apiFor(deps2, store.s).devices());
+    return read(deps2, async (store) => {
+      const devices = await apiFor(deps2, store.s).devices();
+      const self = devices.find((d) => d.isSelf);
+      if (self && (store.s.pairedAt === null || store.s.deviceName !== self.name)) {
+        await store.set({ pairedAt: store.s.pairedAt ?? self.createdAt, deviceName: self.name });
+      }
+      return devices;
+    });
+  }
+  async function renameDevice(deps2, name) {
+    const store = await Store.open(deps2);
+    requirePaired(store.s);
+    const wanted = name.trim();
+    if (!wanted) throw new Error("Device name is required");
+    if ([...wanted].length > 64) throw new Error("Device name must be at most 64 characters");
+    try {
+      const d = await apiFor(deps2, store.s).renameDevice(store.s.deviceId, wanted);
+      const owner = store.s.owner?.deviceId === d.id ? { ...store.s.owner, name: d.name } : store.s.owner;
+      await store.set({
+        deviceName: d.name,
+        owner,
+        ...succeeded(deps2),
+        lastError: null,
+        statusText: d.name === wanted ? `Renamed to "${d.name}"` : `Renamed to "${d.name}" (another device is named "${wanted}")`
+      });
+      return store.s;
+    } catch (e) {
+      return fail(store, e);
+    }
   }
   async function revokeDevice(deps2, deviceId) {
     const store = await Store.open(deps2);
@@ -1707,6 +1802,7 @@
   // src/core/engine.ts
   var SYNC_DEBOUNCE_MS = 2e3;
   var VERIFY_INTERVAL_MS = 1e4;
+  var REMATCH_DELAYS_MS = [5e3, 3e4];
   var SESSION_MARKER = "cts.browserSession";
   var PAUSED_MESSAGE = "Sync is paused. Resume to sync again.";
   var BACKED_OFF = /* @__PURE__ */ new Set(["sync", "alarm"]);
@@ -1714,23 +1810,37 @@
     const h = setTimeout(fn, ms);
     return () => clearTimeout(h);
   };
-  var ignore = () => void 0;
+  var ignore = (e) => {
+    if (e !== void 0) diag(`caught ${errText(e)}`);
+  };
   function isCommitted(tab, change) {
     return change.status === "complete" || change.url !== void 0 && tab.status === "complete";
   }
   function outcome(o, kind) {
     return { patch: o.patch, ops: o.ops.length, activity: o.activity, kind };
   }
+  function activityText(s, isOwner, d) {
+    if (!d) return "paused";
+    if (!d.counted) return "not counted (startup)";
+    if (d.takeover) return "fresh, takeover";
+    if (!d.fresh) return s.suppressAutoTakeover && !isOwner ? "not fresh (suppressed after hand over)" : "not fresh";
+    return isOwner ? "fresh, owner" : "fresh, takeover rate-limited (pending)";
+  }
   var SyncEngine = class {
-    /** `retrySchedule` runs the backoff retries (separate so tests can fire them on their own). */
-    constructor(deps2, schedule = timeoutScheduler, retrySchedule = schedule) {
+    /**
+     * `retrySchedule` runs the backoff retries and `rematchSchedule` the delayed re-matches after a
+     * startup reset (separate so tests can fire them on their own).
+     */
+    constructor(deps2, schedule = timeoutScheduler, retrySchedule = schedule, rematchSchedule = schedule) {
       this.deps = deps2;
       this.schedule = schedule;
       this.retrySchedule = retrySchedule;
+      this.rematchSchedule = rematchSchedule;
     }
     deps;
     schedule;
     retrySchedule;
+    rematchSchedule;
     chain = Promise.resolve();
     depth = 0;
     cancelTimer = null;
@@ -1744,17 +1854,30 @@
     /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
     attach() {
       const a = this.deps.adapter;
-      a.onTabCreated((tab) => this.event(async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab), ctx), "created")));
+      a.onTabCreated(
+        (tab) => this.event(
+          `created tab=${tab.id} win=${tab.windowId}`,
+          async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab), ctx), "created")
+        )
+      );
       a.onTabUpdated((tab, change) => {
         if (!isCommitted(tab, change)) return;
-        this.event(async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab), ctx)));
+        this.event(
+          `updated tab=${tab.id} win=${tab.windowId} status=${change.status ?? "-"}`,
+          async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab), ctx))
+        );
       });
       a.onTabRemoved(
-        (tabId, windowClosing, windowId) => this.event(async (s, ctx) => outcome(recordRemoved(s, tabId, windowClosing, windowId, ctx)))
+        (tabId, windowClosing, windowId) => this.event(
+          `removed tab=${tabId} win=${windowId} windowClosing=${windowClosing}`,
+          async (s, ctx) => outcome(recordRemoved(s, tabId, windowClosing, windowId, ctx))
+        )
       );
-      a.onWindowRemoved((windowId) => this.event(async (s, ctx) => outcome(recordWindowRemoved(s, windowId, ctx))));
+      a.onWindowRemoved(
+        (windowId) => this.event(`windowRemoved win=${windowId}`, async (s, ctx) => outcome(recordWindowRemoved(s, windowId, ctx)))
+      );
       a.onTabActivated(
-        (tabId) => this.event(async (s, ctx) => ({
+        (tabId, windowId) => this.event(`activated tab=${tabId} win=${windowId}`, async (s, ctx) => ({
           patch: {},
           ops: 0,
           activity: !s.expected.some((e) => e.kind === "load" && e.created && e.tabId === tabId && e.until > ctx.now),
@@ -1762,18 +1885,30 @@
         }))
       );
       a.onWindowFocusChanged((windowId) => {
-        if (windowId !== null) this.event((s) => this.focused(s, windowId));
+        if (windowId !== null) this.event(`focus win=${windowId}`, (s) => this.focused(s, windowId));
       });
-      a.onStartup(() => void this.startup().catch(ignore));
+      a.onStartup(() => {
+        diag("onStartup");
+        void this.startup().catch(ignore);
+      });
     }
     /** True while anything is queued or running. */
     get busy() {
       return this.depth > 0;
     }
-    /** Run `fn` after everything queued before it. */
-    enqueue(fn) {
+    /** Run `fn` after everything queued before it. `label` names the task in the diagnostics trace. */
+    enqueue(fn, label = "task") {
       this.depth++;
-      const run = this.chain.then(fn);
+      const run = this.chain.then(async () => {
+        await refreshDiagnostics(this.deps.adapter.storage).catch(() => void 0);
+        const started = Date.now();
+        diag(`task ${label} start`);
+        try {
+          return await fn();
+        } finally {
+          diag(`task ${label} end ${Date.now() - started}ms`);
+        }
+      });
       const done = () => {
         this.depth--;
       };
@@ -1793,26 +1928,45 @@
         await this.ensureSession();
         try {
           return await withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps));
+        } catch (e) {
+          diag(`${action} failed: ${errText(e)}`);
+          throw e;
         } finally {
           await this.scheduleRetry().catch(ignore);
         }
-      });
+      }, action);
     }
     /**
      * Tab ids from a previous browser session must never be read against the current tabs, and
      * restored tabs' events can arrive before runtime.onStartup. So every queued task first checks a
      * marker in session storage (cleared when the browser exits) and runs the startup reset when it
-     * is missing. Without session storage, only runtime.onStartup resets.
+     * is missing. Without session storage, only runtime.onStartup resets. After a reset the open
+     * tabs are re-matched by URL (tabs.query reports URLs of restored tabs that never loaded and send
+     * no events, as in Safari) now and after REMATCH_DELAYS_MS; restored tabs' events still re-match
+     * on their own during the stale-mapping window.
      */
     async ensureSession(force = false) {
       const marker = this.deps.adapter.sessionStorage;
       if (!marker) {
-        if (force) await resetForBrowserStartup(this.deps);
+        if (force) await this.reset(force === "always" ? "update" : "onStartup (no session storage)");
         return;
       }
       if (force !== "always" && (await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== void 0) return;
-      await resetForBrowserStartup(this.deps);
+      await this.reset(force === "always" ? "update" : "session marker missing");
       await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
+    }
+    async reset(reason) {
+      diag(`startup reset: ${reason}`);
+      await resetForBrowserStartup(this.deps);
+      await rematchTabs(this.deps);
+      for (const ms of REMATCH_DELAYS_MS) {
+        this.rematchSchedule(() => {
+          void this.enqueue(async () => {
+            await this.ensureSession();
+            await rematchTabs(this.deps);
+          }, `rematch +${ms}ms`).catch(ignore);
+        }, ms);
+      }
     }
     /**
      * Owner or follower run now (alarm, Sync now, debounced local changes, retry, `verify` after
@@ -1826,12 +1980,19 @@
       return this.locked(action, async () => {
         const s = await loadState(this.deps.adapter.storage);
         if (s.paused) {
+          diag(`run ${action} skipped: paused`);
           if (action === "syncNow") throw new Error(PAUSED_MESSAGE);
           return s;
         }
-        if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) return s;
+        if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) {
+          diag(`run ${action} skipped: backing off`);
+          return s;
+        }
+        diag(`run ${action} start as ${s.generation !== null ? "owner" : "follower"} pending=${s.pending.length}`);
         try {
-          return await syncRun(this.deps);
+          const out = await syncRun(this.deps);
+          diag(`run ${action} end: ${out.statusText ?? "-"}; error: ${out.lastError ?? "none"}`);
+          return out;
         } finally {
           if (s.generation !== null) await this.afterDemotion().catch(ignore);
         }
@@ -1843,6 +2004,7 @@
       const s = await loadState(storage);
       if (!isPaired(s) || s.paused || s.generation !== null) return;
       const d = onDemoted(s, nowMs(this.deps));
+      diag(`demoted: ${d.takeover ? "taking over" : d.patch.freshPending ? "takeover rate-limited, pending" : "no recent activity, following"}`);
       await saveState(storage, d.patch);
       if (d.takeover) void this.takeover().catch(ignore);
     }
@@ -1861,6 +2023,7 @@
     takeover(action = "takeover") {
       return this.locked(action, async () => {
         const s = await loadState(this.deps.adapter.storage);
+        diag(`${action}${s.paused ? " skipped: paused" : ""}`);
         if (s.paused) {
           if (action === "takeover") return s;
           throw new Error(PAUSED_MESSAGE);
@@ -1896,26 +2059,24 @@
         const storage = this.deps.adapter.storage;
         await saveState(storage, { paused: true, statusText: "Paused. Local changes are kept and sent when you resume." });
         return loadState(storage);
-      });
+      }, "pause");
     }
     /**
      * Resume: release held closes first (those whose windows are gone are dropped, never sent; a
      * tab that is merely absent is only unmapped by the run), then run in the current role.
      */
     async unpause() {
-      await this.enqueue(() => saveState(this.deps.adapter.storage, { paused: false, statusText: null }));
-      await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)));
+      await this.enqueue(() => saveState(this.deps.adapter.storage, { paused: false, statusText: null }), "resume sync");
+      await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)), "release held closes");
       return this.runNow("resume");
     }
     /**
      * Browser startup (`browser`): set mappings aside unless already done for this session, start
-     * the grace period, catch up shortly after. Extension update (`update`): the same reset always.
+     * the grace period, re-match the open tabs by URL, catch up shortly after. Extension update
+     * (`update`): the same reset always (the tabs are already loaded and send no restore events).
      */
     async startup(reason = "browser") {
-      await this.enqueue(async () => {
-        await this.ensureSession(reason === "update" ? "always" : true);
-        if (reason === "update") await rematchTabs(this.deps);
-      });
+      await this.enqueue(() => this.ensureSession(reason === "update" ? "always" : true), `startup ${reason}`);
       this.requestSync();
     }
     /** Worker (re)start: send what an earlier worker journaled, release closes it held, rearm the retry. */
@@ -1923,7 +2084,7 @@
       const s = await this.enqueue(async () => {
         await this.ensureSession();
         return loadState(this.deps.adapter.storage);
-      });
+      }, "worker resume");
       if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease();
       if (s.paused) return;
       if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
@@ -1949,7 +2110,7 @@
       if (this.cancelRelease) return;
       this.cancelRelease = this.schedule(() => {
         this.cancelRelease = null;
-        this.event((s, ctx) => this.release(s, ctx));
+        this.event("release held closes", (s, ctx) => this.release(s, ctx));
       }, CLOSE_HOLD_MS);
     }
     async release(s, ctx) {
@@ -1958,8 +2119,9 @@
       if (out.waiting) this.scheduleRelease();
       return outcome(out);
     }
-    event(step) {
-      void this.enqueue(() => this.process(step)).catch(ignore);
+    event(label, step) {
+      diag(`event ${label}`);
+      void this.enqueue(() => this.process(step), label).catch(ignore);
     }
     /** Load state, apply one event, write all changed fields at once, then schedule follow-ups. */
     async process(step) {
@@ -1971,12 +2133,14 @@
       const out = await step(s, { now, newId: idGen(this.deps) });
       const isOwner = s.generation !== null;
       const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner, kind: out.kind }) : null;
+      if (out.activity) diag(`activity ${out.kind ?? "-"}: ${activityText(s, isOwner, decision)}`);
       await saveState(storage, { ...out.patch, ...decision?.patch });
       if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
       if (s.paused) return;
       if (decision?.takeover) void this.takeover().catch(ignore);
       else if (isOwner && (decision?.fresh || decision?.counted && now - this.lastVerifyAt >= VERIFY_INTERVAL_MS)) {
         this.lastVerifyAt = now;
+        diag(`verify ownership (${decision?.fresh ? "fresh interaction" : "activity"})`);
         void this.runNow("verify").catch(ignore);
       } else if (isOwner && out.ops > 0) this.requestSync();
     }
@@ -2008,6 +2172,7 @@
       serverUrl: s.serverUrl,
       deviceName: s.deviceName,
       deviceId: s.deviceId,
+      pairedAt: s.pairedAt,
       owner: s.owner,
       isOwner: s.generation !== null,
       generation: s.generation,
@@ -2038,6 +2203,7 @@
     browser: "safari"
   };
   var engine = new SyncEngine(deps);
+  void refreshDiagnostics(adapter.storage).then(() => diag(`worker start (${"safari"})`)).catch(() => void 0);
   async function pairQueued() {
     const result = await engine.locked("pair", () => pairFromPending(deps));
     if (result) {
@@ -2051,15 +2217,14 @@
     const state = await loadState(adapter.storage);
     if (!state.deviceName) {
       const os = await chrome.runtime.getPlatformInfo().then((p) => p.os).catch(() => "");
-      const osName = os === "mac" ? "macOS" : os === "win" ? "Windows" : os === "linux" ? "Linux" : "";
-      const browserName = true ? "Safari" : "Brave";
-      await saveState(adapter.storage, { deviceName: osName ? `${browserName} on ${osName}` : browserName });
+      await saveState(adapter.storage, { deviceName: defaultDeviceName("safari", os) });
     }
     await adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
   }
   void adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
   void engine.enqueue(() => saveState(adapter.storage, { runLock: null })).then(() => engine.resume());
   chrome.runtime.onInstalled.addListener((details) => {
+    diag(`onInstalled ${details.reason}`);
     void setup();
     if (details.reason === "update") void engine.startup("update").catch(() => void 0);
   });
@@ -2108,6 +2273,9 @@
         break;
       case "listDevices":
         devices = await listDevices(deps);
+        break;
+      case "renameDevice":
+        await engine.enqueue(() => renameDevice(deps, req.name));
         break;
       case "revokeDevice":
         await engine.enqueue(() => revokeDevice(deps, req.id));

@@ -12,6 +12,7 @@ export type Api = Pick<
   | "pair"
   | "createPairingCode"
   | "devices"
+  | "renameDevice"
   | "deleteDevice"
   | "session"
   | "changes"

@@ -51,9 +51,15 @@ function validateBatch(body: { baseRevision: number; operations: Operation[] }):
 interface Device {
   id: string;
   name: string;
+  browser: string;
   token: string;
+  createdAt: string;
   revoked: boolean;
+  revokedAt: string | null;
 }
+
+/** Revoked devices stay in the device list this long. */
+const REVOKED_LISTED_MS = 7 * 24 * 3600_000;
 
 type ServerEntry = Entry & { open: boolean; urlRevision: number; urlDevice: string };
 
@@ -104,11 +110,33 @@ export class FakeServer {
     }
   }
 
-  addDevice(name: string): Device {
+  /** Clock for createdAt / revokedAt and the 7-day revoked window. */
+  now = () => Date.now();
+
+  /** The server's duplicate rule: lowest free " N" suffix among other active devices, ignoring case. */
+  private uniqueName(name: string, exceptId: string): string {
+    const taken = new Set(this.devices.filter((d) => !d.revoked && d.id !== exceptId).map((d) => d.name.toLowerCase()));
+    if (!taken.has(name.toLowerCase())) return name;
+    for (let n = 2; ; n++) {
+      const suffix = ` ${n}`;
+      const candidate = [...name].slice(0, 64 - suffix.length).join("").trimEnd() + suffix;
+      if (!taken.has(candidate.toLowerCase())) return candidate;
+    }
+  }
+
+  addDevice(name: string, browser = "brave"): Device {
     const n = this.devices.length + 1;
-    const d = { id: `dev-${n}`, name, token: `cts_token${n}`, revoked: false };
+    const id = `dev-${n}`;
+    const createdAt = new Date(this.now()).toISOString();
+    const d = { id, name: this.uniqueName(name, id), browser, token: `cts_token${n}`, createdAt, revoked: false, revokedAt: null };
     this.devices.push(d);
     return d;
+  }
+
+  private deviceJson(x: Device, self: string) {
+    const lastSeenAt = new Date(this.now()).toISOString();
+    const out = { id: x.id, name: x.name, browser: x.browser, createdAt: x.createdAt, lastSeenAt, isSelf: x.id === self };
+    return x.revokedAt ? { ...out, revokedAt: x.revokedAt } : out;
   }
 
   session(): Session {
@@ -279,30 +307,42 @@ export class FakeServer {
   }
 
   api = (cfg: { baseUrl: string; token: string | null }): Api => ({
-    pair: async ({ code, name }) => {
+    pair: async ({ code, name, browser }) => {
       if (this.unreachable) throw new ApiError(0, "network_error", "Server is unreachable");
+      this.requests.push({ path: "pair", body: { code, name, browser } });
       if (!this.codes.delete(code)) throw new ApiError(400, "invalid_code", "invalid or expired code");
-      const d = this.addDevice(name);
-      return { deviceId: d.id, token: d.token };
+      const d = this.addDevice(name, browser);
+      return { deviceId: d.id, token: d.token, name: d.name };
     },
     createPairingCode: async () => {
       this.auth(cfg.token);
       const code = `CODE${this.codes.size}`.padEnd(8, "X");
       this.codes.add(code);
-      return { code, expiresAt: new Date(Date.now() + 600_000).toISOString() };
+      return { code, expiresAt: new Date(this.now() + 600_000).toISOString(), link: `${cfg.baseUrl}#${code}` };
     },
     devices: async () => {
       const d = this.auth(cfg.token);
-      const at = new Date().toISOString();
-      return this.devices
-        .filter((x) => !x.revoked)
-        .map((x) => ({ id: x.id, name: x.name, browser: "brave", createdAt: at, lastSeenAt: at, isSelf: x.id === d.id }));
+      const cutoff = this.now() - REVOKED_LISTED_MS;
+      const recent = this.devices
+        .filter((x) => x.revokedAt && Date.parse(x.revokedAt) > cutoff)
+        .sort((a, b) => b.revokedAt!.localeCompare(a.revokedAt!));
+      return [...this.devices.filter((x) => !x.revoked), ...recent].map((x) => this.deviceJson(x, d.id));
+    },
+    renameDevice: async (id, name) => {
+      const d = this.auth(cfg.token);
+      if (id !== d.id) throw new ApiError(403, "forbidden", "a device can only rename itself", { error: "forbidden" });
+      const trimmed = name.trim();
+      if (!trimmed || [...trimmed].length > 64) throw new ApiError(400, "invalid_request", "bad name", { error: "invalid_request" });
+      d.name = this.uniqueName(trimmed, d.id);
+      if (this.owner?.deviceId === d.id) this.owner = { ...this.owner, name: d.name };
+      return this.deviceJson(d, d.id);
     },
     deleteDevice: async (id) => {
       this.auth(cfg.token);
       const d = this.devices.find((x) => x.id === id);
       if (!d || d.revoked) throw new ApiError(404, "not_found", "not found");
       d.revoked = true;
+      d.revokedAt = new Date(this.now()).toISOString();
       if (this.owner?.deviceId === id) this.owner = null;
     },
     session: async () => {

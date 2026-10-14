@@ -38,6 +38,7 @@ describe("ApiClient", () => {
     ["acquire", (c: ApiClient) => c.acquire(true), "POST", "/v1/session/acquire"],
     ["pairingCodes", (c: ApiClient) => c.createPairingCode(), "POST", "/v1/pairing-codes"],
     ["devices", (c: ApiClient) => c.devices(), "GET", "/v1/devices"],
+    ["renameDevice", (c: ApiClient) => c.renameDevice("a/b", "Mac"), "PATCH", "/v1/devices/a%2Fb"],
     ["merge", (c: ApiClient) => c.merge([]), "POST", "/v1/session/merge"],
     ["snapshots", (c: ApiClient) => c.snapshots(), "GET", "/v1/snapshots"],
     ["restore", (c: ApiClient) => c.restoreSnapshot(4, 2), "POST", "/v1/snapshots/4/restore"],

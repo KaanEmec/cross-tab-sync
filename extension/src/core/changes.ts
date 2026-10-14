@@ -4,6 +4,7 @@
 // navigation never does, see activity.ts).
 
 import type { Operation } from "./client.js";
+import { diag, short } from "./diag.js";
 import { append, type Journal } from "./journal.js";
 import { removeMappings, serverUrl, setMapping, tabsForEntry, type MappedTab, type Mappings } from "./mapping.js";
 
@@ -323,6 +324,7 @@ export function recordRemoved(s: LocalState, tabId: number, windowClosing: boole
   if (ours || windowClosing || inStartupGrace(d.s.startupAt, ctx.now)) return d.done(false);
   const recent = d.s.heldCloses.filter((h) => !h.done || ctx.now - h.at < 2 * CLOSE_HOLD_MS);
   d.set("heldCloses", [...recent, { entryId: mapped.entryId, tabId, windowId, at: ctx.now }]);
+  diag(`held close created entry=${short(mapped.entryId)} tab=${tabId} win=${windowId}`);
   return d.done(false);
 }
 
@@ -353,8 +355,20 @@ export function releaseHeld(s: LocalState, aliveWindows: Set<number>, ctx: Ctx):
     const burst = held.filter((o) => o.windowId === h.windowId && Math.abs(o.at - h.at) < CLOSE_HOLD_MS);
     const windowClosing = burst.length >= BURST_REMOVALS && burst.some((o) => o.entryId !== h.entryId);
     const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== undefined;
-    if (windowGone || windowClosing || closed.has(h.entryId)) continue;
-    if (tabsForEntry(d.s.mappings, h.entryId).length > 0) continue;
+    const dropped = windowGone
+      ? "window gone"
+      : windowClosing
+        ? `burst of ${burst.length} removals`
+        : closed.has(h.entryId)
+          ? "entry already closed in this release"
+          : tabsForEntry(d.s.mappings, h.entryId).length > 0
+            ? "entry still has a local copy"
+            : null;
+    if (dropped) {
+      diag(`held close dropped entry=${short(h.entryId)} tab=${h.tabId}: ${dropped}`);
+      continue;
+    }
+    diag(`held close released entry=${short(h.entryId)} tab=${h.tabId}`);
     closed.add(h.entryId);
     d.ops.push({ opId: ctx.newId(), type: "close", entryId: h.entryId });
   }

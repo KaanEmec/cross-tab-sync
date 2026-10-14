@@ -27,7 +27,13 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
             message = request?.userInfo?["message"]
         }
 
-        os_log(.default, "Received message from browser.runtime.sendNativeMessage: %@ (profile: %@)", String(describing: message), profile?.uuidString ?? "none")
+        // Diagnostics trace from the extension (core/diag.ts): read with
+        // log show --predicate 'process == "Cross-Tab-Sync Extension"' | grep CTS-DIAG
+        if let diag = (message as? [String: Any])?["diag"] as? String {
+            os_log(.default, "CTS-DIAG: %{public}@", diag)
+        } else {
+            os_log(.default, "Received message from browser.runtime.sendNativeMessage: %@ (profile: %@)", String(describing: message), profile?.uuidString ?? "none")
+        }
 
         let response = NSExtensionItem()
         if #available(iOS 15.0, macOS 11.0, *) {

@@ -80,7 +80,12 @@ describe("devices", () => {
     const s = await revokeDevice(mac.deps, brave.id);
     expect(s.owner).toBeNull();
     expect(server.owner).toBeNull();
-    expect((await listDevices(mac.deps)).map((d) => d.name)).toEqual(["Mac Safari"]);
+    // The revoked device stays listed for 7 days, after the active ones.
+    const after = await listDevices(mac.deps);
+    expect(after.map((d) => [d.name, Boolean(d.revokedAt)])).toEqual([
+      ["Mac Safari", false],
+      ["Brave", true],
+    ]);
     await expect(brave.engine.runNow("syncNow")).rejects.toMatchObject({ code: "device_revoked" });
     const b = await brave.state();
     expect(b).toMatchObject({ token: null, errorKind: "device_revoked", lastError: "This device was revoked on the server. Pair it again." });

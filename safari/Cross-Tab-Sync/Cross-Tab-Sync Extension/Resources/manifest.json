@@ -6,7 +6,8 @@
   "permissions": [
     "tabs",
     "storage",
-    "alarms"
+    "alarms",
+    "nativeMessaging"
   ],
   "optional_host_permissions": [
     "https://*/*",

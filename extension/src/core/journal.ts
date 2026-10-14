@@ -1,3 +1,4 @@
+import { diag, short } from "./diag.js";
 import type { MergeOperation, Operation } from "./client.js";
 
 /**
@@ -39,6 +40,7 @@ export function append(
       if (meta.baseRevision !== undefined) p.baseRevision = meta.baseRevision;
       return p;
     });
+  if (added.length > 0) diag(`journal + ${added.map((p) => `${p.op.type}:${short(p.op.entryId)}`).join(" ")} (now ${journal.length + added.length})`);
   return [...journal, ...added];
 }
 

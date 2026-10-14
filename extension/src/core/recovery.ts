@@ -1,4 +1,4 @@
-// Recovery and device management (v1.0): snapshot list and restore, device list and revocation.
+// Recovery and device management (v1.0): snapshot list and restore, device list, rename and revocation.
 // Restoration is ordinary `open` operations on the server, never a rewind; it reopens URLs only.
 
 import { ApiError, type Device, type Snapshot } from "./client.js";
@@ -28,8 +28,39 @@ export function listSnapshots(deps: Deps): Promise<Snapshot[]> {
   return read(deps, (store) => apiFor(deps, store.s).snapshots());
 }
 
+/** Devices, including ones revoked in the last 7 days. Keeps this device's name and pairing time in step. */
 export function listDevices(deps: Deps): Promise<Device[]> {
-  return read(deps, (store) => apiFor(deps, store.s).devices());
+  return read(deps, async (store) => {
+    const devices = await apiFor(deps, store.s).devices();
+    const self = devices.find((d) => d.isSelf);
+    if (self && (store.s.pairedAt === null || store.s.deviceName !== self.name)) {
+      await store.set({ pairedAt: store.s.pairedAt ?? self.createdAt, deviceName: self.name });
+    }
+    return devices;
+  });
+}
+
+/** Rename this device on the server; the stored name may carry a suffix when another device uses it. */
+export async function renameDevice(deps: Deps, name: string): Promise<State> {
+  const store = await Store.open(deps);
+  requirePaired(store.s);
+  const wanted = name.trim();
+  if (!wanted) throw new Error("Device name is required");
+  if ([...wanted].length > 64) throw new Error("Device name must be at most 64 characters");
+  try {
+    const d = await apiFor(deps, store.s).renameDevice(store.s.deviceId!, wanted);
+    const owner = store.s.owner?.deviceId === d.id ? { ...store.s.owner, name: d.name } : store.s.owner;
+    await store.set({
+      deviceName: d.name,
+      owner,
+      ...succeeded(deps),
+      lastError: null,
+      statusText: d.name === wanted ? `Renamed to "${d.name}"` : `Renamed to "${d.name}" (another device is named "${wanted}")`,
+    });
+    return store.s;
+  } catch (e) {
+    return fail(store, e);
+  }
 }
 
 /** Revoke another paired device. This device is removed with Disconnect instead. */

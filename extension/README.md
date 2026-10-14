@@ -4,10 +4,10 @@ One TypeScript code base for Brave (Chromium) and Safari (macOS), Manifest V3, n
 
 | Path | Contents |
 | --- | --- |
-| `src/core/` | Browser-free logic, unit tested: eligibility, mappings, planner, journal, state, run lock, API client. `changes.ts` records local tab events, `activity.ts` decides automatic takeover, `apply.ts` applies remote operations, `sync.ts` runs owner/follower syncs, `merge.ts` submits the journal through `merge`, `handover.ts` the manual actions and pairing, `recovery.ts` snapshots and devices, `status.ts` backoff and status texts, `engine.ts` serializes events and runs. |
+| `src/core/` | Browser-free logic, unit tested: eligibility, mappings, planner, journal, state, run lock, API client. `changes.ts` records local tab events, `activity.ts` decides automatic takeover, `apply.ts` applies remote operations, `sync.ts` runs owner/follower syncs, `merge.ts` submits the journal through `merge`, `handover.ts` the manual actions and pairing, `recovery.ts` snapshots and devices (list, rename, revoke), `pairing.ts` pairing-link parsing, `devices.ts` device identity and list rows, `status.ts` backoff and status texts, `engine.ts` serializes events and runs. |
 | `src/adapter/` | `BrowserAdapter` interface, `webext.ts` over `chrome.*`, `fake.ts` in-memory for tests (emits browser events, simulates user actions). |
 | `src/background/` | MV3 service worker: wires the engine to browser events, the 5-minute alarm and popup messages. |
-| `src/popup/` | Pairing form and status page: role, owner, last sync, local changes (saved / waiting / offline), last error; **Hand over**, **Continue here**, **Sync now**, **Pause sync**; **Recover** (snapshots) and **Devices** sections. |
+| `src/popup/` | Pairing form (pairing link, device name, Advanced: server URL and code) and status page: role, owner, last sync, local changes (saved / waiting / offline), last error; **Hand over**, **Continue here**, **Sync now**, **Pause sync**; **Recover** (snapshots), **This device** (name, rename, browser, short id, server, paired since) and **Devices** sections; **Invite another browser**. |
 | `manifests/` | `base.json` plus per-browser overrides, merged at build time (`_comment*` keys are stripped). |
 | `scripts/` | `build.mjs` (esbuild), `icons.mjs` (placeholder PNGs generated at build). |
 
@@ -47,8 +47,8 @@ Build and run the app in Xcode, then in Safari: **Settings > Advanced > Show fea
 
 ## Pairing
 
-1. Create a code on the server (`cross-tab-sync pair-code`) or, on an already paired browser, open the popup and click **Create pairing code**.
-2. In the new browser's popup enter the server URL (`https://…`; `http://localhost` only for local development with `CTS_ALLOW_INSECURE=1`), a device name and the code, then **Pair**.
+1. Get a pairing link: on an already paired browser, open the popup, click **Invite another browser** and **Copy**; or on the server run `cross-tab-sync pair-code` (prints the link `https://tabs.example.com#ABCD2345` when `CTS_PUBLIC_URL` is set, else the bare code).
+2. In the new browser's popup paste the link, check the device name (prefilled `<Browser> on <OS>`), then **Pair**. A bare code works when the browser already knows the server (from an earlier pairing) or with the server URL under **Advanced** (`https://…`; `http://localhost` / `127.0.0.1` only for local development with `CTS_ALLOW_INSECURE=1`). A name another active device already uses gets a number (`Brave on macOS 2`).
 3. The browser asks for permission to access the server origin. The extension has no install-time host access; it requests only the server's origin from `optional_host_permissions`. If the prompt closes the popup, pairing still completes in the background (the form is saved first and the worker finishes on `permissions.onAdded`); reopen the popup to see the result.
 
 ## Using it (automatic sync, v1.0 offline work)
@@ -63,7 +63,8 @@ One browser is the **owner** and publishes changes; the others are **followers**
 - **Status.** The popup shows **Saved to server**, **N changes waiting (offline, retrying at HH:MM)** or **Paused**. The server accepting a change does not mean the other browsers applied it yet; they do on their next sync. Errors say what to do: pair again (`unauthorized`, revoked device), grant access to the server origin (missing site permission; **Grant access** button), or wait for the retry (unreachable server, 5xx).
 - **Pause sync** stops all runs and automatic takeover on this browser; local changes are still journaled. **Resume sync** first releases held closes (dropped when their window is gone, so nothing missing becomes a deletion), then runs.
 - **Recover** lists the server's snapshots (time, device, tab count). **Restore** (click twice) takes over if needed, reopens the snapshot's URLs as new shared tabs (nothing is closed or rewound) and opens them here in the background. URLs only: unsaved form input and page state cannot be recovered.
-- **Devices** lists paired devices; **Revoke** (click twice) removes another one. Use **Disconnect** for this browser.
+- **This device** shows the name (**Rename**), browser, short id (first 8 characters of the device id; **Copy** copies the full id), server URL and when it was paired. The owner line shows `Name (shortid)`.
+- **Devices** lists paired devices with short id and last seen, this device marked; **Revoke** (click twice) removes another one. Devices revoked in the last 7 days stay listed, greyed. Use **Disconnect** for this browser; pairing again gives it a new identity.
 - **Hand over** publishes, releases ownership and pauses automatic takeover on this browser until the next fresh interaction. **Continue here** takes ownership immediately. **Disconnect** releases ownership, revokes this device on the server and forgets the credentials; tabs stay open.
 
 ## Behavior notes and limits

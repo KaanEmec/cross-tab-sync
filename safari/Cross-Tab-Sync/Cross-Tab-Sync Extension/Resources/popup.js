@@ -8,6 +8,20 @@
   };
 
   // src/core/client.ts
+  function normalizeServerUrl(input) {
+    let url;
+    try {
+      url = new URL(input.trim());
+    } catch {
+      throw new Error("Server URL is not a valid URL");
+    }
+    const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+      throw new Error("Server URL must use https:// (http:// only for localhost)");
+    }
+    if (url.search || url.hash) throw new Error("Server URL must not contain a query or fragment");
+    return (url.origin + url.pathname).replace(/\/+$/, "");
+  }
   function originPattern(serverUrl2) {
     try {
       const u = new URL(serverUrl2.trim());
@@ -15,6 +29,77 @@
     } catch {
       return null;
     }
+  }
+
+  // src/core/pairing.ts
+  var CODE_LENGTH = 8;
+  var EXAMPLE = "https://tabs.example.com#ABCD2345";
+  function normalizeCode(input) {
+    return input.toUpperCase().replace(/[\s-]+/g, "");
+  }
+  function checkCode(raw) {
+    const code = normalizeCode(raw);
+    if (!new RegExp(`^[A-Z0-9]{${CODE_LENGTH}}$`).test(code)) {
+      throw new Error(`A pairing code has ${CODE_LENGTH} letters and digits, e.g. ABCD2345`);
+    }
+    return code;
+  }
+  function parsePairingInput(input, knownServerUrl = "") {
+    const text = input.trim();
+    if (!text) throw new Error(`Paste the pairing link, e.g. ${EXAMPLE}`);
+    if (/^[A-Za-z0-9\s-]+$/.test(text)) {
+      const code = checkCode(text);
+      if (!knownServerUrl.trim()) {
+        throw new Error(`Paste the whole pairing link (server address and code, e.g. ${EXAMPLE}) or enter the server URL under Advanced`);
+      }
+      return { serverUrl: normalizeServerUrl(knownServerUrl), code };
+    }
+    const hash = text.indexOf("#");
+    const fragment = hash < 0 ? "" : text.slice(hash + 1);
+    if (!fragment.trim()) throw new Error(`This link has no pairing code. A pairing link ends with #CODE, e.g. ${EXAMPLE}`);
+    let base = hash < 0 ? text : text.slice(0, hash);
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(base.trim())) base = `https://${base.trim()}`;
+    return { serverUrl: normalizeServerUrl(base), code: checkCode(fragment) };
+  }
+  function resolvePairingForm(form, knownServerUrl = "") {
+    return parsePairingInput(form.link.trim() ? form.link : form.code, form.serverUrl.trim() || knownServerUrl);
+  }
+  function browserLabel(browser) {
+    if (browser === "safari") return "Safari";
+    if (browser === "brave") return "Brave";
+    return browser ? browser[0].toUpperCase() + browser.slice(1) : "Browser";
+  }
+
+  // src/core/devices.ts
+  function shortId(id) {
+    return id.slice(0, 8);
+  }
+  function relativeTime(iso, now) {
+    if (!iso) return "never";
+    const secs = Math.round((now - Date.parse(iso)) / 1e3);
+    if (secs < 45) return "just now";
+    if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
+    if (secs < 86400) return `${Math.round(secs / 3600)} h ago`;
+    return new Date(iso).toLocaleString();
+  }
+  function ownerLine(owner, selfId) {
+    if (!owner) return "No owner";
+    const label = `${owner.name} (${shortId(owner.deviceId)})`;
+    return owner.deviceId === selfId ? `${label}, this device` : label;
+  }
+  function deviceRows(devices, now) {
+    return devices.map((d) => {
+      const revoked = Boolean(d.revokedAt);
+      const seen = revoked ? `revoked ${relativeTime(d.revokedAt, now)}` : `last seen ${relativeTime(d.lastSeenAt, now)}`;
+      return {
+        id: d.id,
+        title: d.isSelf ? `${d.name} (this device)` : d.name,
+        detail: `${browserLabel(d.browser)} \xB7 ${shortId(d.id)} \xB7 ${seen}`,
+        isSelf: d.isSelf,
+        revoked,
+        canRevoke: !d.isSelf && !revoked
+      };
+    });
   }
 
   // src/core/mapping.ts
@@ -30,6 +115,7 @@
       deviceName: "",
       deviceId: null,
       token: null,
+      pairedAt: null,
       lastRevision: 0,
       generation: null,
       owner: null,
@@ -58,7 +144,8 @@
       nextRetryAt: null,
       retryAttempts: 0,
       paused: false,
-      minRevision: null
+      minRevision: null,
+      diagnostics: null
     };
   }
   var PREFIX = "cts.";
@@ -75,6 +162,10 @@
 
   // src/core/status.ts
   var RETRY_MAX_MS = 5 * 6e4;
+  function clock(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  }
   var APPLIED_ELSEWHERE_NOTE = "Applied on other devices: unknown. The server confirms receipt, not that other browsers opened the tabs.";
   var RESTORE_NOTE = "Restore reopens the saved URLs as shared tabs. Unsaved form input and page state cannot be recovered.";
 
@@ -84,11 +175,17 @@
   var mainView = $("main-view");
   var errorEl = $("error");
   var badge = $("badge");
+  var pairLink = $("pair-link");
+  var pairTarget = $("pair-target");
+  var pairHint = pairTarget.innerHTML;
   var serverUrl = $("server-url");
   var deviceName = $("device-name");
   var pairCode = $("pair-code");
   var recover = $("recover-section");
+  var deviceSection = $("device-section");
   var devicesSection = $("devices-section");
+  var renameForm = $("rename-form");
+  var renameInput = $("rename-input");
   var buttons = () => Array.from(document.querySelectorAll("button"));
   var busy = false;
   var reachable;
@@ -102,14 +199,7 @@
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   }
-  function relative(iso) {
-    if (!iso) return "never";
-    const secs = Math.round((Date.now() - Date.parse(iso)) / 1e3);
-    if (secs < 45) return "just now";
-    if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
-    if (secs < 86400) return `${Math.round(secs / 3600)} h ago`;
-    return new Date(iso).toLocaleString();
-  }
+  var relative = (iso) => relativeTime(iso, Date.now());
   var ACTIVITY_WORDS = { activated: "tab switch", focus: "window focus", created: "new tab" };
   function lastActivity(s) {
     if (s.lastActivityAt === null) return "";
@@ -136,16 +226,15 @@
     badge.textContent = s.paused ? "Paused" : offline ? "Offline" : s.isOwner ? "Owner" : "Follower";
     badge.classList.toggle("owner", s.isOwner && !offline && !s.paused);
     $("role").textContent = s.isOwner ? "Owner (publishes changes)" : "Follower (applies changes)";
-    const o = s.owner;
-    $("owner").textContent = !o ? "No owner" : o.deviceId === s.deviceId ? `This device (gen. ${o.generation})` : `${o.name} (gen. ${o.generation})`;
+    $("owner").textContent = ownerLine(s.owner, s.deviceId);
+    $("owner").title = s.owner ? `Generation ${s.owner.generation}` : "";
     $("last-sync").textContent = relative(s.lastSuccessAt);
     $("last-sync").title = `Revision ${s.lastRevision}` + (s.minRevision !== null ? `; server history from revision ${s.minRevision}` : "");
     $("sync-state").textContent = s.summary;
     $("status-text").textContent = s.running ? "Working\u2026" : s.statusText ?? "";
     $("last-activity").textContent = lastActivity(s);
     $("last-activity").hidden = s.lastActivityAt === null;
-    $("identity").textContent = `${s.deviceName} \xB7 ${hostOf(s.serverUrl)}`;
-    $("identity").title = s.serverUrl;
+    renderIdentity(s);
     const handOver = $("hand-over");
     const continueHere = $("continue-here");
     const syncNow = $("sync-now");
@@ -162,12 +251,33 @@
     $("grant").hidden = s.errorKind !== "permission";
     showError(s.lastError);
   }
-  function hostOf(url) {
-    try {
-      return new URL(url).host;
-    } catch {
-      return url;
-    }
+  function renderIdentity(s) {
+    const id = s.deviceId ?? "";
+    $("self-summary").textContent = `\xB7 ${s.deviceName} (${shortId(id)})`;
+    $("self-name").textContent = s.deviceName;
+    $("self-browser").textContent = browserLabel("safari");
+    $("self-id").textContent = shortId(id);
+    $("self-id").title = id;
+    $("self-server").textContent = s.serverUrl;
+    $("self-since").textContent = s.pairedAt ? new Date(s.pairedAt).toLocaleString() : "unknown";
+  }
+  function copyText(text, source, btn) {
+    const label = btn.textContent;
+    const flash = (msg) => {
+      btn.textContent = msg;
+      setTimeout(() => btn.textContent = label, 2e3);
+    };
+    const select = () => {
+      if (source instanceof HTMLInputElement) {
+        source.focus();
+        source.select();
+      } else {
+        window.getSelection()?.selectAllChildren(source);
+      }
+      flash(navigator.userAgent.includes("Mac") ? "Press \u2318C" : "Press Ctrl+C");
+    };
+    if (!navigator.clipboard?.writeText) return select();
+    navigator.clipboard.writeText(text).then(() => flash("Copied"), select);
   }
   function setBusy(value) {
     busy = value;
@@ -214,8 +324,9 @@
       return false;
     }
   }
-  function item(text, detail, button2) {
+  function item(text, detail, button2, className = "") {
     const li = document.createElement("li");
+    if (className) li.className = className;
     const span = document.createElement("span");
     span.textContent = text;
     const small = document.createElement("small");
@@ -264,19 +375,40 @@
   async function loadDevices() {
     const res = await send({ type: "listDevices" });
     if (!res.ok) return showError(res.error);
-    const rows = (res.devices ?? []).map((d) => {
-      const action = d.isSelf ? void 0 : button("Revoke", "Confirm revoke", () => void revoke(d.id), true);
-      return item(d.isSelf ? `${d.name} (this device)` : d.name, `${d.browser}, last seen ${relative(d.lastSeenAt)}`, action);
+    const rows = deviceRows(res.devices ?? [], Date.now()).map((d) => {
+      const action = d.canRevoke ? button("Revoke", "Confirm revoke", () => void revoke(d.id), true) : void 0;
+      return item(d.title, d.detail, action, d.revoked ? "revoked" : "");
     });
     fill($("devices"), rows, "No devices");
   }
+  function pairingTarget() {
+    return resolvePairingForm({ link: pairLink.value, serverUrl: serverUrl.value, code: pairCode.value }, last?.serverUrl ?? "");
+  }
+  pairLink.addEventListener("input", () => {
+    let host = "";
+    try {
+      host = new URL(pairingTarget().serverUrl).host;
+    } catch {
+    }
+    if (host) pairTarget.textContent = `Pairs with ${host}.`;
+    else pairTarget.innerHTML = pairHint;
+  });
   pairView.addEventListener("submit", (ev) => {
     ev.preventDefault();
+    let target;
+    try {
+      target = pairingTarget();
+    } catch (e) {
+      showError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    if (!deviceName.value.trim()) return showError("Enter a device name");
+    showError(null);
     const saved = saveState(storageLocal, {
-      pendingPair: { serverUrl: serverUrl.value, deviceName: deviceName.value, code: pairCode.value, createdAt: Date.now() },
+      pendingPair: { serverUrl: target.serverUrl, deviceName: deviceName.value, code: target.code, createdAt: Date.now() },
       lastError: null
     });
-    const granted = requestOrigin(serverUrl.value);
+    const granted = requestOrigin(target.serverUrl);
     void Promise.all([saved, granted]).then(async ([, ok]) => {
       if (!ok) {
         await saveState(storageLocal, { pendingPair: null });
@@ -284,7 +416,7 @@
         return;
       }
       const res = await run({ type: "pair" });
-      if (res.ok) pairCode.value = "";
+      if (res.ok) pairLink.value = pairCode.value = "";
     });
   });
   $("hand-over").addEventListener("click", () => void run({ type: "handOver" }));
@@ -298,21 +430,44 @@
   });
   recover.addEventListener("toggle", () => void (recover.open && loadSnapshots()));
   devicesSection.addEventListener("toggle", () => void (devicesSection.open && loadDevices()));
-  $("create-code").addEventListener("click", async () => {
-    const res = await run({ type: "createPairingCode" });
-    const el = $("pairing-code");
-    if (res.ok && res.pairingCode) {
-      const expires = new Date(res.pairingCode.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      el.textContent = res.pairingCode.code;
-      const small = document.createElement("small");
-      small.textContent = `Enter on the other device. Valid until ${expires}, single use.`;
-      el.append(small);
-      el.hidden = false;
+  deviceSection.addEventListener("toggle", () => void (deviceSection.open && last?.paired && !last.pairedAt && send({ type: "listDevices" })));
+  $("copy-id").addEventListener("click", (ev) => copyText(last?.deviceId ?? "", $("self-id"), ev.currentTarget));
+  function showRename(open) {
+    renameForm.hidden = !open;
+    $("rename").hidden = open;
+    if (open) {
+      renameInput.value = last?.deviceName ?? "";
+      renameInput.focus();
+      renameInput.select();
     }
+  }
+  $("rename").addEventListener("click", () => showRename(true));
+  $("rename-cancel").addEventListener("click", () => showRename(false));
+  renameForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const name = renameInput.value.trim();
+    if (!name) return showError("Enter a device name");
+    void run({ type: "renameDevice", name }).then(async (res) => {
+      if (!res.ok) return;
+      showRename(false);
+      if (devicesSection.open) await loadDevices();
+    });
   });
+  var inviteLink = $("invite-link");
+  $("invite").addEventListener("click", async () => {
+    const res = await run({ type: "createPairingCode" });
+    if (!res.ok || !res.pairingCode) return;
+    const { link, expiresAt } = res.pairingCode;
+    const expires = clock(Date.parse(expiresAt));
+    inviteLink.value = link;
+    $("invite-note").textContent = `Valid until ${expires}, single use. In the other browser, open Cross-Tab-Sync and paste this link.`;
+    $("invite-box").hidden = false;
+    $("invite").textContent = "New invitation link";
+  });
+  $("copy-link").addEventListener("click", (ev) => copyText(inviteLink.value, inviteLink, ev.currentTarget));
   var disconnect = $("disconnect");
-  disconnect.title = "Your tabs stay open";
-  confirmTwice(disconnect, "Click again to disconnect", () => void run({ type: "disconnect" }));
+  disconnect.title = "Releases ownership and revokes this device on the server. Your tabs stay open.";
+  confirmTwice(disconnect, "Click again to disconnect. Pairing again gives this browser a new identity.", () => void run({ type: "disconnect" }));
   chrome.storage.onChanged.addListener((_changes, area) => {
     if (area !== "local" || busy) return;
     void send({ type: "getStatus" }).then((res) => res.status && render(res.status));

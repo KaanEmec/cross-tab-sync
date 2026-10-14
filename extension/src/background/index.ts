@@ -3,11 +3,13 @@
 
 import { createWebExtAdapter } from "../adapter/webext.js";
 import { ApiClient } from "../core/client.js";
+import { diag, refreshDiagnostics } from "../core/diag.js";
 import { SyncEngine } from "../core/engine.js";
 import { createPairingCode, disconnect, pairFromPending, refreshOwner, type Deps } from "../core/handover.js";
 import type { Device, Snapshot } from "../core/client.js";
 import { statusView, type Request, type Response } from "../core/messages.js";
-import { listDevices, listSnapshots, revokeDevice } from "../core/recovery.js";
+import { defaultDeviceName } from "../core/pairing.js";
+import { listDevices, listSnapshots, renameDevice, revokeDevice } from "../core/recovery.js";
 import { isPaired, loadState, saveState } from "../core/state.js";
 
 /** The 5-minute cycle (named "heartbeat" since v0.1 so existing alarms keep working). */
@@ -25,6 +27,11 @@ const deps: Deps = {
 // worker keeps state between events.
 const engine = new SyncEngine(deps);
 
+// Diagnostics trace (core/diag.ts): on for a loopback server unless toggled in state.
+void refreshDiagnostics(adapter.storage)
+  .then(() => diag(`worker start (${__BROWSER__})`))
+  .catch(() => undefined);
+
 /** Pairing can be triggered twice (popup message and permissions.onAdded); the later one finds nothing. */
 async function pairQueued(): Promise<void> {
   const result = await engine.locked("pair", () => pairFromPending(deps));
@@ -40,10 +47,8 @@ async function pairQueued(): Promise<void> {
 async function setup(): Promise<void> {
   const state = await loadState(adapter.storage);
   if (!state.deviceName) {
-    const os = await chrome.runtime.getPlatformInfo().then((p) => p.os).catch(() => "");
-    const osName = os === "mac" ? "macOS" : os === "win" ? "Windows" : os === "linux" ? "Linux" : "";
-    const browserName = __BROWSER__ === "safari" ? "Safari" : "Brave";
-    await saveState(adapter.storage, { deviceName: osName ? `${browserName} on ${osName}` : browserName });
+    const os = await chrome.runtime.getPlatformInfo().then((p) => p.os as string).catch(() => "");
+    await saveState(adapter.storage, { deviceName: defaultDeviceName(__BROWSER__, os) });
   }
   await adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
 }
@@ -57,6 +62,7 @@ void adapter.ensureAlarm(SYNC_ALARM, SYNC_MINUTES);
 void engine.enqueue(() => saveState(adapter.storage, { runLock: null })).then(() => engine.resume());
 
 chrome.runtime.onInstalled.addListener((details) => {
+  diag(`onInstalled ${details.reason}`);
   void setup();
   // Same reset as a new browser session: an update may leave state from another code version.
   if (details.reason === "update") void engine.startup("update").catch(() => undefined);
@@ -80,7 +86,7 @@ chrome.permissions?.onAdded?.addListener((perms) => {
 });
 
 async function handle(req: Request): Promise<Response> {
-  let pairingCode: { code: string; expiresAt: string } | undefined;
+  let pairingCode: { code: string; expiresAt: string; link: string } | undefined;
   let reachable: boolean | undefined;
   let snapshots: Snapshot[] | undefined;
   let devices: Device[] | undefined;
@@ -114,6 +120,9 @@ async function handle(req: Request): Promise<Response> {
       break;
     case "listDevices":
       devices = await listDevices(deps);
+      break;
+    case "renameDevice":
+      await engine.enqueue(() => renameDevice(deps, req.name));
       break;
     case "revokeDevice":
       await engine.enqueue(() => revokeDevice(deps, req.id));

@@ -5,6 +5,7 @@
 
 import type { TabInfo } from "../adapter/types.js";
 import { onActivity, onDemoted, type ActivityKind } from "./activity.js";
+import { diag, errText, refreshDiagnostics } from "./diag.js";
 import {
   CLOSE_HOLD_MS,
   recordCreated,
@@ -55,7 +56,10 @@ const timeoutScheduler: Scheduler = (fn, ms) => {
   return () => clearTimeout(h);
 };
 
-const ignore = () => undefined;
+/** Swallow an error the caller cannot act on; traced when diagnostics are on. */
+const ignore = (e?: unknown) => {
+  if (e !== undefined) diag(`caught ${errText(e)}`);
+};
 
 /** A URL the page committed: load complete, or a URL change on an already loaded page (in-page navigation). */
 export function isCommitted(tab: TabInfo, change: { url?: string; status?: string }): boolean {
@@ -64,6 +68,15 @@ export function isCommitted(tab: TabInfo, change: { url?: string; status?: strin
 
 function outcome(o: Outcome, kind?: ActivityKind): Step {
   return { patch: o.patch, ops: o.ops.length, activity: o.activity, kind };
+}
+
+/** Takeover decision for the diagnostics trace. */
+function activityText(s: State, isOwner: boolean, d: ReturnType<typeof onActivity> | null): string {
+  if (!d) return "paused";
+  if (!d.counted) return "not counted (startup)";
+  if (d.takeover) return "fresh, takeover";
+  if (!d.fresh) return s.suppressAutoTakeover && !isOwner ? "not fresh (suppressed after hand over)" : "not fresh";
+  return isOwner ? "fresh, owner" : "fresh, takeover rate-limited (pending)";
 }
 
 interface Step {
@@ -101,18 +114,28 @@ export class SyncEngine {
   /** Subscribe to tab and window events. In a service worker, call synchronously at top level. */
   attach(): void {
     const a = this.deps.adapter;
-    a.onTabCreated((tab) => this.event(async (s, ctx) => outcome(recordCreated(s, await this.toEvent(tab), ctx), "created")));
+    a.onTabCreated((tab) =>
+      this.event(`created tab=${tab.id} win=${tab.windowId}`, async (s, ctx) =>
+        outcome(recordCreated(s, await this.toEvent(tab), ctx), "created"),
+      ),
+    );
     a.onTabUpdated((tab, change) => {
       if (!isCommitted(tab, change)) return;
-      this.event(async (s, ctx) => outcome(recordUpdated(s, await this.toEvent(tab), ctx)));
+      this.event(`updated tab=${tab.id} win=${tab.windowId} status=${change.status ?? "-"}`, async (s, ctx) =>
+        outcome(recordUpdated(s, await this.toEvent(tab), ctx)),
+      );
     });
     a.onTabRemoved((tabId, windowClosing, windowId) =>
-      this.event(async (s, ctx) => outcome(recordRemoved(s, tabId, windowClosing, windowId, ctx))),
+      this.event(`removed tab=${tabId} win=${windowId} windowClosing=${windowClosing}`, async (s, ctx) =>
+        outcome(recordRemoved(s, tabId, windowClosing, windowId, ctx)),
+      ),
     );
-    a.onWindowRemoved((windowId) => this.event(async (s, ctx) => outcome(recordWindowRemoved(s, windowId, ctx))));
+    a.onWindowRemoved((windowId) =>
+      this.event(`windowRemoved win=${windowId}`, async (s, ctx) => outcome(recordWindowRemoved(s, windowId, ctx))),
+    );
     // A tab the extension just created can become active in its own new window: not the user.
-    a.onTabActivated((tabId) =>
-      this.event(async (s, ctx) => ({
+    a.onTabActivated((tabId, windowId) =>
+      this.event(`activated tab=${tabId} win=${windowId}`, async (s, ctx) => ({
         patch: {},
         ops: 0,
         activity: !s.expected.some((e) => e.kind === "load" && e.created && e.tabId === tabId && e.until > ctx.now),
@@ -120,9 +143,12 @@ export class SyncEngine {
       })),
     );
     a.onWindowFocusChanged((windowId) => {
-      if (windowId !== null) this.event((s) => this.focused(s, windowId));
+      if (windowId !== null) this.event(`focus win=${windowId}`, (s) => this.focused(s, windowId));
     });
-    a.onStartup(() => void this.startup().catch(ignore));
+    a.onStartup(() => {
+      diag("onStartup");
+      void this.startup().catch(ignore);
+    });
   }
 
   /** True while anything is queued or running. */
@@ -130,10 +156,19 @@ export class SyncEngine {
     return this.depth > 0;
   }
 
-  /** Run `fn` after everything queued before it. */
-  enqueue<T>(fn: () => Promise<T>): Promise<T> {
+  /** Run `fn` after everything queued before it. `label` names the task in the diagnostics trace. */
+  enqueue<T>(fn: () => Promise<T>, label = "task"): Promise<T> {
     this.depth++;
-    const run = this.chain.then(fn);
+    const run = this.chain.then(async () => {
+      await refreshDiagnostics(this.deps.adapter.storage).catch(() => undefined);
+      const started = Date.now();
+      diag(`task ${label} start`);
+      try {
+        return await fn();
+      } finally {
+        diag(`task ${label} end ${Date.now() - started}ms`);
+      }
+    });
     const done = () => {
       this.depth--;
     };
@@ -155,10 +190,13 @@ export class SyncEngine {
       await this.ensureSession();
       try {
         return await withRunLock(this.deps.adapter.storage, action, fn, () => nowMs(this.deps));
+      } catch (e) {
+        diag(`${action} failed: ${errText(e)}`);
+        throw e;
       } finally {
         await this.scheduleRetry().catch(ignore);
       }
-    });
+    }, action);
   }
 
   /**
@@ -173,15 +211,16 @@ export class SyncEngine {
   private async ensureSession(force: boolean | "always" = false): Promise<void> {
     const marker = this.deps.adapter.sessionStorage;
     if (!marker) {
-      if (force) await this.reset();
+      if (force) await this.reset(force === "always" ? "update" : "onStartup (no session storage)");
       return;
     }
     if (force !== "always" && (await marker.get([SESSION_MARKER]))[SESSION_MARKER] !== undefined) return;
-    await this.reset();
+    await this.reset(force === "always" ? "update" : "session marker missing");
     await marker.set({ [SESSION_MARKER]: nowMs(this.deps) });
   }
 
-  private async reset(): Promise<void> {
+  private async reset(reason: string): Promise<void> {
+    diag(`startup reset: ${reason}`);
     await resetForBrowserStartup(this.deps);
     await rematchTabs(this.deps);
     for (const ms of REMATCH_DELAYS_MS) {
@@ -189,7 +228,7 @@ export class SyncEngine {
         void this.enqueue(async () => {
           await this.ensureSession();
           await rematchTabs(this.deps);
-        }).catch(ignore);
+        }, `rematch +${ms}ms`).catch(ignore);
       }, ms);
     }
   }
@@ -206,12 +245,19 @@ export class SyncEngine {
     return this.locked(action, async () => {
       const s = await loadState(this.deps.adapter.storage);
       if (s.paused) {
+        diag(`run ${action} skipped: paused`);
         if (action === "syncNow") throw new Error(PAUSED_MESSAGE);
         return s;
       }
-      if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) return s;
+      if (BACKED_OFF.has(action) && s.nextRetryAt !== null && s.nextRetryAt > nowMs(this.deps)) {
+        diag(`run ${action} skipped: backing off`);
+        return s;
+      }
+      diag(`run ${action} start as ${s.generation !== null ? "owner" : "follower"} pending=${s.pending.length}`);
       try {
-        return await syncRun(this.deps);
+        const out = await syncRun(this.deps);
+        diag(`run ${action} end: ${out.statusText ?? "-"}; error: ${out.lastError ?? "none"}`);
+        return out;
       } finally {
         if (s.generation !== null) await this.afterDemotion().catch(ignore);
       }
@@ -224,6 +270,7 @@ export class SyncEngine {
     const s = await loadState(storage);
     if (!isPaired(s) || s.paused || s.generation !== null) return;
     const d = onDemoted(s, nowMs(this.deps));
+    diag(`demoted: ${d.takeover ? "taking over" : d.patch.freshPending ? "takeover rate-limited, pending" : "no recent activity, following"}`);
     await saveState(storage, d.patch);
     // Queued behind this run, so it starts once the run lock is released.
     if (d.takeover) void this.takeover().catch(ignore);
@@ -245,6 +292,7 @@ export class SyncEngine {
   takeover(action = "takeover"): Promise<State> {
     return this.locked(action, async () => {
       const s = await loadState(this.deps.adapter.storage);
+      diag(`${action}${s.paused ? " skipped: paused" : ""}`);
       if (s.paused) {
         if (action === "takeover") return s;
         throw new Error(PAUSED_MESSAGE);
@@ -283,7 +331,7 @@ export class SyncEngine {
       const storage = this.deps.adapter.storage;
       await saveState(storage, { paused: true, statusText: "Paused. Local changes are kept and sent when you resume." });
       return loadState(storage);
-    });
+    }, "pause");
   }
 
   /**
@@ -291,8 +339,8 @@ export class SyncEngine {
    * tab that is merely absent is only unmapped by the run), then run in the current role.
    */
   async unpause(): Promise<State> {
-    await this.enqueue(() => saveState(this.deps.adapter.storage, { paused: false, statusText: null }));
-    await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)));
+    await this.enqueue(() => saveState(this.deps.adapter.storage, { paused: false, statusText: null }), "resume sync");
+    await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)), "release held closes");
     return this.runNow("resume");
   }
 
@@ -302,7 +350,7 @@ export class SyncEngine {
    * (`update`): the same reset always (the tabs are already loaded and send no restore events).
    */
   async startup(reason: "browser" | "update" = "browser"): Promise<void> {
-    await this.enqueue(() => this.ensureSession(reason === "update" ? "always" : true));
+    await this.enqueue(() => this.ensureSession(reason === "update" ? "always" : true), `startup ${reason}`);
     this.requestSync();
   }
 
@@ -311,7 +359,7 @@ export class SyncEngine {
     const s = await this.enqueue(async () => {
       await this.ensureSession();
       return loadState(this.deps.adapter.storage);
-    });
+    }, "worker resume");
     if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease(); // journaling continues while paused
     if (s.paused) return;
     if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
@@ -340,7 +388,7 @@ export class SyncEngine {
     if (this.cancelRelease) return;
     this.cancelRelease = this.schedule(() => {
       this.cancelRelease = null;
-      this.event((s, ctx) => this.release(s, ctx));
+      this.event("release held closes", (s, ctx) => this.release(s, ctx));
     }, CLOSE_HOLD_MS);
   }
 
@@ -351,8 +399,9 @@ export class SyncEngine {
     return outcome(out);
   }
 
-  private event(step: (s: State, ctx: Ctx) => Promise<Step>): void {
-    void this.enqueue(() => this.process(step)).catch(ignore);
+  private event(label: string, step: (s: State, ctx: Ctx) => Promise<Step>): void {
+    diag(`event ${label}`);
+    void this.enqueue(() => this.process(step), label).catch(ignore);
   }
 
   /** Load state, apply one event, write all changed fields at once, then schedule follow-ups. */
@@ -366,6 +415,7 @@ export class SyncEngine {
     const isOwner = s.generation !== null;
     // Paused: journal only; activity neither takes over nor triggers a run.
     const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner, kind: out.kind }) : null;
+    if (out.activity) diag(`activity ${out.kind ?? "-"}: ${activityText(s, isOwner, decision)}`);
     await saveState(storage, { ...out.patch, ...decision?.patch });
     if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
     if (s.paused) return;
@@ -376,6 +426,7 @@ export class SyncEngine {
     // follows (afterDemotion).
     else if (isOwner && (decision?.fresh || (decision?.counted && now - this.lastVerifyAt >= VERIFY_INTERVAL_MS))) {
       this.lastVerifyAt = now;
+      diag(`verify ownership (${decision?.fresh ? "fresh interaction" : "activity"})`);
       void this.runNow("verify").catch(ignore);
     } else if (isOwner && out.ops > 0) this.requestSync();
   }

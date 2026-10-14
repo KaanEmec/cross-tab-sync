@@ -91,6 +91,15 @@ export interface Device {
   createdAt: string;
   lastSeenAt: string;
   isSelf: boolean;
+  /** Set for devices revoked within the last 7 days (still listed, greyed out). */
+  revokedAt?: string;
+}
+
+/** `POST /v1/pairing-codes`. `link` is the server URL with the code as fragment (absent on older servers). */
+export interface PairingCode {
+  code: string;
+  expiresAt: string;
+  link?: string;
 }
 
 /** Error codes from PROTOCOL.md plus `network_error` (no HTTP response) and `http_<status>`. */
@@ -98,6 +107,7 @@ export type ErrorCode =
   | "invalid_request"
   | "invalid_code"
   | "unauthorized"
+  | "forbidden"
   | "device_revoked"
   | "not_found"
   | "owner_active"
@@ -180,12 +190,18 @@ export class ApiClient {
     this.timeoutMs = opts.timeoutMs ?? 15_000;
   }
 
-  pair(body: { code: string; name: string; browser: BrowserKind }): Promise<{ deviceId: string; token: string }> {
+  /** `name` in the response is the stored name, suffixed when another device uses it (absent on older servers). */
+  pair(body: { code: string; name: string; browser: BrowserKind }): Promise<{ deviceId: string; token: string; name?: string }> {
     return this.request("POST", "/v1/pair", body, false);
   }
 
-  createPairingCode(): Promise<{ code: string; expiresAt: string }> {
+  createPairingCode(): Promise<PairingCode> {
     return this.request("POST", "/v1/pairing-codes");
+  }
+
+  /** Rename this device (self only); the response carries the stored, possibly suffixed, name. */
+  renameDevice(id: string, name: string): Promise<Device> {
+    return this.request("PATCH", `/v1/devices/${encodeURIComponent(id)}`, { name });
   }
 
   async devices(): Promise<Device[]> {

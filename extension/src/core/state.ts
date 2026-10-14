@@ -11,6 +11,8 @@ export interface State {
   deviceName: string;
   deviceId: string | null;
   token: string | null;
+  /** ISO time this device paired (backfilled from the device list for devices paired before it was kept). */
+  pairedAt: string | null;
   /** Last session revision this device applied. */
   lastRevision: number;
   /** Ownership generation while this device is the owner, otherwise null. */
@@ -81,6 +83,8 @@ export interface State {
   paused: boolean;
   /** Oldest revision the server still has history for (from `GET session` / `changes`). */
   minRevision: number | null;
+  /** Diagnostics trace (core/diag.ts); null: on only when `serverUrl` is a loopback address. */
+  diagnostics: boolean | null;
 }
 
 /** Error classes the popup explains with an action (see status.ts). */
@@ -102,6 +106,7 @@ export function defaultState(): State {
     deviceName: "",
     deviceId: null,
     token: null,
+    pairedAt: null,
     lastRevision: 0,
     generation: null,
     owner: null,
@@ -131,6 +136,7 @@ export function defaultState(): State {
     retryAttempts: 0,
     paused: false,
     minRevision: null,
+    diagnostics: null,
   };
 }
 
@@ -165,6 +171,7 @@ export function clearedCredentials(): Partial<State> {
   return {
     deviceId: null,
     token: null,
+    pairedAt: null,
     lastRevision: 0,
     generation: null,
     owner: null,

@@ -11,7 +11,8 @@ describe.each(["brave", "safari"])("dist/%s/manifest.json", (target) => {
     const m = JSON.parse(readFileSync(file, "utf8"));
     expect(m.manifest_version).toBe(3);
     expect(m.background).toEqual({ service_worker: "background.js" });
-    expect(m.permissions).toEqual(["tabs", "storage", "alarms"]);
+    // Safari only: nativeMessaging carries the diagnostics trace to the app extension.
+    expect(m.permissions).toEqual(target === "safari" ? ["tabs", "storage", "alarms", "nativeMessaging"] : ["tabs", "storage", "alarms"]);
     expect(m.host_permissions).toBeUndefined();
     expect(m.optional_host_permissions).toContain("https://*/*");
     expect(JSON.stringify(m)).not.toContain("_comment");

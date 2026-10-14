@@ -6,6 +6,7 @@ import { applyRemote, captureTabs, currentMappings } from "./apply.js";
 import { materialize } from "./materialize.js";
 import { ApiError, normalizeServerUrl, type Owner } from "./client.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
+import { pairingLink } from "./pairing.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
 import { apiFor, fail, nowIso, nowMs, ownerLabel, requirePaired, Store, succeeded, type Deps } from "./store.js";
 import { submitJournal } from "./merge.js";
@@ -117,16 +118,20 @@ export async function pair(
     if (deviceName.length > 64) throw new Error("Device name must be at most 64 characters");
     if (!code) throw new Error("Pairing code is required");
     const res = await deps.api({ baseUrl: serverUrl, token: null }).pair({ code, name: deviceName, browser: deps.browser });
+    // The server suffixes the name when another active device uses it ("Brave on macOS 2").
+    const name = res.name ?? deviceName;
+    const renamed = name !== deviceName ? ` as "${name}" (another device is named "${deviceName}")` : "";
     await store.set({
       ...clearedCredentials(),
       serverUrl,
-      deviceName,
+      deviceName: name,
       deviceId: res.deviceId,
       token: res.token,
+      pairedAt: nowIso(deps),
       mappings: emptyMappings(),
       ...succeeded(deps),
       lastError: null,
-      statusText: "Paired. This browser follows the shared tabs and takes over when you use it.",
+      statusText: `Paired${renamed}. This browser follows the shared tabs and takes over when you use it.`,
     });
     return store.s;
   } catch (e) {
@@ -147,11 +152,13 @@ export async function pairFromPending(deps: Deps, now = Date.now()): Promise<Sta
   return pair(deps, pending);
 }
 
-export async function createPairingCode(deps: Deps): Promise<{ code: string; expiresAt: string }> {
+/** A single-use code for another browser, with its pairing link (built locally for older servers). */
+export async function createPairingCode(deps: Deps): Promise<{ code: string; expiresAt: string; link: string }> {
   const store = await Store.open(deps);
   try {
     requirePaired(store.s);
-    return await apiFor(deps, store.s).createPairingCode();
+    const res = await apiFor(deps, store.s).createPairingCode();
+    return { code: res.code, expiresAt: res.expiresAt, link: res.link ?? pairingLink(store.s.serverUrl, res.code) };
   } catch (e) {
     return fail(store, e);
   }

@@ -88,27 +88,24 @@ button.link.danger { color: var(--danger); }
 .actions .wide { grid-column: 1 / -1; }
 
 .pairing { margin-bottom: 12px; }
-.code {
-  margin: 8px 0 0;
-  padding: 8px;
-  text-align: center;
-  font: 600 18px/1.2 ui-monospace, "SF Mono", Consolas, monospace;
-  letter-spacing: 0.15em;
-  background: var(--field);
-  border-radius: 6px;
-}
-.code small { display: block; font: 11px system-ui, sans-serif; letter-spacing: 0; color: var(--muted); margin-top: 4px; }
+.inline { display: flex; align-items: center; gap: 6px; margin: 8px 0 0; }
+.inline input { margin-top: 0; flex: 1; min-width: 0; }
+.inline button { flex-shrink: 0; }
+#invite-link { font: 12px ui-monospace, "SF Mono", Consolas, monospace; }
+#invite-note { margin: 4px 0 0; }
+
+.muted { color: var(--muted); font-weight: normal; }
+#self-id { font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.facts dd button.link { font-size: 12px; margin-left: 4px; }
 
 footer {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-end;
   padding-top: 10px;
   border-top: 1px solid var(--line);
-  color: var(--muted);
   font-size: 11px;
 }
-#identity { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+footer button { text-align: right; }
 
 .error { margin: 10px 0 0; color: var(--danger); }
 [hidden] { display: none !important; }
@@ -121,4 +118,5 @@ summary { cursor: pointer; font-weight: 600; }
 .list li small { color: var(--muted); display: block; }
 .list button { padding: 3px 8px; font-size: 12px; flex-shrink: 0; }
 .list .empty { color: var(--muted); }
+.list li.revoked { opacity: 0.55; }
 button.danger:not(.link) { color: var(--danger); }

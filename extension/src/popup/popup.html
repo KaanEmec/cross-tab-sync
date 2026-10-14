@@ -12,18 +12,26 @@
       <span id="badge" class="badge" hidden></span>
     </header>
 
-    <form id="pair-view" hidden>
-      <label>Server URL
-        <input id="server-url" type="url" required placeholder="https://sync.example.com" autocomplete="url" />
+    <form id="pair-view" novalidate hidden>
+      <label>Paste pairing link
+        <input id="pair-link" type="text" placeholder="https://tabs.example.com#ABCD2345" autocomplete="off"
+          spellcheck="false" autocapitalize="off" />
       </label>
+      <p id="pair-target" class="hint">From <b>Invite another browser</b> on a paired browser, or <code>cross-tab-sync pair-code</code> on the server.</p>
       <label>Device name
-        <input id="device-name" type="text" required maxlength="64" />
+        <input id="device-name" type="text" maxlength="64" />
       </label>
-      <label>Pairing code
-        <input id="pair-code" type="text" required maxlength="16" autocomplete="one-time-code"
-          spellcheck="false" autocapitalize="characters" placeholder="8 characters" />
-      </label>
-      <p class="hint">Create a code with <code>cross-tab-sync pair-code</code> or from an already paired browser.</p>
+      <details id="pair-advanced">
+        <summary>Advanced</summary>
+        <label>Server URL
+          <input id="server-url" type="text" inputmode="url" placeholder="https://tabs.example.com" autocomplete="url"
+            spellcheck="false" autocapitalize="off" />
+        </label>
+        <label>Pairing code
+          <input id="pair-code" type="text" maxlength="16" autocomplete="one-time-code"
+            spellcheck="false" autocapitalize="characters" placeholder="8 characters" />
+        </label>
+      </details>
       <button id="pair" type="submit" class="primary">Pair</button>
     </form>
 
@@ -49,16 +57,38 @@
         <p id="restore-note" class="hint"></p>
         <ul id="snapshots" class="list"></ul>
       </details>
+      <details id="device-section">
+        <summary>This device <span id="self-summary" class="muted"></span></summary>
+        <dl class="facts">
+          <dt>Name</dt>
+          <dd><span id="self-name"></span> <button id="rename" type="button" class="link">Rename</button></dd>
+          <dt>Browser</dt><dd id="self-browser"></dd>
+          <dt>Device id</dt>
+          <dd><code id="self-id"></code> <button id="copy-id" type="button" class="link" title="Copy the full device id">Copy</button></dd>
+          <dt>Server</dt><dd id="self-server"></dd>
+          <dt>Paired since</dt><dd id="self-since"></dd>
+        </dl>
+        <form id="rename-form" class="inline" hidden>
+          <input id="rename-input" type="text" maxlength="64" aria-label="New device name" />
+          <button type="submit">Save</button>
+          <button id="rename-cancel" type="button" class="link">Cancel</button>
+        </form>
+      </details>
       <details id="devices-section">
         <summary>Devices</summary>
         <ul id="devices" class="list"></ul>
       </details>
       <div class="pairing">
-        <button id="create-code" type="button" class="link">Create pairing code</button>
-        <p id="pairing-code" class="code" hidden></p>
+        <button id="invite" type="button" class="link">Invite another browser</button>
+        <div id="invite-box" hidden>
+          <div class="inline">
+            <input id="invite-link" type="text" readonly aria-label="Pairing link" />
+            <button id="copy-link" type="button">Copy</button>
+          </div>
+          <p id="invite-note" class="hint"></p>
+        </div>
       </div>
       <footer>
-        <span id="identity"></span>
         <button id="disconnect" type="button" class="link danger">Disconnect</button>
       </footer>
     </section>
