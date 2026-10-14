@@ -1,6 +1,6 @@
 # Architecture
 
-Cross-Tab-Sync keeps one shared set of open tabs between Safari on macOS and Brave on Windows through a small self-hosted service. This document is the current system design; [PROTOCOL.md](PROTOCOL.md) is the wire contract and [ROADMAP.md](../ROADMAP.md) the delivery plan.
+Cross-Tab-Sync keeps one shared set of open tabs between Safari on macOS and Brave on Windows through a small service: one hosted instance, or anyone's own. This document is the current system design; [PROTOCOL.md](PROTOCOL.md) is the wire contract and [ROADMAP.md](../ROADMAP.md) the delivery plan.
 
 ## System overview
 
@@ -14,7 +14,7 @@ Safari (macOS)                       Brave (Windows)
 │ └──────────────────┘ │     │ │    │ └──────────────────┘ │
 └──────────────────────┘     ▼ ▼    └──────────────────────┘
                      ┌─────────────────┐
-                     │ Go service      │  single user, single session
+                     │ Go service      │  many sessions, each blind
                      │ SQLite (WAL)    │  devices · ownership · ops log · snapshots
                      │ behind Caddy    │
                      └─────────────────┘
@@ -37,11 +37,11 @@ Exactly one device is the **owner** (publisher) at a time. The owner pushes oper
 
 ### Go service (`server/`)
 
-- **HTTP API** on the standard library `net/http` mux (Go 1.22+ method routing). JSON bodies, bearer-token auth, structured errors, payload limits. No framework.
+- **HTTP API** on the standard library `net/http` mux (Go 1.22+ method routing). JSON bodies, bearer-token auth (the token's device selects the session), structured errors, payload limits, a per-IP rate limit on the two unauthenticated endpoints, a static root page. No framework.
 - **Store** on SQLite via `modernc.org/sqlite` (pure Go, no CGO, trivial cross-compile for the VPS). WAL mode, single writer, `database/sql`. Migrations are embedded `.sql` files applied in order at startup.
 - **Session engine**: applies operation batches inside one transaction. Enforces owner generation, assigns revisions, coalesces duplicate URLs, keeps closure tombstones, records per-operation results for idempotent retries.
 - **Recovery snapshots**: before any batch that closes or navigates entries, the open-entry set is saved; a bounded number is retained.
-- **CLI**: `serve` and `pair-code` subcommands. Configuration from environment variables.
+- **CLI**: `serve` only; sessions and invites are created from the extension. Configuration from environment variables.
 
 ### Extension (`extension/`)
 
@@ -53,13 +53,14 @@ Exactly one device is the **owner** (publisher) at a time. The owner pushes oper
 
 ### Safari wrapper (`safari/`)
 
-A minimal Swift macOS app whose only job is to host the extension. Produced from `extension/dist/safari` by `xcrun safari-web-extension-packager`; no native messaging and no native logic. Local testing uses Safari's *Allow unsigned extensions* (Settings > Developer, resets when Safari quits); distribution is Developer ID + notarization (documented in the release epic).
+A minimal Swift macOS app whose only job is to host the extension. Produced from `extension/dist/safari` by `xcrun safari-web-extension-packager`; no native messaging and no native logic. Local testing uses Safari's *Allow unsigned extensions* (Settings > Developer, resets when Safari quits); distribution is a Developer ID signed, notarized DMG built by the release workflow.
 
 ## Key decisions
 
 | Decision | Choice | Why |
 | --- | --- | --- |
-| Single session, single user | One shared session per server instance | Matches the product; avoids multi-tenant complexity. Devices pair into the one session. |
+| Many sessions per server | Any number of independent sessions; a token maps to a device, the device to its session; session ids never leave the server | One hosted server serves everyone without accounts, and sessions stay mutually invisible. A personal server sets `CTS_MAX_SESSIONS=1`. |
+| Session lifetime and abuse controls | A session is deleted when its last active device is revoked, or after `CTS_SESSION_RETENTION` (180 days) without device activity; 10 requests per 10 minutes per IP on `POST /v3/sessions` and `/v3/pair`; `CTS_MAX_SESSIONS` (default unlimited) and `CTS_MAX_DEVICES` (default 10) | Nobody can reach a session without a paired device, so its state is dropped; tabs stay open in the browsers, so no shared tab is closed without a `close`. Limits keep an open hosted server cheap to run. |
 | Ownership | Server-held owner + monotonically increasing **generation** | Stale owners are rejected by generation mismatch, not by timing. Takeover increments the generation atomically. |
 | Change model | Append-only **operation log**; `revision` = sequence number of the last applied op | Followers catch up with `changes?since=`. Deterministic replay. Retry safety via client-generated `opId`. |
 | Deletion | Explicit `close` ops only; closed entries stay as tombstones | Snapshot absence never deletes. Tombstones stop stale devices from resurrecting closed tabs. |
@@ -70,7 +71,7 @@ A minimal Swift macOS app whose only job is to host the extension. Produced from
 | Extension build | esbuild + TypeScript, no framework | Two small bundles (worker, popup). No React/Vue; the popup is a status page. |
 | Browser API | `chrome.*` promise API directly, no polyfill | Both Safari and Brave support it under MV3. A thin adapter interface keeps the core testable. |
 | Sync cadence | `alarms` every 5 minutes, immediate on takeover and manual actions | Service workers are suspended; alarms are the only reliable scheduler. Safari does not persist alarms, so the worker re-creates them on every start. |
-| Backend access | `optional_host_permissions`; the exact backend origin is requested with `permissions.request` during pairing | Both browsers need a host grant before `fetch` to the backend. Asking for one origin avoids a broad install-time permission. |
+| Backend access | `optional_host_permissions`; the exact backend origin is requested with `permissions.request` on Start syncing or pairing | Both browsers need a host grant before `fetch` to the backend. Asking for one origin avoids a broad install-time permission. |
 | Supported browsers | Safari 18.4+ on macOS, Brave on Chromium 120+ on Windows | Safari 18.4 is the first version that loads Developer ID extensions and has the required `permissions` semantics; Chromium 120 gives 30 s alarm floors. See [COMPATIBILITY.md](COMPATIBILITY.md). |
 | Tab order | Best-effort `position` hint, never `tabs.move` on Safari | Safari does not implement `tabs.move`. Order is applied only where cheap. |
 
@@ -93,7 +94,10 @@ URLs are end-to-end encrypted ([PROTOCOL.md](PROTOCOL.md#encryption)); the serve
 | v1.0.0 | 01 Offline merging | done in code (server merge + retention, client journal/backoff/resync) |
 | v1.0.0 | 02 Recovery | done in code (snapshot restore, status, pause/resume, devices) |
 | v1.0.0 | 03 Release | packaging and install guide done; first-release validation pending on real browsers |
-| v2.0.0 | 01 End-to-end encryption | planned; protocol v2 specified, implementation and measurement pending |
+| v2.0.0 | 01 End-to-end encryption | done in code and measured; real-browser cutover validated 2026-10-14 |
+| v3.0.0 | 01 Multi-session server | planned |
+| v3.0.0 | 02 Onboarding | planned |
+| v3.0.0 | 03 Distribution | planned |
 
 Every "done in code" item is unit tested, integration tested against the real server where applicable, and independently reviewed with findings fixed.
 

@@ -62,9 +62,20 @@ Upgrade of the live v1 database: entries, operations and snapshots wiped, revisi
 - [ ] Upgrade a v1 database to v2: entries, operations and snapshots are gone, the revision is 0, every device is revoked and must pair again.
 - [ ] Cost: fill the "Measured cost" table in `versions/v2.0.0/01-end-to-end-encryption/01-encrypt-urls.md` (bytes on the wire and container CPU for a 200-tab sync, v1 versus v2).
 
+## Multi-session onboarding (v3.0.0)
+
+- [ ] Fresh Brave: Start syncing against the hosted server; the permission prompt appears for `cts.kexperiments.com` only; the popup returns with Devices open and one invite link.
+- [ ] Fresh Safari (DMG, no "Allow unsigned extensions"): I have an invite link, paste, join; tabs arrive within one sync.
+- [ ] Paste a link without a key, an expired link and a used link: each is refused in the popup with a plain message and no request is sent for the keyless one.
+- [ ] Two sessions on one server (a second Start syncing from another profile): neither sees the other's devices, tabs or snapshots; `GET /v3/devices` lists only its own.
+- [ ] Disconnect the last browser of a session: the server deletes the session (`sqlite3 ... "select count(*) from sessions"` drops by one).
+- [ ] Eleven Start syncing attempts from one address within 10 minutes: the eleventh shows the retry message; the server log holds no IP.
+- [ ] A v2 extension against the v3 server and a v3 extension against a v2 server each show "older version" style errors, never a silent failure.
+- [ ] Upgrade the live v2 database (one session, paired devices) to v3: devices stay paired and the tabs are intact.
+
 ## Release
 
 - [ ] Fresh install of the server on the VPS from the published image; backup and restore work as documented.
-- [ ] Fresh Brave install from the release zip; fresh Safari build from `safari/` in Xcode.
+- [ ] Fresh Brave install from the Chrome Web Store listing; fresh Safari install from the notarized DMG.
 - [ ] Server upgrade (new image) applies migrations and keeps the session.
 - [ ] Server logs contain no URLs, tokens or pairing codes.
