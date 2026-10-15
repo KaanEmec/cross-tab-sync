@@ -7,7 +7,7 @@ import type { TabInfo } from "../adapter/types.js";
 import { onActivity, onDemoted, type ActivityKind } from "./activity.js";
 import { diag, errText, flushDiag, refreshDiagnostics, setDiagSink } from "./diag.js";
 import {
-  CLOSE_HOLD_MS,
+  nextRelease,
   recordCreated,
   recordRemoved,
   recordUpdated,
@@ -93,6 +93,8 @@ export class SyncEngine {
   private depth = 0;
   private cancelTimer: (() => void) | null = null;
   private cancelRelease: (() => void) | null = null;
+  /** Epoch ms the armed release timer fires at. */
+  private releaseAt = Infinity;
   private cancelRetry: (() => void) | null = null;
   /**
    * Last ownership verification started by an activity signal. In memory only: a restarted worker
@@ -358,7 +360,7 @@ export class SyncEngine {
    */
   async unpause(): Promise<State> {
     await this.enqueue(() => saveState(this.deps.adapter.storage, { paused: false, statusText: null }), "resume sync");
-    await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)), "release held closes");
+    await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)), "release held changes");
     return this.runNow("resume");
   }
 
@@ -372,13 +374,13 @@ export class SyncEngine {
     this.requestSync();
   }
 
-  /** Worker (re)start: send what an earlier worker journaled, release closes it held, rearm the retry. */
+  /** Worker (re)start: send what an earlier worker journaled, release what it held, rearm the retry. */
   async resume(): Promise<void> {
     const s = await this.enqueue(async () => {
       await this.ensureSession();
       return loadState(this.deps.adapter.storage);
     }, "worker resume");
-    if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease(); // journaling continues while paused
+    this.scheduleRelease(nextRelease(s)); // journaling continues while paused
     if (s.paused) return;
     if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
     await this.scheduleRetry();
@@ -401,19 +403,26 @@ export class SyncEngine {
     );
   }
 
-  /** Release held closes once CLOSE_HOLD_MS has passed (see changes.releaseHeld). */
-  private scheduleRelease(): void {
-    if (this.cancelRelease) return;
+  /**
+   * Arm the release of held closes and navigations for `at` (changes.nextRelease), unless a timer
+   * fires earlier already; the release re-arms for whatever is still held.
+   */
+  private scheduleRelease(at: number | null): void {
+    if (at === null || (this.cancelRelease && this.releaseAt <= at)) return;
+    this.cancelRelease?.();
+    this.releaseAt = at;
     this.cancelRelease = this.schedule(() => {
       this.cancelRelease = null;
-      this.event("release held closes", (s, ctx) => this.release(s, ctx));
-    }, CLOSE_HOLD_MS);
+      this.event("release held changes", (s, ctx) => this.release(s, ctx));
+    }, Math.max(0, at - nowMs(this.deps)));
   }
 
+  /** Release what is due (changes.releaseHeld), with the open windows and their tab counts. */
   private async release(s: State, ctx: Ctx): Promise<Step> {
-    const alive = new Set((await this.deps.adapter.getWindows()).map((w) => w.id));
-    const out = releaseHeld(s, alive, ctx);
-    if (out.waiting) this.scheduleRelease();
+    const [windows, tabs] = await Promise.all([this.deps.adapter.getWindows(), this.deps.adapter.queryTabs()]);
+    const windowTabs = new Map(windows.map((w) => [w.id, tabs.filter((t) => t.windowId === w.id).length]));
+    const out = releaseHeld(s, windowTabs, ctx);
+    if (out.waiting) this.scheduleRelease(nextRelease({ ...s, ...out.patch }));
     return outcome(out);
   }
 
@@ -435,7 +444,7 @@ export class SyncEngine {
     const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner, kind: out.kind }) : null;
     if (out.activity) diag(`activity ${out.kind ?? "-"}: ${activityText(s, isOwner, decision)}`);
     await saveState(storage, { ...out.patch, ...decision?.patch });
-    if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
+    if (out.patch.heldCloses || out.patch.heldNavigates) this.scheduleRelease(nextRelease({ ...s, ...out.patch }));
     if (s.paused) return;
     if (decision?.takeover) void this.takeover().catch(ignore);
     // Any counted signal (at most every VERIFY_INTERVAL_MS, regardless of the idle rule; a fresh

@@ -3,13 +3,14 @@
 // against fakes. Hand over and Continue here reuse the v0.2 sync run (sync.ts).
 
 import { applyRemote, captureTabs, currentMappings } from "./apply.js";
+import { flushNavigates } from "./changes.js";
 import { materialize } from "./materialize.js";
 import { ApiError, normalizeServerUrl, type Owner, type Paired } from "./client.js";
 import { generateKey, keyCheck } from "./crypto.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 import { pairingLink } from "./pairing.js";
 import { clearedCredentials, isPaired, loadState, PENDING_PAIR_TTL_MS, saveState, type State } from "./state.js";
-import { apiFor, dropCredentials, fail, nowIso, nowMs, ownerLabel, requireKey, Store, succeeded, type Api, type Deps } from "./store.js";
+import { apiFor, dropCredentials, fail, idGen, nowIso, nowMs, ownerLabel, requireKey, Store, succeeded, type Api, type Deps } from "./store.js";
 import { submitJournal } from "./merge.js";
 import { classify, INVITE_KEY_MISMATCH_MESSAGE, isRemovedKind, pairingRefusal } from "./status.js";
 import { createFailedMessage, flush, rejectedMessage } from "./sync.js";
@@ -323,7 +324,10 @@ export async function refreshOwner(deps: Deps): Promise<boolean> {
  * Starts the startup grace for removals and activity.
  */
 export async function resetForBrowserStartup(deps: Deps): Promise<void> {
-  const s = await loadState(deps.adapter.storage);
+  const loaded = await loadState(deps.adapter.storage);
+  // Navigations still held were made by the user before the browser quit: journal them now.
+  const flushed = flushNavigates(loaded, { now: nowMs(deps), newId: idGen(deps) });
+  const s = { ...loaded, ...flushed.patch };
   const previous = [...Object.values(s.staleMappings?.tabs ?? {}), ...Object.values(s.mappings.tabs)];
   const staleMappings: Mappings = {
     tabs: Object.fromEntries(previous.map((m, i) => [`stale-${i}`, m])),
@@ -335,8 +339,10 @@ export async function resetForBrowserStartup(deps: Deps): Promise<void> {
     staleMappings: previous.length > 0 ? staleMappings : null,
     detached,
     expected: [],
+    pending: s.pending,
     // Removals still held belong to the shutdown of the previous session: unmap only.
     heldCloses: [],
+    heldNavigates: [],
     removedWindows: {},
     receivingWindowId: null,
     runLock: null,

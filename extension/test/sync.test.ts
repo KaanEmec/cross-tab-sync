@@ -1,10 +1,10 @@
 // Scenarios for the v0.2 automatic sync: engine + fake browsers + fake server.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { isCommitted } from "../src/core/engine.js";
+import { isCommitted, SyncEngine } from "../src/core/engine.js";
 import { list } from "../src/core/journal.js";
 import { BusyError } from "../src/core/lock.js";
 import { saveState } from "../src/core/state.js";
-import { Clock, device, type Dev } from "./support/devices.js";
+import { Clock, device, ManualTimers, type Dev } from "./support/devices.js";
 import { FakeServer } from "./support/fakeServer.js";
 
 let server: FakeServer;
@@ -21,6 +21,11 @@ afterEach(() => {
 
 
 const removals = (d: Dev) => d.b.calls.filter((c) => c.method === "removeTab").length;
+/**
+ * A new tab page keeps the device's window open while its shared tabs are closed (a browser closes
+ * a window with its last tab; removals that empty a window are a teardown, not closes).
+ */
+const keepWindow = (d: Dev) => d.b.addTab(d.win, { url: "chrome://newtab/" });
 const entryOf = (url: string) => server.session().entries.find((e) => e.url === url)!.id;
 
 /** An owner with the given tabs, already flushed. */
@@ -164,6 +169,7 @@ describe("follower application", () => {
     const brave = await owner("Brave", ["https://a/", "https://b/"]);
     const mac = await follower("Mac Safari");
     await mac.quiet();
+    keepWindow(brave);
     mac.b.userActivate(mac.tab("https://a/"));
     brave.b.userCloseTab(brave.tab("https://a/"));
     brave.b.userCloseTab(brave.tab("https://b/"));
@@ -211,6 +217,7 @@ describe("follower application", () => {
     mac.b.tabs.find((t) => t.id === b)!.windowId = w2;
     mac.b.userActivate(b);
     await mac.settle();
+    keepWindow(brave);
     brave.b.userCloseTab(brave.tab("https://a/"));
     brave.b.userCloseTab(brave.tab("https://b/"));
     await brave.settle();
@@ -573,7 +580,9 @@ describe("live testing fixes", () => {
 
     // A window restored a little later, also silently: the delayed re-match finds it.
     clock.advance(3_000);
-    const c = mac.b.addTab(mac.b.addWindow(), { url: "https://c/" });
+    const late = mac.b.addWindow();
+    const c = mac.b.addTab(late, { url: "https://c/" });
+    mac.b.addTab(late, { url: "https://c2/" });
     mac.rematches.fire();
     await mac.settle();
     expect(await urls()).toEqual(["https://a/", "https://b/", "https://c/"]);
@@ -698,6 +707,7 @@ describe("review fixes", () => {
     clock.advance(15_000); // past the post-load grace of the tabs the follower just received
     await mac.quiet();
     mac.b.userNavigate(mac.tab("https://a/"), "https://a/local"); // journaled, held while following
+    keepWindow(brave);
     brave.b.userCloseTab(brave.tab("https://a/"));
     brave.b.userCloseTab(brave.tab("https://b/"));
     await brave.settle();
@@ -748,7 +758,8 @@ describe("review fixes", () => {
   it("a window closing as individual tab removals produces no close ops; rapid individual closes do", async () => {
     const mac = await owner("Mac Safari", ["https://keep/"]);
     const w2 = mac.b.addWindow({ tabs: [{ url: "https://w1/" }, { url: "https://w2/" }] });
-    const w3 = mac.b.addWindow({ tabs: [{ url: "https://w3/" }, { url: "https://w4/" }, { url: "https://w5/" }] });
+    const blank = { url: "chrome://newtab/" };
+    const w3 = mac.b.addWindow({ tabs: [{ url: "https://w3/" }, { url: "https://w4/" }, { url: "https://w5/" }, blank, blank, blank] });
     mac.b.userFocusWindow(mac.win);
     await mac.settle();
     await mac.engine.takeover(); // publishes the new windows' tabs
@@ -762,8 +773,8 @@ describe("review fixes", () => {
     expect(mac.sent().filter((o) => o.type === "close")).toEqual([]);
     expect((await mac.state()).heldCloses).toEqual([]);
 
-    // Three tabs of a window that stays open, closed one after another within 2 s: three closes.
-    for (const id of mac.b.tabs.filter((t) => t.windowId === w3).map((t) => t.id)) {
+    // Three tabs of a window that keeps three others, closed one after another within 2 s: three closes.
+    for (const id of mac.b.tabs.filter((t) => t.windowId === w3 && t.url?.startsWith("https:")).map((t) => t.id)) {
       mac.b.userCloseTab(id);
       clock.advance(300);
     }
@@ -832,5 +843,236 @@ describe("two devices", () => {
     expect((await mac.state()).pending).toEqual([]);
     expect((await brave.state()).pending).toEqual([]);
     expect(server.owner?.deviceId).toBe(mac.id);
+  });
+});
+
+/** A new engine over the same browser and storage, as after the service worker was terminated. */
+async function restartWorker(d: Dev): Promise<{ engine: SyncEngine; timers: ManualTimers }> {
+  const timers = new ManualTimers(clock);
+  const engine = new SyncEngine(d.deps, timers.schedule, new ManualTimers(clock).schedule, new ManualTimers(clock).schedule);
+  await engine.resume();
+  return { engine, timers };
+}
+
+/** Fire a restarted worker's timers until nothing is left. */
+async function settleWorker(w: { engine: SyncEngine; timers: ManualTimers }): Promise<void> {
+  for (let i = 0; i < 20 && (w.timers.size > 0 || w.engine.busy); i++) {
+    await w.engine.idle();
+    if (w.timers.size > 0) w.timers.fire();
+  }
+  await w.engine.idle();
+}
+
+describe("second live test fixes", () => {
+  it("received tabs go to the frontmost window, not the stale persisted one", async () => {
+    const brave = await owner("Brave", ["https://a/"]);
+    const mac = await follower("Mac Safari");
+    const a = mac.win;
+    const b = mac.b.addWindow({ tabs: [{ url: "https://local/", active: true }] });
+    await saveState(mac.b.storage, { receivingWindowId: a }); // persisted by the last focus event
+    // The user brings window B to the front; Safari reports no focus event.
+    for (const w of mac.b.windows) w.focused = w.id === b;
+    mac.b.lastFocusedWindowId = b;
+
+    brave.b.userOpenTab(brave.win, "https://new/");
+    await brave.settle();
+    await mac.engine.runNow();
+    await mac.settle();
+    expect(mac.b.tabs.find((t) => t.url === "https://new/")?.windowId).toBe(b);
+    expect(mac.b.tabs.find((t) => t.url === "https://new/")?.active).toBe(false);
+
+    // The browser's focused window wins over a last-focused answer that lags behind.
+    for (const w of mac.b.windows) w.focused = w.id === a;
+    brave.b.userOpenTab(brave.win, "https://newer/");
+    await brave.settle();
+    await mac.engine.runNow();
+    await mac.settle();
+    expect(mac.b.tabs.find((t) => t.url === "https://newer/")?.windowId).toBe(a);
+  });
+
+  it("a live page rewriting its URL every second is one navigate; the other browser loads it once", async () => {
+    const mac = await owner("Mac Safari", ["https://deploy/"]);
+    const brave = await follower("Brave");
+    const tab = mac.tab("https://deploy/");
+    for (const run of ["1", "2", "3"]) {
+      mac.b.pageRewritesUrl(tab, `https://deploy/?run=${run}`);
+      await mac.engine.idle();
+      clock.advance(1_000);
+    }
+    expect((await mac.state()).pending).toEqual([]); // held
+    await mac.settle();
+    expect(mac.sent().filter((o) => o.type === "navigate").map((o) => o.type === "navigate" && o.url)).toEqual(["https://deploy/?run=3"]);
+    expect(server.openUrls()).toEqual(["https://deploy/?run=3"]);
+
+    await brave.engine.runNow();
+    await brave.settle();
+    expect(brave.b.calls.filter((c) => c.method === "updateTab")).toHaveLength(1);
+    expect(await brave.urls()).toEqual(["https://deploy/?run=3"]);
+  });
+
+  it("a page that returns to its URL within the hold publishes nothing; a later change is a new navigate", async () => {
+    const mac = await owner("Mac Safari", ["https://feed/"]);
+    const tab = mac.tab("https://feed/");
+    mac.b.pageRewritesUrl(tab, "https://feed/#loading");
+    await mac.engine.idle();
+    clock.advance(1_000);
+    mac.b.pageRewritesUrl(tab, "https://feed/");
+    await mac.settle();
+    expect(mac.sent().filter((o) => o.type === "navigate")).toEqual([]);
+    const s = await mac.state();
+    expect(s.mappings.tabs[String(tab)]).toEqual({ entryId: entryOf("https://feed/"), url: "https://feed/" });
+    expect(s.heldNavigates).toEqual([]);
+
+    mac.b.userNavigate(tab, "https://feed/page2");
+    await mac.settle();
+    mac.b.userNavigate(tab, "https://feed/page3");
+    await mac.settle();
+    expect(mac.sent().filter((o) => o.type === "navigate").map((o) => o.type === "navigate" && o.url)).toEqual([
+      "https://feed/page2",
+      "https://feed/page3",
+    ]);
+  });
+
+  it("a remote navigate or close of an entry whose navigation is still held forks, like a journaled one", async () => {
+    const brave = await owner("Brave", ["https://a/", "https://b/", "https://keep/"]);
+    const mac = await follower("Mac Safari");
+    clock.advance(15_000); // past the post-load grace of the tabs the follower just received
+    await mac.quiet();
+    mac.b.userNavigate(mac.tab("https://a/"), "https://a/mac");
+    mac.b.userNavigate(mac.tab("https://b/"), "https://b/mac");
+    await mac.engine.idle(); // both held, nothing journaled
+    expect((await mac.state()).pending).toEqual([]);
+    brave.b.userNavigate(brave.tab("https://a/"), "https://a/brave");
+    brave.b.userCloseTab(brave.tab("https://b/"));
+    await brave.settle();
+
+    await mac.engine.runNow(); // applies both before the holds release
+    await mac.settle();
+    expect(removals(mac)).toBe(0);
+    expect(await mac.urls()).toEqual(["https://a/brave", "https://a/mac", "https://b/mac", "https://keep/"]);
+    expect(mac.merged().map((o) => o.type)).toEqual(["open", "open"]); // the forks, no navigate
+    await mac.engine.runNow();
+    await mac.settle();
+    expect(server.openUrls().sort()).toEqual(["https://a/brave", "https://a/mac", "https://b/mac", "https://keep/"]);
+    expect((await mac.state()).heldNavigates).toEqual([]);
+  });
+
+  it("held navigates survive a worker restart and are released by the new worker", async () => {
+    const mac = await owner("Mac Safari", ["https://a/"]);
+    mac.b.userNavigate(mac.tab("https://a/"), "https://a/next");
+    await mac.engine.idle(); // held; the worker dies before the release
+    expect((await mac.state()).heldNavigates).toHaveLength(1);
+
+    const w = await restartWorker(mac);
+    expect(w.timers.size).toBe(1);
+    await settleWorker(w);
+    expect(mac.sent().filter((o) => o.type === "navigate").map((o) => o.type === "navigate" && o.url)).toEqual(["https://a/next"]);
+    expect(server.openUrls()).toEqual(["https://a/next"]);
+    expect((await mac.state()).heldNavigates).toEqual([]);
+  });
+
+  it("a navigation still held when the browser quits is journaled by the startup reset", async () => {
+    const mac = await owner("Mac Safari", ["https://a/"]);
+    mac.b.userNavigate(mac.tab("https://a/"), "https://a/last");
+    await mac.engine.idle();
+    clock.advance(1_000);
+    mac.b.restart();
+    mac.b.restoreTab(mac.b.addWindow({ focused: true }), "https://a/last");
+    mac.b.events.startup.emit();
+    await mac.settle();
+    expect(mac.sent().filter((o) => o.type === "navigate").map((o) => o.type === "navigate" && o.url)).toEqual(["https://a/last"]);
+    expect(server.openUrls()).toEqual(["https://a/last"]);
+    const s = await mac.state();
+    expect(s.heldNavigates).toEqual([]);
+    expect(Object.values(s.mappings.tabs)).toEqual([{ entryId: entryOf("https://a/last"), url: "https://a/last" }]);
+  });
+
+  describe("window teardown on Windows (tabs removed one by one, isWindowClosing false)", () => {
+    /** An owner with a second window of `shared` shared tabs (and `blank` new tab pages). */
+    async function withWindow(shared: number, blank = 0): Promise<{ mac: Dev; w2: number; ids: number[] }> {
+      const mac = await owner("Brave", ["https://keep/"]);
+      const tabs = [
+        ...Array.from({ length: shared }, (_, i) => ({ url: `https://t${i}/` })),
+        ...Array.from({ length: blank }, () => ({ url: "chrome://newtab/" })),
+      ];
+      const w2 = mac.b.addWindow({ tabs });
+      await mac.engine.takeover(); // publishes the new window's tabs
+      await mac.settle();
+      expect(server.openUrls()).toHaveLength(shared + 1);
+      const ids = mac.b.tabs.filter((t) => t.windowId === w2 && t.url?.startsWith("https:")).map((t) => t.id);
+      return { mac, w2, ids };
+    }
+
+    /** Remove tabs one second apart; each removal is processed before the next. */
+    async function removeSlowly(d: Dev, ids: number[]): Promise<void> {
+      for (const id of ids) {
+        d.b.userCloseTab(id);
+        await d.engine.idle();
+        clock.advance(1_000);
+      }
+    }
+    const closes = (d: Dev) => d.sent().filter((o) => o.type === "close");
+
+    it("ten removals a second apart from a window that then disappears: no close", async () => {
+      const { mac, w2, ids } = await withWindow(10);
+      await removeSlowly(mac, ids);
+      mac.b.windows = mac.b.windows.filter((w) => w.id !== w2); // no windows.onRemoved
+      await mac.settle();
+      expect(closes(mac)).toEqual([]);
+      expect(server.openUrls()).toHaveLength(11);
+      expect((await mac.state()).heldCloses).toEqual([]);
+    });
+
+    it("ten removals a second apart from a window still listed without tabs: no close", async () => {
+      const { mac, ids } = await withWindow(10);
+      await removeSlowly(mac, ids);
+      await mac.settle();
+      expect(closes(mac)).toEqual([]);
+      expect(server.openUrls()).toHaveLength(11);
+    });
+
+    it("ten removals a second apart from a window that keeps its other tabs: ten closes", async () => {
+      const { mac, ids } = await withWindow(10, 10);
+      await removeSlowly(mac, ids);
+      await mac.settle();
+      expect(closes(mac)).toHaveLength(10);
+      expect(server.openUrls()).toEqual(["https://keep/"]);
+    });
+
+    it("two of three tabs closed within 2 s: two closes", async () => {
+      const { mac, ids } = await withWindow(3);
+      mac.b.userCloseTab(ids[0]!);
+      await mac.engine.idle();
+      clock.advance(500);
+      mac.b.userCloseTab(ids[1]!);
+      await mac.settle();
+      expect(closes(mac)).toHaveLength(2);
+      expect(server.openUrls().sort()).toEqual(["https://keep/", "https://t2/"]);
+    });
+
+    it("one removal from a window that keeps other tabs is one close after the 2 s hold", async () => {
+      const { mac, ids } = await withWindow(2);
+      const before = clock.t;
+      mac.b.userCloseTab(ids[0]!);
+      await mac.engine.idle();
+      expect(closes(mac)).toEqual([]);
+      expect((await mac.state()).heldCloses).toHaveLength(1);
+      await mac.settle();
+      expect(closes(mac)).toHaveLength(1);
+      expect(clock.t - before).toBeGreaterThanOrEqual(2_000);
+    });
+
+    it("a worker killed mid-teardown: the restarted worker sends nothing", async () => {
+      const { mac, w2, ids } = await withWindow(10);
+      await removeSlowly(mac, ids.slice(0, 5));
+      // The worker dies; the browser finishes closing the window while it is down.
+      mac.b.tabs = mac.b.tabs.filter((t) => t.windowId !== w2);
+      mac.b.windows = mac.b.windows.filter((w) => w.id !== w2);
+      const w = await restartWorker(mac);
+      await settleWorker(w);
+      expect(closes(mac)).toEqual([]);
+      expect(server.openUrls()).toHaveLength(11);
+      expect((await mac.state()).heldCloses).toEqual([]);
+    });
   });
 });

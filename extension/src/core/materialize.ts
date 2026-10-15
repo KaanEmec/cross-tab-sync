@@ -32,11 +32,14 @@ export async function materialize(
   const now = nowDate(store.deps);
   const baseRevision = store.s.lastRevision;
   const sessionIds = entries ? new Set(entries.map((e) => e.id)) : null;
+  /** Entries with a navigation still held (not journaled yet): local changes like pending ones. */
+  const held = new Set(store.s.heldNavigates.map((h) => h.entryId));
 
   // Entries closed elsewhere while this device navigated them: keep the local page as an opening.
   if (sessionIds) {
     for (const entryId of new Set(Object.values(before.tabs).map((m) => m.entryId))) {
-      if (sessionIds.has(entryId) || !pendingChanges(pending, entryId).some((p) => p.op.type === "navigate")) continue;
+      const navigated = pendingChanges(pending, entryId).some((p) => p.op.type === "navigate") || held.has(entryId);
+      if (sessionIds.has(entryId) || !navigated) continue;
       const f = forkEntry(before, pending, entryId, newId, now, baseRevision);
       if (f) ({ mappings: before, pending } = f);
     }
@@ -91,12 +94,12 @@ export async function materialize(
     const copies = tabsForEntry(mappings, entry.id);
     const m = mappings.tabs[String(copies[0])];
     if (!m || entry.url === m.url || entry.url === serverUrl(m)) continue;
-    if (pendingChanges(pending, entry.id).length === 0) {
+    if (pendingChanges(pending, entry.id).length === 0 && !held.has(entry.id)) {
       for (const id of copies) navigateTo.set(id, entry.url);
       mappings = remapEntry(mappings, entry.id, entry.id, entry.url);
       continue;
     }
-    const base = pendingBase(pending, entry.id);
+    const base = pendingBase(pending, entry.id) ?? (held.has(entry.id) ? serverUrl(m) : undefined);
     if (base === undefined || base === entry.url) continue; // our own unsent change: the flush applies it
     const f = forkEntry(mappings, pending, entry.id, newId, now, baseRevision);
     if (!f) continue;

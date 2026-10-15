@@ -12,7 +12,9 @@ import {
   STALE_MAPPINGS_TTL_MS,
   type Expectation,
   type HeldClose,
+  type HeldNavigate,
 } from "./changes.js";
+import { diag } from "./diag.js";
 import { eligibleTabs, type EligibleTab } from "./eligibility.js";
 import { append, pendingChanges, type Journal } from "./journal.js";
 import {
@@ -64,6 +66,14 @@ export function pendingClosedIds(journal: Journal, held: HeldClose[] = [], mappi
 }
 
 /**
+ * Entries this device changed and has not sent: a pending navigate/open, or a navigation still held
+ * (NAVIGATE_SETTLE_MS). A remote navigate or close of such an entry forks instead of overwriting.
+ */
+export function locallyChanged(journal: Journal, held: HeldNavigate[], entryId: string): boolean {
+  return pendingChanges(journal, entryId).length > 0 || held.some((h) => h.entryId === entryId);
+}
+
+/**
  * Detached tabs that still exist. After a browser restart (`stale-N` keys) each detached URL claims
  * one unmapped tab showing it; unmatched ones are kept while `live`.
  */
@@ -109,16 +119,26 @@ export async function currentMappings(store: Store, all: TabInfo[], eligible: El
 }
 
 /**
- * Window that receives created tabs: the last focused normal window, else the persisted
- * `receivingWindowId`, else any normal window. Null means a window must be created.
+ * Window that receives created tabs, read from the browser at creation time: the focused normal
+ * window, else the last focused one (`getLastFocusedWindow`), else the persisted
+ * `receivingWindowId` (last focus event, possibly stale), else any normal window. Null means a
+ * window must be created.
  */
 export async function resolveReceivingWindow(adapter: BrowserAdapter, persisted: number | null): Promise<number | null> {
   const windows = (await adapter.getWindows()).filter((w) => w.type === "normal" && !w.incognito);
   const ids = new Set(windows.map((w) => w.id));
   const last = await adapter.getLastFocusedWindow().catch(() => null);
-  if (last && ids.has(last.id)) return last.id;
-  if (persisted !== null && ids.has(persisted)) return persisted;
-  return windows[0]?.id ?? null;
+  const focused = windows.find((w) => w.focused)?.id;
+  const [id, source] =
+    focused !== undefined
+      ? [focused, "focused"]
+      : last && ids.has(last.id)
+        ? [last.id, "last focused"]
+        : persisted !== null && ids.has(persisted)
+          ? [persisted, "persisted"]
+          : [windows[0]?.id ?? null, "any"];
+  diag(`receiving window ${id ?? "new"} (${source}; last focused ${last?.id ?? "-"}, persisted ${persisted ?? "-"})`);
+  return id;
 }
 
 export const expiry = (store: Store) => nowMs(store.deps) + EXPECT_TTL_MS;
@@ -326,7 +346,7 @@ export async function applyRemote(
           ensureTab(fresh, op.url);
           break;
         }
-        if (localUrl !== op.url && pendingChanges(pending, op.entryId).length > 0 && fork(op.entryId)) {
+        if (localUrl !== op.url && locallyChanged(pending, store.s.heldNavigates, op.entryId) && fork(op.entryId)) {
           ensureTab(target, op.url);
           break;
         }
@@ -351,7 +371,7 @@ export async function applyRemote(
         const i = toCreate.findIndex((c) => c.entryId === op.entryId);
         if (i >= 0) toCreate.splice(i, 1);
         // An unsent local change on the entry survives as a fresh opening.
-        if (pendingChanges(pending, op.entryId).length > 0 && fork(op.entryId)) break;
+        if (locallyChanged(pending, store.s.heldNavigates, op.entryId) && fork(op.entryId)) break;
         for (const id of tabsForEntry(mappings, op.entryId)) {
           const live = byId.get(id)?.url;
           const m = mappings.tabs[String(id)]!;

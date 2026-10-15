@@ -292,6 +292,7 @@
       suppressAutoTakeover: false,
       freshPending: false,
       heldCloses: [],
+      heldNavigates: [],
       removedWindows: {},
       errorKind: null,
       online: true,

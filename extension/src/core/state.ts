@@ -1,7 +1,7 @@
 import type { KeyValueStorage } from "../adapter/types.js";
 import type { ActivityKind } from "./activity.js";
 import type { Owner } from "./client.js";
-import type { Expectation, HeldClose } from "./changes.js";
+import type { Expectation, HeldClose, HeldNavigate } from "./changes.js";
 import type { Journal } from "./journal.js";
 import { emptyMappings, type Mappings } from "./mapping.js";
 
@@ -80,6 +80,8 @@ export interface State {
   freshPending: boolean;
   /** Removals of mapped tabs waiting CLOSE_HOLD_MS before they may become `close` operations. */
   heldCloses: HeldClose[];
+  /** Local navigations waiting NAVIGATE_SETTLE_MS before they may become `navigate` operations. */
+  heldNavigates: HeldNavigate[];
   /** Recently removed windows (windows.onRemoved), window id -> epoch ms. */
   removedWindows: Record<string, number>;
 
@@ -149,6 +151,7 @@ export function defaultState(): State {
     suppressAutoTakeover: false,
     freshPending: false,
     heldCloses: [],
+    heldNavigates: [],
     removedWindows: {},
     errorKind: null,
     online: true,
@@ -209,6 +212,7 @@ export function clearedCredentials(): Partial<State> {
     suppressAutoTakeover: false,
     freshPending: false,
     heldCloses: [],
+    heldNavigates: [],
     removedWindows: {},
     online: true,
     nextRetryAt: null,

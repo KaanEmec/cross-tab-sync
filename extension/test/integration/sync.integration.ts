@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { FakeBrowser } from "../../src/adapter/fake.js";
+import { NAVIGATE_SETTLE_MS } from "../../src/core/changes.js";
 import { ApiClient, type BrowserKind, type Session } from "../../src/core/client.js";
 import { cipherFor } from "../../src/core/crypto.js";
 import { SyncEngine } from "../../src/core/engine.js";
@@ -273,12 +274,20 @@ describe.skipIf(!hasGo)("real server + real client", () => {
     const safari = await device("Safari", "safari", ["https://a.example/"]);
     const brave = await device("Brave", "brave", [], safari);
     await continueHere(safari.deps);
-    const engine = new SyncEngine(brave.deps, () => () => undefined);
+    const scheduled: (() => void)[] = [];
+    const engine = new SyncEngine(brave.deps, (fn) => {
+      scheduled.push(fn);
+      return () => undefined;
+    });
     engine.attach();
     await engine.runNow("syncNow"); // first follower run: full resync creates the tab
     const tab = brave.b.tabs.find((t) => t.url === "https://a.example/")!;
     brave.deps.now = () => new Date(Date.now() + 60_000); // past the post-load grace
     brave.b.userNavigate(tab.id, "https://a.example/brave");
+    await engine.idle();
+    expect((await brave.state()).heldNavigates).toHaveLength(1);
+    brave.deps.now = () => new Date(Date.now() + 60_000 + NAVIGATE_SETTLE_MS); // the navigation settles
+    for (const fn of scheduled.splice(0)) fn();
     await engine.idle();
     expect((await brave.state()).pending.map((p) => p.op.type)).toEqual(["navigate"]);
 

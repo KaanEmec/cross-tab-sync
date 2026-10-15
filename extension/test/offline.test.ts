@@ -76,6 +76,7 @@ describe("follower journal through merge", () => {
     const mac = await follower("Mac Safari");
     const a = entryOf("https://a/");
     mac.b.userNavigate(mac.tab("https://a/"), "https://a/mac");
+    await mac.settle(); // the navigate settles and is journaled first
     for (let i = 0; i < 100; i++) mac.b.userOpenTab(mac.win, long(i)); // pushes the next op into a later batch
     await mac.settle();
     const pinOp = { opId: crypto.randomUUID(), type: "update" as const, entryId: a, pinned: true };

@@ -672,6 +672,9 @@
   var EXPECT_TTL_MS = 3e4;
   var LOAD_GRACE_MS = 1e4;
   var CLOSE_HOLD_MS = 2e3;
+  var CLOSE_HOLD_MAX_MS = 15e3;
+  var NAVIGATE_SETTLE_MS = 5e3;
+  var NAVIGATE_MAX_HOLD_MS = 3e4;
   var STARTUP_GRACE_MS = 1e4;
   var STALE_MAPPINGS_TTL_MS = 6e4;
   function inStartupGrace(startupAt, now, windowMs = STARTUP_GRACE_MS) {
@@ -799,6 +802,21 @@
     if (takeCreate(d, withUrl)) return d.done(false);
     return d.done(!addition(d, withUrl));
   }
+  function holdNavigate(d, tabId, mapped, url) {
+    const base = serverUrl(mapped);
+    const tabs = { ...d.s.mappings.tabs, [String(tabId)]: url === base ? { entryId: mapped.entryId, url } : { entryId: mapped.entryId, url, base } };
+    d.set("mappings", { ...d.s.mappings, tabs });
+    const prev = d.s.heldNavigates.find((h) => h.tabId === tabId && h.entryId === mapped.entryId);
+    const held = { tabId, entryId: mapped.entryId, firstAt: prev?.firstAt ?? d.ctx.now, at: d.ctx.now };
+    d.set("heldNavigates", [...d.s.heldNavigates.filter((h) => h.tabId !== tabId), held]);
+    diag(`held navigate ${prev ? "extended" : "created"} entry=${short(mapped.entryId)} tab=${tabId}${url === base ? " (back at entry URL)" : ""}`);
+  }
+  function dropHeldNavigate(d, tabId, reason) {
+    const held = d.s.heldNavigates.find((h) => h.tabId === tabId);
+    if (!held) return;
+    d.set("heldNavigates", d.s.heldNavigates.filter((h) => h !== held));
+    diag(`held navigate dropped entry=${short(held.entryId)} tab=${tabId}: ${reason}`);
+  }
   function recordUpdated(s, tab, ctx) {
     const d = new Draft(s, ctx);
     const key = String(tab.id);
@@ -837,14 +855,13 @@
     const copies = tabsForEntry(d.s.mappings, mapped.entryId);
     const dest = mappedTabWithUrl(d.s.mappings, tab.url, tab.id);
     if (dest && dest.entryId !== mapped.entryId) {
+      dropHeldNavigate(d, tab.id, "joined another entry");
       d.map(tab.id, dest.entryId, tab.url);
       if (copies.length === 1) d.ops.push({ opId: ctx.newId(), type: "close", entryId: mapped.entryId });
     } else if (copies.length === 1) {
-      const opId = ctx.newId();
-      d.ops.push({ opId, type: "navigate", entryId: mapped.entryId, url: tab.url });
-      d.bases[opId] = serverUrl(mapped);
-      d.map(tab.id, mapped.entryId, tab.url);
+      holdNavigate(d, tab.id, mapped, tab.url);
     } else {
+      dropHeldNavigate(d, tab.id, "detached from its entry");
       const entryId = ctx.newId();
       d.ops.push({ opId: ctx.newId(), type: "open", entryId, url: tab.url, pinned: tab.pinned });
       d.map(tab.id, entryId, tab.url);
@@ -856,6 +873,7 @@
     const ours = d.take((e) => e.kind === "remove" && e.tabId === tabId) !== void 0;
     d.take((e) => e.kind === "load" && e.tabId === tabId);
     d.undetach(String(tabId));
+    dropHeldNavigate(d, tabId, "tab removed");
     const mapped = d.s.mappings.tabs[String(tabId)];
     if (!mapped) return d.done(false);
     d.unmap(tabId);
@@ -870,28 +888,78 @@
     d.set("removedWindows", { ...d.s.removedWindows, [String(windowId)]: ctx.now });
     return d.done(false);
   }
-  function releaseHeld(s, aliveWindows, ctx) {
-    const d = new Draft(s, ctx);
-    const held = d.s.heldCloses;
-    const due = held.filter((h) => !h.done && ctx.now - h.at >= CLOSE_HOLD_MS);
-    const waiting = held.some((h) => !h.done && ctx.now - h.at < CLOSE_HOLD_MS);
-    const kept = held.filter((h) => !h.done && !due.includes(h));
-    if (kept.length !== held.length) d.set("heldCloses", kept);
-    const closed = /* @__PURE__ */ new Set();
+  function navigateDue(h) {
+    return Math.min(h.at + NAVIGATE_SETTLE_MS, h.firstAt + NAVIGATE_MAX_HOLD_MS);
+  }
+  function byWindow(held) {
+    const groups = /* @__PURE__ */ new Map();
+    for (const h of held) if (!h.done) groups.set(h.windowId, [...groups.get(h.windowId) ?? [], h]);
+    return groups;
+  }
+  function closesDue(group) {
+    const ats = group.map((h) => h.at);
+    return Math.min(Math.max(...ats) + CLOSE_HOLD_MS, Math.min(...ats) + CLOSE_HOLD_MAX_MS);
+  }
+  function nextRelease(s) {
+    const due = [...s.heldNavigates.map(navigateDue), ...[...byWindow(s.heldCloses).values()].map(closesDue)];
+    return due.length > 0 ? Math.min(...due) : null;
+  }
+  function releaseNavigates(d, all = false) {
+    const due = d.s.heldNavigates.filter((h) => all || navigateDue(h) <= d.ctx.now);
+    if (due.length === 0) return;
+    d.set("heldNavigates", d.s.heldNavigates.filter((h) => !due.includes(h)));
     for (const h of due) {
-      const windowGone = !aliveWindows.has(h.windowId) || d.s.removedWindows[String(h.windowId)] !== void 0;
-      const dropped = windowGone ? "window gone" : closed.has(h.entryId) ? "entry already closed in this release" : tabsForEntry(d.s.mappings, h.entryId).length > 0 ? "entry still has a local copy" : null;
+      const m = d.s.mappings.tabs[String(h.tabId)];
+      const dropped = !m || m.entryId !== h.entryId ? "tab no longer mapped to the entry" : m.url === serverUrl(m) ? "back at the entry URL" : null;
       if (dropped) {
-        diag(`held close dropped entry=${short(h.entryId)} tab=${h.tabId}: ${dropped}`);
+        diag(`held navigate dropped entry=${short(h.entryId)} tab=${h.tabId}: ${dropped}`);
         continue;
       }
-      diag(`held close released entry=${short(h.entryId)} tab=${h.tabId}`);
-      closed.add(h.entryId);
-      d.ops.push({ opId: ctx.newId(), type: "close", entryId: h.entryId });
+      const opId = d.ctx.newId();
+      d.ops.push({ opId, type: "navigate", entryId: h.entryId, url: m.url });
+      d.bases[opId] = serverUrl(m);
+      d.map(h.tabId, h.entryId, m.url);
+      diag(`held navigate released entry=${short(h.entryId)} tab=${h.tabId} after ${d.ctx.now - h.firstAt}ms`);
     }
+  }
+  function flushNavigates(s, ctx) {
+    const d = new Draft(s, ctx);
+    releaseNavigates(d, true);
+    return d.done(false);
+  }
+  function releaseCloses(d, windowTabs) {
+    const groups = [...byWindow(d.s.heldCloses)].filter(([, g]) => closesDue(g) <= d.ctx.now);
+    const due = new Set(groups.flatMap(([, g]) => g));
+    const kept = d.s.heldCloses.filter((h) => !h.done && !due.has(h));
+    if (kept.length !== d.s.heldCloses.length) d.set("heldCloses", kept);
+    const closed = /* @__PURE__ */ new Set();
+    for (const [windowId, group] of groups) {
+      const left = windowTabs.get(windowId);
+      const arriving = d.ctx.now < Math.max(...group.map((h) => h.at)) + CLOSE_HOLD_MS;
+      const gone = left === void 0 || d.s.removedWindows[String(windowId)] !== void 0 ? "window gone" : left === 0 ? "window emptied" : arriving && left < group.length ? `mid-teardown at the cap (${left} tab(s) left)` : null;
+      if (gone) {
+        diag(`held closes dropped win=${windowId} count=${group.length}: ${gone}`);
+        continue;
+      }
+      for (const h of group) {
+        const dropped = closed.has(h.entryId) ? "entry already closed in this release" : tabsForEntry(d.s.mappings, h.entryId).length > 0 ? "entry still has a local copy" : null;
+        if (dropped) {
+          diag(`held close dropped entry=${short(h.entryId)} tab=${h.tabId}: ${dropped}`);
+          continue;
+        }
+        diag(`held close released entry=${short(h.entryId)} tab=${h.tabId}`);
+        closed.add(h.entryId);
+        d.ops.push({ opId: d.ctx.newId(), type: "close", entryId: h.entryId });
+      }
+    }
+  }
+  function releaseHeld(s, windowTabs, ctx) {
+    const d = new Draft(s, ctx);
+    releaseNavigates(d);
+    releaseCloses(d, windowTabs);
     const recent = Object.entries(d.s.removedWindows).filter(([, at]) => ctx.now - at < EXPECT_TTL_MS);
     if (recent.length !== Object.keys(d.s.removedWindows).length) d.set("removedWindows", Object.fromEntries(recent));
-    return { ...d.done(false), waiting };
+    return { ...d.done(false), waiting: nextRelease(d.s) !== null };
   }
 
   // src/core/eligibility.ts
@@ -957,6 +1025,7 @@
       suppressAutoTakeover: false,
       freshPending: false,
       heldCloses: [],
+      heldNavigates: [],
       removedWindows: {},
       errorKind: null,
       online: true,
@@ -1011,6 +1080,7 @@
       suppressAutoTakeover: false,
       freshPending: false,
       heldCloses: [],
+      heldNavigates: [],
       removedWindows: {},
       online: true,
       nextRetryAt: null,
@@ -1219,6 +1289,9 @@
     for (const h of held) if (!h.done && (!mappings || tabsForEntry(mappings, h.entryId).length === 0)) ids.add(h.entryId);
     return ids;
   }
+  function locallyChanged(journal, held, entryId) {
+    return pendingChanges(journal, entryId).length > 0 || held.some((h) => h.entryId === entryId);
+  }
   function reconcileDetached(detached, all, eligible, mappings, live) {
     const present = new Set(all.map((t) => String(t.id)));
     const out = {};
@@ -1251,9 +1324,10 @@
     const windows = (await adapter2.getWindows()).filter((w) => w.type === "normal" && !w.incognito);
     const ids = new Set(windows.map((w) => w.id));
     const last = await adapter2.getLastFocusedWindow().catch(() => null);
-    if (last && ids.has(last.id)) return last.id;
-    if (persisted !== null && ids.has(persisted)) return persisted;
-    return windows[0]?.id ?? null;
+    const focused = windows.find((w) => w.focused)?.id;
+    const [id, source] = focused !== void 0 ? [focused, "focused"] : last && ids.has(last.id) ? [last.id, "last focused"] : persisted !== null && ids.has(persisted) ? [persisted, "persisted"] : [windows[0]?.id ?? null, "any"];
+    diag(`receiving window ${id ?? "new"} (${source}; last focused ${last?.id ?? "-"}, persisted ${persisted ?? "-"})`);
+    return id;
   }
   var expiry = (store) => nowMs(store.deps) + EXPECT_TTL_MS;
   function forkEntry(mappings, pending, entryId, newId, now, baseRevision = 0) {
@@ -1409,7 +1483,7 @@
             ensureTab(fresh, op.url);
             break;
           }
-          if (localUrl !== op.url && pendingChanges(pending, op.entryId).length > 0 && fork(op.entryId)) {
+          if (localUrl !== op.url && locallyChanged(pending, store.s.heldNavigates, op.entryId) && fork(op.entryId)) {
             ensureTab(target, op.url);
             break;
           }
@@ -1432,7 +1506,7 @@
         case "close": {
           const i = toCreate.findIndex((c) => c.entryId === op.entryId);
           if (i >= 0) toCreate.splice(i, 1);
-          if (pendingChanges(pending, op.entryId).length > 0 && fork(op.entryId)) break;
+          if (locallyChanged(pending, store.s.heldNavigates, op.entryId) && fork(op.entryId)) break;
           for (const id of tabsForEntry(mappings, op.entryId)) {
             const live = byId.get(id)?.url;
             const m = mappings.tabs[String(id)];
@@ -1537,9 +1611,11 @@
     const now = nowDate(store.deps);
     const baseRevision = store.s.lastRevision;
     const sessionIds = entries ? new Set(entries.map((e) => e.id)) : null;
+    const held = new Set(store.s.heldNavigates.map((h) => h.entryId));
     if (sessionIds) {
       for (const entryId of new Set(Object.values(before.tabs).map((m) => m.entryId))) {
-        if (sessionIds.has(entryId) || !pendingChanges(pending, entryId).some((p2) => p2.op.type === "navigate")) continue;
+        const navigated = pendingChanges(pending, entryId).some((p2) => p2.op.type === "navigate") || held.has(entryId);
+        if (sessionIds.has(entryId) || !navigated) continue;
         const f = forkEntry(before, pending, entryId, newId, now, baseRevision);
         if (f) ({ mappings: before, pending } = f);
       }
@@ -1588,12 +1664,12 @@
       const copies = tabsForEntry(mappings, entry.id);
       const m = mappings.tabs[String(copies[0])];
       if (!m || entry.url === m.url || entry.url === serverUrl(m)) continue;
-      if (pendingChanges(pending, entry.id).length === 0) {
+      if (pendingChanges(pending, entry.id).length === 0 && !held.has(entry.id)) {
         for (const id of copies) navigateTo.set(id, entry.url);
         mappings = remapEntry(mappings, entry.id, entry.id, entry.url);
         continue;
       }
-      const base = pendingBase(pending, entry.id);
+      const base = pendingBase(pending, entry.id) ?? (held.has(entry.id) ? serverUrl(m) : void 0);
       if (base === void 0 || base === entry.url) continue;
       const f = forkEntry(mappings, pending, entry.id, newId, now, baseRevision);
       if (!f) continue;
@@ -2026,7 +2102,9 @@
     return true;
   }
   async function resetForBrowserStartup(deps2) {
-    const s = await loadState(deps2.adapter.storage);
+    const loaded = await loadState(deps2.adapter.storage);
+    const flushed = flushNavigates(loaded, { now: nowMs(deps2), newId: idGen(deps2) });
+    const s = { ...loaded, ...flushed.patch };
     const previous = [...Object.values(s.staleMappings?.tabs ?? {}), ...Object.values(s.mappings.tabs)];
     const staleMappings = {
       tabs: Object.fromEntries(previous.map((m, i) => [`stale-${i}`, m])),
@@ -2038,8 +2116,10 @@
       staleMappings: previous.length > 0 ? staleMappings : null,
       detached,
       expected: [],
+      pending: s.pending,
       // Removals still held belong to the shutdown of the previous session: unmap only.
       heldCloses: [],
+      heldNavigates: [],
       removedWindows: {},
       receivingWindowId: null,
       runLock: null,
@@ -2214,6 +2294,8 @@
     depth = 0;
     cancelTimer = null;
     cancelRelease = null;
+    /** Epoch ms the armed release timer fires at. */
+    releaseAt = Infinity;
     cancelRetry = null;
     /**
      * Last ownership verification started by an activity signal. In memory only: a restarted worker
@@ -2446,7 +2528,7 @@
      */
     async unpause() {
       await this.enqueue(() => saveState(this.deps.adapter.storage, { paused: false, statusText: null }), "resume sync");
-      await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)), "release held closes");
+      await this.enqueue(() => this.process((s, ctx) => this.release(s, ctx)), "release held changes");
       return this.runNow("resume");
     }
     /**
@@ -2458,13 +2540,13 @@
       await this.enqueue(() => this.ensureSession(reason === "update" ? "always" : true), `startup ${reason}`);
       this.requestSync();
     }
-    /** Worker (re)start: send what an earlier worker journaled, release closes it held, rearm the retry. */
+    /** Worker (re)start: send what an earlier worker journaled, release what it held, rearm the retry. */
     async resume() {
       const s = await this.enqueue(async () => {
         await this.ensureSession();
         return loadState(this.deps.adapter.storage);
       }, "worker resume");
-      if (s.heldCloses.some((h) => !h.done)) this.scheduleRelease();
+      this.scheduleRelease(nextRelease(s));
       if (s.paused) return;
       if (isPaired(s) && s.generation !== null && s.pending.length > 0) this.requestSync();
       await this.scheduleRetry();
@@ -2484,18 +2566,25 @@
         Math.max(0, s.nextRetryAt - nowMs(this.deps))
       );
     }
-    /** Release held closes once CLOSE_HOLD_MS has passed (see changes.releaseHeld). */
-    scheduleRelease() {
-      if (this.cancelRelease) return;
+    /**
+     * Arm the release of held closes and navigations for `at` (changes.nextRelease), unless a timer
+     * fires earlier already; the release re-arms for whatever is still held.
+     */
+    scheduleRelease(at) {
+      if (at === null || this.cancelRelease && this.releaseAt <= at) return;
+      this.cancelRelease?.();
+      this.releaseAt = at;
       this.cancelRelease = this.schedule(() => {
         this.cancelRelease = null;
-        this.event("release held closes", (s, ctx) => this.release(s, ctx));
-      }, CLOSE_HOLD_MS);
+        this.event("release held changes", (s, ctx) => this.release(s, ctx));
+      }, Math.max(0, at - nowMs(this.deps)));
     }
+    /** Release what is due (changes.releaseHeld), with the open windows and their tab counts. */
     async release(s, ctx) {
-      const alive = new Set((await this.deps.adapter.getWindows()).map((w) => w.id));
-      const out = releaseHeld(s, alive, ctx);
-      if (out.waiting) this.scheduleRelease();
+      const [windows, tabs] = await Promise.all([this.deps.adapter.getWindows(), this.deps.adapter.queryTabs()]);
+      const windowTabs = new Map(windows.map((w) => [w.id, tabs.filter((t) => t.windowId === w.id).length]));
+      const out = releaseHeld(s, windowTabs, ctx);
+      if (out.waiting) this.scheduleRelease(nextRelease({ ...s, ...out.patch }));
       return outcome(out);
     }
     event(label, step) {
@@ -2514,7 +2603,7 @@
       const decision = out.activity && !s.paused ? onActivity(s, { now, isOwner, kind: out.kind }) : null;
       if (out.activity) diag(`activity ${out.kind ?? "-"}: ${activityText(s, isOwner, decision)}`);
       await saveState(storage, { ...out.patch, ...decision?.patch });
-      if (out.patch.heldCloses?.some((h) => !h.done)) this.scheduleRelease();
+      if (out.patch.heldCloses || out.patch.heldNavigates) this.scheduleRelease(nextRelease({ ...s, ...out.patch }));
       if (s.paused) return;
       if (decision?.takeover) void this.takeover().catch(ignore);
       else if (isOwner && (decision?.fresh || decision?.counted && now - this.lastVerifyAt >= VERIFY_INTERVAL_MS)) {

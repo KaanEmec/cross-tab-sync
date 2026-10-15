@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  CLOSE_HOLD_MAX_MS,
   CLOSE_HOLD_MS,
   EXPECT_TTL_MS,
   LOAD_GRACE_MS,
+  NAVIGATE_MAX_HOLD_MS,
+  NAVIGATE_SETTLE_MS,
+  nextRelease,
   recordCreated,
   recordRemoved,
   recordUpdated,
@@ -32,6 +36,7 @@ const state = (over: Partial<LocalState> = {}): LocalState => ({
   detached: {},
   startupAt: null,
   heldCloses: [],
+  heldNavigates: [],
   removedWindows: {},
   ...over,
 });
@@ -95,7 +100,8 @@ describe("additions", () => {
 });
 
 const W = 1;
-const alive = new Set([W]);
+/** Open windows and their tab counts: window W keeps plenty of tabs. */
+const alive = new Map([[W, 20]]);
 /** Remove a tab individually, then release held closes after the hold. */
 function closeTab(s: LocalState, tabId: number, at = T0): { s: LocalState; ops: Outcome["ops"] } {
   const removed = next(s, recordRemoved(s, tabId, false, W, ctx(at)));
@@ -133,7 +139,7 @@ describe("closures", () => {
     for (const windows of [[1, 2, 3], [W, W, W]]) {
       let s = copies;
       for (const [i, id] of [1, 2, 3].entries()) s = next(s, recordRemoved(s, id, false, windows[i]!, ctx(T0 + i)));
-      const released = releaseHeld(s, new Set([1, 2, 3]), ctx(T0 + 2 + CLOSE_HOLD_MS));
+      const released = releaseHeld(s, new Map([[1, 5], [2, 5], [3, 5]]), ctx(T0 + 2 + CLOSE_HOLD_MS));
       expect(released.ops).toEqual([{ opId: "id1", type: "close", entryId: "E" }]);
     }
     // With another entry among them: one close per entry.
@@ -146,22 +152,22 @@ describe("closures", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"], [2, "F", "https://y/"], [3, "G", "https://z/"]]) });
     expect(closeTab(s, 1).ops).toHaveLength(1);
     const removed = next(s, recordRemoved(s, 1, false, W, ctx()));
-    expect(releaseHeld(removed, new Set(), ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
+    expect(releaseHeld(removed, new Map(), ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
     const reported = next(removed, recordWindowRemoved(removed, W, ctx(T0 + 10)));
     expect(releaseHeld(reported, alive, ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
 
-    // Three different tabs closed within 600 ms (cmd-W, cmd-W, cmd-W): three closes, in two releases.
+    // Three different tabs closed within 600 ms (cmd-W, cmd-W, cmd-W): the window's holds slide to
+    // 2 s after the last removal, then three closes.
     let rapid = s;
     for (const [i, id] of [1, 2, 3].entries()) rapid = next(rapid, recordRemoved(rapid, id, false, W, ctx(T0 + i * 300)));
+    expect(nextRelease(rapid)).toBe(T0 + 600 + CLOSE_HOLD_MS);
     const early = releaseHeld(rapid, alive, ctx(T0 + CLOSE_HOLD_MS));
-    expect(early.ops.map((o) => o.entryId)).toEqual(["E"]);
-    rapid = next(rapid, early);
-    expect(rapid.heldCloses.map((h) => h.entryId)).toEqual(["F", "G"]); // released holds are not kept
+    expect(early).toMatchObject({ ops: [], waiting: true });
     const late = releaseHeld(rapid, alive, ctx(T0 + 600 + CLOSE_HOLD_MS));
-    expect(late.ops.map((o) => o.entryId)).toEqual(["F", "G"]);
-    expect(next(rapid, late).heldCloses).toEqual([]);
+    expect(late.ops.map((o) => o.entryId)).toEqual(["E", "F", "G"]);
+    expect(next(rapid, late).heldCloses).toEqual([]); // released holds are not kept
     // The same removals from a window that is gone by the release: none.
-    expect(releaseHeld(next(s, recordRemoved(s, 1, false, W, ctx())), new Set(), ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
+    expect(releaseHeld(next(s, recordRemoved(s, 1, false, W, ctx())), new Map(), ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([]);
   });
 
   it("removals during the startup grace only unmap", () => {
@@ -175,13 +181,160 @@ describe("closures", () => {
   });
 });
 
+describe("window teardown (removals one by one, isWindowClosing false)", () => {
+  const ten = () =>
+    state({ mappings: mapped(Array.from({ length: 10 }, (_, i): [number, string, string] => [i + 1, `E${i}`, `https://t${i}/`])) });
+  /** Ten removals from window W, one second apart. */
+  function removeTen(): LocalState {
+    let s = ten();
+    for (let i = 0; i < 10; i++) {
+      s = next(s, recordRemoved(s, i + 1, false, W, ctx(T0 + i * 1000)));
+      // Each removal extends the window's holds: nothing is due between removals.
+      expect(releaseHeld(s, new Map([[W, 0]]), ctx(T0 + i * 1000 + 999)).ops).toEqual([]);
+    }
+    expect(nextRelease(s)).toBe(T0 + 9000 + CLOSE_HOLD_MS);
+    return s;
+  }
+  const at = ctx(T0 + 9000 + CLOSE_HOLD_MS);
+
+  it("a window that disappears, or is still listed with no tabs: no close", () => {
+    const s = removeTen();
+    for (const windows of [new Map<number, number>(), new Map([[W, 0]])]) {
+      const r = releaseHeld(s, windows, at);
+      expect(r.ops).toEqual([]);
+      expect(next(s, r).heldCloses).toEqual([]);
+      expect(r.waiting).toBe(false);
+    }
+  });
+
+  it("a window that keeps other tabs: ten closes, however few are left once the removals stopped", () => {
+    for (const left of [10, 1]) {
+      const r = releaseHeld(removeTen(), new Map([[W, left]]), at);
+      expect(r.ops.map((o) => o.entryId)).toEqual(Array.from({ length: 10 }, (_, i) => `E${i}`));
+    }
+  });
+
+  it("two of three tabs closed within 2 s: two closes", () => {
+    let s = state({ mappings: mapped([[1, "E", "https://x/"], [2, "F", "https://y/"], [3, "G", "https://z/"]]) });
+    s = next(s, recordRemoved(s, 1, false, W, ctx(T0)));
+    s = next(s, recordRemoved(s, 2, false, W, ctx(T0 + 500)));
+    expect(releaseHeld(s, new Map([[W, 1]]), ctx(T0 + 500 + CLOSE_HOLD_MS)).ops.map((o) => o.entryId)).toEqual(["E", "F"]);
+  });
+
+  it("the cap firing while removals still arrive drops them when fewer tabs are left than removals", () => {
+    let s = ten();
+    for (let i = 0; i < 10; i++) s = next(s, recordRemoved(s, i + 1, false, W, ctx(T0 + i * 1600)));
+    // Last removal at 14.4 s: at the 15 s cap removals are still arriving.
+    const capped = ctx(T0 + CLOSE_HOLD_MAX_MS);
+    expect(releaseHeld(s, new Map([[W, 9]]), capped).ops).toEqual([]);
+    expect(releaseHeld(s, new Map([[W, 10]]), capped).ops).toHaveLength(10);
+  });
+
+  it("one removal from a window that keeps other tabs is one close after 2 s", () => {
+    const s = next(ten(), recordRemoved(ten(), 1, false, W, ctx()));
+    expect(releaseHeld(s, new Map([[W, 9]]), ctx(T0 + CLOSE_HOLD_MS - 1)).ops).toEqual([]);
+    expect(releaseHeld(s, new Map([[W, 9]]), ctx(T0 + CLOSE_HOLD_MS)).ops).toEqual([{ opId: "id1", type: "close", entryId: "E0" }]);
+  });
+
+  it("holds slide at most CLOSE_HOLD_MAX_MS from the window's first removal; other windows are separate", () => {
+    let s = ten();
+    for (let i = 0; i < 8; i++) s = next(s, recordRemoved(s, i + 1, false, W, ctx(T0 + i * 1900)));
+    s = next(s, recordRemoved(s, 10, false, 2, ctx(T0 + 1000)));
+    expect(nextRelease(s)).toBe(T0 + 1000 + CLOSE_HOLD_MS); // window 2's single removal
+    expect(releaseHeld(s, new Map([[W, 20], [2, 5]]), ctx(T0 + 3000)).ops.map((o) => o.entryId)).toEqual(["E9"]);
+    const capped = releaseHeld(s, new Map([[W, 20], [2, 5]]), ctx(T0 + CLOSE_HOLD_MAX_MS));
+    expect(capped.ops.map((o) => o.entryId)).toEqual(["E0", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E9"]);
+  });
+});
+
+describe("held navigations", () => {
+  const one = () => state({ mappings: mapped([[1, "E", "https://x/"]]) });
+  const release = (s: LocalState, now: number) => releaseHeld(s, alive, ctx(now));
+  /** Distinct op ids across releases (the journal keeps one operation per opId). */
+  let seq = 0;
+  const releaseNew = (s: LocalState, now: number) => releaseHeld(s, alive, { now, newId: () => `op${++seq}` });
+
+  it("URL changes within the hold become one navigate with the last URL", () => {
+    let s = one();
+    for (const [i, url] of ["https://x/1", "https://x/2", "https://x/3"].entries()) {
+      s = next(s, recordUpdated(s, tab(1, url), ctx(T0 + i * 2000)));
+    }
+    expect(s.heldNavigates).toEqual([{ tabId: 1, entryId: "E", firstAt: T0, at: T0 + 4000 }]);
+    expect(nextRelease(s)).toBe(T0 + 4000 + NAVIGATE_SETTLE_MS);
+    expect(release(s, T0 + 4000 + NAVIGATE_SETTLE_MS - 1).ops).toEqual([]);
+    const r = release(s, T0 + 4000 + NAVIGATE_SETTLE_MS);
+    expect(r.ops).toEqual([{ opId: "id1", type: "navigate", entryId: "E", url: "https://x/3" }]);
+    expect(next(s, r).pending.map((p) => p.base)).toEqual(["https://x/"]);
+  });
+
+  it("a page that returns to its mapped URL produces nothing", () => {
+    let s = one();
+    s = next(s, recordUpdated(s, tab(1, "https://x/#live"), ctx(T0)));
+    s = next(s, recordUpdated(s, tab(1, "https://x/"), ctx(T0 + 1000)));
+    expect(s.mappings.tabs["1"]).toEqual({ entryId: "E", url: "https://x/" });
+    const r = release(s, T0 + 1000 + NAVIGATE_SETTLE_MS);
+    expect(r.ops).toEqual([]);
+    expect(next(s, r).heldNavigates).toEqual([]);
+  });
+
+  it("a change after the hold is a new navigate", () => {
+    let s = one();
+    s = next(s, recordUpdated(s, tab(1, "https://x/1"), ctx(T0)));
+    s = next(s, releaseNew(s, T0 + NAVIGATE_SETTLE_MS));
+    s = next(s, recordUpdated(s, tab(1, "https://x/2"), ctx(T0 + NAVIGATE_SETTLE_MS + 1)));
+    const r = releaseNew(s, T0 + 2 * NAVIGATE_SETTLE_MS + 1);
+    expect(r.ops).toMatchObject([{ type: "navigate", entryId: "E", url: "https://x/2" }]);
+    expect(next(s, r).pending.map((p) => [p.op.type === "navigate" && p.op.url, p.base])).toEqual([
+      ["https://x/1", "https://x/"],
+      ["https://x/2", "https://x/1"],
+    ]);
+  });
+
+  it("a page rewriting its URL every 3 s publishes at most once per NAVIGATE_MAX_HOLD_MS", () => {
+    let s = one();
+    let navigates = 0;
+    for (let t = 0; t <= 63_000; t += 1000) {
+      if (t % 3000 === 0) s = next(s, recordUpdated(s, tab(1, `https://x/?t=${t}`), ctx(T0 + t)));
+      const r = releaseNew(s, T0 + t);
+      navigates += r.ops.length;
+      s = next(s, r);
+    }
+    // Released 30 s after the first change of each hold (0 s, then 33 s), with the latest URL.
+    expect(navigates).toBe(2);
+    expect(s.pending.map((p) => p.op.type === "navigate" && p.op.url)).toEqual(["https://x/?t=30000", "https://x/?t=63000"]);
+    expect(NAVIGATE_MAX_HOLD_MS).toBe(30_000);
+  });
+
+  it("closing the tab drops its held navigate; the close rules apply", () => {
+    let s = one();
+    s = next(s, recordUpdated(s, tab(1, "https://x/1"), ctx(T0)));
+    s = next(s, recordRemoved(s, 1, false, W, ctx(T0 + 1000)));
+    expect(s.heldNavigates).toEqual([]);
+    expect(release(s, T0 + 1000 + NAVIGATE_SETTLE_MS).ops).toEqual([{ opId: "id1", type: "close", entryId: "E" }]);
+    // Window closing: unmap only, nothing at all.
+    let w = one();
+    w = next(w, recordUpdated(w, tab(1, "https://x/1"), ctx(T0)));
+    w = next(w, recordRemoved(w, 1, true, W, ctx(T0 + 1000)));
+    expect(w.heldNavigates).toEqual([]);
+    expect(release(w, T0 + NAVIGATE_MAX_HOLD_MS).ops).toEqual([]);
+  });
+});
+
 describe("navigation", () => {
-  it("single copy: navigate, mapping follows", () => {
+  it("single copy: navigate after the hold, mapping follows", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"]]) });
     const o = recordUpdated(s, tab(1, "https://x/next?q=1#f", { active: true }), ctx());
-    expect(o.ops).toEqual([{ opId: "id1", type: "navigate", entryId: "E", url: "https://x/next?q=1#f" }]);
-    expect(next(s, o).mappings.tabs["1"]).toEqual({ entryId: "E", url: "https://x/next?q=1#f" });
+    expect(o.ops).toEqual([]); // held
     expect(o.activity).toBe(false);
+    const held = next(s, o);
+    expect(held.mappings.tabs["1"]).toEqual({ entryId: "E", url: "https://x/next?q=1#f", base: "https://x/" });
+    expect(held.heldNavigates).toEqual([{ tabId: 1, entryId: "E", firstAt: T0, at: T0 }]);
+    const r = releaseHeld(held, alive, ctx(T0 + NAVIGATE_SETTLE_MS));
+    expect(r.ops).toEqual([{ opId: "id1", type: "navigate", entryId: "E", url: "https://x/next?q=1#f" }]);
+    const after = next(held, r);
+    expect(after.mappings.tabs["1"]).toEqual({ entryId: "E", url: "https://x/next?q=1#f" });
+    expect(after.pending[0]?.base).toBe("https://x/");
+    expect(after.heldNavigates).toEqual([]);
   });
 
   it("one of several copies: detaches and is a fresh open", () => {
@@ -224,7 +377,8 @@ describe("echo suppression", () => {
     after = next(after, rewrite);
     expect(after.expected[0]).toMatchObject({ until: T0 + LOAD_GRACE_MS }); // not extended
     // After the grace a user navigation is recorded, based on the server URL.
-    const user = recordUpdated(after, tab(1, "https://elsewhere/"), ctx(T0 + LOAD_GRACE_MS));
+    after = next(after, recordUpdated(after, tab(1, "https://elsewhere/"), ctx(T0 + LOAD_GRACE_MS)));
+    const user = releaseHeld(after, alive, ctx(T0 + LOAD_GRACE_MS + NAVIGATE_SETTLE_MS));
     expect(user.ops).toEqual([{ opId: "id1", type: "navigate", entryId: "E", url: "https://elsewhere/" }]);
     expect(next(after, user).pending[0]?.base).toBe("https://x/");
   });
@@ -255,7 +409,7 @@ describe("echo suppression", () => {
   it("expired expectations are dropped and not honored", () => {
     const s = state({ mappings: mapped([[1, "E", "https://x/"]]), expected: [{ kind: "load", tabId: 1, until: T0 }] });
     const o = recordUpdated(s, tab(1, "https://y/"), ctx());
-    expect(o.ops.map((op) => op.type)).toEqual(["navigate"]);
+    expect(o.patch.heldNavigates).toHaveLength(1);
     expect(o.patch.expected).toEqual([]);
   });
 });
