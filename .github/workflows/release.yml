@@ -176,6 +176,23 @@ jobs:
             -archivePath "$RUNNER_TEMP/Cross-Tab-Sync.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/export.plist" \
             -exportPath "$RUNNER_TEMP/export"
+      - name: Notarize and staple the app
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s\n' "$ASC_API_KEY_P8" > "$key"
+          # The app gets its own ticket and is stapled before it goes into the DMG, so Safari can
+          # verify it offline (an unstapled app is checked online at every launch).
+          ditto -c -k --keepParent "$RUNNER_TEMP/export/Cross-Tab-Sync.app" "$RUNNER_TEMP/Cross-Tab-Sync.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/Cross-Tab-Sync.zip" --wait \
+            --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID"
+          rm "$key"
+          xcrun stapler staple "$RUNNER_TEMP/export/Cross-Tab-Sync.app"
+          xcrun stapler validate "$RUNNER_TEMP/export/Cross-Tab-Sync.app"
       - name: Build DMG
         if: steps.check.outputs.enabled == 'true'
         run: |
@@ -194,7 +211,7 @@ jobs:
         run: |
           key="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
           printf '%s\n' "$ASC_API_KEY_P8" > "$key"
-          # Notarizing the DMG also notarizes the app inside it.
+          # The DMG gets its own ticket; the app inside is already stapled.
           xcrun notarytool submit "Cross-Tab-Sync-$VERSION.dmg" --wait \
             --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID"
           rm "$key"
