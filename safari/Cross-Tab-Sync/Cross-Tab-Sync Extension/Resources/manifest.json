@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Cross-Tab-Sync",
   "description": "Keep the same open tabs in Brave and Safari. End-to-end encrypted, through a hosted or your own server.",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "permissions": [
     "tabs",
     "storage",
