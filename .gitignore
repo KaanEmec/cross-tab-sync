@@ -1,0 +1,33 @@
+# OS
+.DS_Store
+
+# Node / extension
+node_modules/
+extension/dist/
+*.tsbuildinfo
+coverage/
+
+# Go
+server/bin/
+*.db
+*.db-wal
+*.db-shm
+
+# Xcode
+safari/**/xcuserdata/
+safari/**/DerivedData/
+safari/**/build/
+*.xcuserstate
+safari/**/dd/
+safari/**/*.xcworkspace/xcuserdata/
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Release assets built by `make release`
+/release/
+
+# Local server runtime data (database, debug log)
+server/data/

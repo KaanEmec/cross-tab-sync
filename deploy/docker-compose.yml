@@ -1,0 +1,42 @@
+# Usage: CTS_DOMAIN=tabs.example.com CTS_MAX_SESSIONS=1 docker compose up -d
+# Then set the extension's Advanced > Server URL to https://$CTS_DOMAIN and click Start syncing.
+services:
+  cts:
+    # `docker compose pull cts` fetches the release image; `--build` builds from source.
+    image: ghcr.io/kaanemec/cross-tab-sync:${CTS_VERSION:-latest}
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      CTS_DB_PATH: /data/cts.db
+      # 0 = unlimited sessions; a personal server sets 1.
+      CTS_MAX_SESSIONS: ${CTS_MAX_SESSIONS:-0}
+      CTS_OWNER_LIVENESS: ${CTS_OWNER_LIVENESS:-10m}
+      CTS_SNAPSHOT_RETENTION: ${CTS_SNAPSHOT_RETENTION:-20}
+    volumes:
+      - cts-data:/data
+    # Not published: only Caddy reaches it, so X-Forwarded-Proto is trustworthy.
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - cts
+    environment:
+      CTS_DOMAIN: ${CTS_DOMAIN:?set CTS_DOMAIN to the public hostname}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  cts-data:
+  caddy-data:
+  caddy-config:

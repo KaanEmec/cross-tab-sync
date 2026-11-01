@@ -1,0 +1,105 @@
+import type { Device, Owner, Snapshot } from "./client.js";
+import type { ActivityKind } from "./activity.js";
+import { isLocked, isPaired, PENDING_PAIR_TTL_MS, type ErrorKind, type State } from "./state.js";
+import { diagnosticsOn } from "./diag.js";
+import { syncSummary } from "./status.js";
+
+/** Messages from the popup to the service worker. */
+export type Request =
+  | { type: "getStatus"; refresh?: boolean }
+  /** Start syncing or join, using the form the popup saved as `pendingPair` (see State). */
+  | { type: "pair" }
+  | { type: "handOver" }
+  | { type: "continueHere" }
+  /** Run the owner or follower sync now (also the manual retry). */
+  | { type: "syncNow" }
+  | { type: "pause" }
+  | { type: "resume" }
+  /** Diagnostics trace on or off for this browser (core/diag.ts). */
+  | { type: "setDiagnostics"; on: boolean }
+  | { type: "listSnapshots" }
+  | { type: "restoreSnapshot"; id: number }
+  | { type: "listDevices" }
+  | { type: "renameDevice"; name: string }
+  | { type: "revokeDevice"; id: string }
+  | { type: "createPairingCode" }
+  | { type: "disconnect" };
+
+export interface StatusView {
+  paired: boolean;
+  serverUrl: string;
+  deviceName: string;
+  deviceId: string | null;
+  pairedAt: string | null;
+  owner: Owner | null;
+  isOwner: boolean;
+  generation: number | null;
+  lastRevision: number;
+  minRevision: number | null;
+  lastSuccessAt: string | null;
+  pendingCount: number;
+  online: boolean;
+  nextRetryAt: number | null;
+  paused: boolean;
+  /** URLs are end-to-end encrypted (an encryption key is stored). The key itself is never in the view. */
+  encrypted: boolean;
+  /** Start syncing just created the session: open Devices with a fresh invite. */
+  invitePending: boolean;
+  /** Unpaired, with Start syncing or a join saved or in progress in the worker. */
+  finishing: boolean;
+  /** "Saved to server", "3 changes waiting (offline, retrying at 10:05)", … (status.syncSummary). */
+  summary: string;
+  lastError: string | null;
+  errorKind: ErrorKind | null;
+  statusText: string | null;
+  running: boolean;
+  /** Last activity signal (diagnostics). */
+  lastActivityAt: number | null;
+  lastActivityKind: ActivityKind | null;
+  /** Diagnostics trace on (diag.diagnosticsOn). */
+  diagnostics: boolean;
+  /** False when the last status refresh could not reach the server. Not persisted. */
+  reachable?: boolean;
+}
+
+export type Response =
+  | {
+      ok: true;
+      status: StatusView;
+      pairingCode?: { code: string; expiresAt: string; link: string };
+      snapshots?: Snapshot[];
+      devices?: Device[];
+    }
+  | { ok: false; error: string; status?: StatusView };
+
+export function statusView(s: State, now = Date.now()): StatusView {
+  const pendingCount = s.pending.length;
+  return {
+    paired: isPaired(s),
+    serverUrl: s.serverUrl,
+    deviceName: s.deviceName,
+    deviceId: s.deviceId,
+    pairedAt: s.pairedAt,
+    owner: s.owner,
+    isOwner: s.generation !== null,
+    generation: s.generation,
+    lastRevision: s.lastRevision,
+    minRevision: s.minRevision,
+    lastSuccessAt: s.lastSuccessAt,
+    pendingCount,
+    online: s.online,
+    nextRetryAt: s.nextRetryAt,
+    paused: s.paused,
+    encrypted: s.syncKey !== null,
+    invitePending: s.invitePending,
+    finishing: !isPaired(s) && ((s.pendingPair !== null && now - s.pendingPair.createdAt <= PENDING_PAIR_TTL_MS) || (isLocked(s, now) && s.runLock?.action === "pair")),
+    summary: syncSummary({ ...s, pendingCount }),
+    lastError: s.lastError,
+    errorKind: s.errorKind,
+    statusText: s.statusText,
+    running: isLocked(s, now),
+    lastActivityAt: s.lastActivityAt,
+    lastActivityKind: s.lastActivityKind,
+    diagnostics: diagnosticsOn(s),
+  };
+}

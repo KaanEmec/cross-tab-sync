@@ -1,0 +1,4 @@
+{
+  "_comment": "Brave (Chromium). A service worker needs host permission to fetch the backend, so the origin is requested at pairing time from optional_host_permissions. Floor 120 per docs/COMPATIBILITY.md (30 s alarm floor, current storage quotas).",
+  "minimum_chrome_version": "120"
+}
